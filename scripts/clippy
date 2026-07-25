@@ -1,0 +1,62 @@
+#!/bin/sh
+
+set -eu
+
+cd "$(dirname "$0")/.."
+
+cargo clippy --workspace --all-targets --all-features -- \
+  -Wclippy::all \
+  -Wclippy::restriction \
+  -Wclippy::pedantic \
+  -Wclippy::nursery \
+  -Wclippy::cargo \
+  -Aclippy::missing_docs_in_private_items \
+  -Aclippy::absolute-paths \
+  -Aclippy::exhaustive-structs \
+  -Aclippy::implicit-return \
+  -Aclippy::missing_errors_doc \
+  -Aclippy::missing_inline_in_public_items \
+  -Aclippy::arbitrary-source-item-ordering \
+  -Aclippy::question-mark-used \
+  -Aclippy::pattern-type-mismatch \
+  -Aclippy::significant-drop-tightening \
+  -Aclippy::wildcard-imports \
+  -Aclippy::partial-pub-fields \
+  -Aclippy::option-if-let-else \
+  -Aclippy::large-futures \
+  -Aclippy::large_include_file \
+  -Aclippy::exhaustive-enums \
+  -Aclippy::missing-trait-methods \
+  -Aclippy::single_call_fn \
+  -Aclippy::std_instead_of_core \
+  -Aclippy::std_instead_of_alloc \
+  -Aclippy::must_use_candidate \
+  -Aclippy::ref-patterns \
+  -Aclippy::default_numeric_fallback \
+  -Aclippy::cargo_common_metadata \
+  -Aclippy::multiple_crate_versions \
+  -Aclippy::blanket_clippy_restriction_lints \
+  -Aclippy::separated_literal_suffix \
+  -Aclippy::pattern-type-mismatch \
+  -Aclippy::tests-outside-test-module \
+  -Aclippy::impl-trait-in-params \
+  -Aclippy::missing_panics_doc \
+  -Aclippy::unwrap_used \
+  -Aclippy::expect_used \
+  -Aclippy::panic \
+  -Aclippy::indexing_slicing \
+  -Aclippy::print-stdout \
+  -Aclippy::shadow-reuse \
+  -Aclippy::let-underscore-must-use \
+  -Aclippy::let_underscore_untyped \
+  -Aclippy::arithmetic_side_effects \
+  -Aclippy::missing_const_for_fn \
+  -Aclippy::single_char_lifetime_names \
+  -Aclippy::struct_field_names \
+  -Aclippy::same_name_method \
+  -Aclippy::pub_use \
+  -Aclippy::pub_with_shorthand \
+  -Aclippy::pub_without_shorthand \
+  -Aclippy::redundant_pub_crate \
+  -Aclippy::float_arithmetic \
+  -Aclippy::exit

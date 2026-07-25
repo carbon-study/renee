@@ -1,0 +1,16 @@
+[package]
+name = "renee-conformance"
+description = "Model-based and fault-injection conformance harness for Renee"
+keywords = ["conformance", "fault-injection", "testing"]
+categories = ["development-tools::testing"]
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true

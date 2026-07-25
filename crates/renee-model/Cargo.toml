@@ -1,0 +1,16 @@
+[package]
+name = "renee-model"
+description = "Deterministic reference state machine for Renee"
+keywords = ["crdt", "model", "synchronization"]
+categories = ["data-structures"]
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
