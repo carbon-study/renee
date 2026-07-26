@@ -1,7 +1,7 @@
 [package]
-name = "renee-subject"
-description = "Black-box process and fault-injection harness for Renee"
-keywords = ["fault-injection", "integration-testing", "testing"]
+name = "renee-conformance"
+description = "Model and subject comparison scenarios for Renee"
+keywords = ["conformance", "integration-testing", "testing"]
 categories = ["development-tools::testing"]
 authors.workspace = true
 edition.workspace = true
@@ -12,10 +12,10 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
-[dependencies]
-renee-wire = { path = "../renee-wire" }
+[dev-dependencies]
+renee-model = { path = "../renee-model" }
+renee-subject = { path = "../renee-subject" }
 tokio.workspace = true
-wtransport.workspace = true
 
 [lints]
 workspace = true

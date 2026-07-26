@@ -693,9 +693,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "renee-conformance"
+version = "0.0.0"
+dependencies = [
+ "renee-model",
+ "renee-subject",
+ "tokio",
+]
+
+[[package]]
 name = "renee-gatewayd"
 version = "0.0.0"
 dependencies = [
+ "renee-wire",
  "tokio",
  "wtransport",
 ]
@@ -708,6 +718,7 @@ version = "0.0.0"
 name = "renee-sessiond"
 version = "0.0.0"
 dependencies = [
+ "renee-wire",
  "tokio",
 ]
 
@@ -722,6 +733,7 @@ dependencies = [
 name = "renee-subject"
 version = "0.0.0"
 dependencies = [
+ "renee-wire",
  "tokio",
  "wtransport",
 ]
@@ -736,6 +748,13 @@ dependencies = [
 [[package]]
 name = "renee-types"
 version = "0.0.0"
+
+[[package]]
+name = "renee-wire"
+version = "0.0.0"
+dependencies = [
+ "tokio",
+]
 
 [[package]]
 name = "ring"

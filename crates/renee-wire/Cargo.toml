@@ -1,8 +1,8 @@
 [package]
-name = "renee-gatewayd"
-description = "Public WebTransport gateway daemon for Renee"
-keywords = ["networking", "server", "webtransport"]
-categories = ["network-programming"]
+name = "renee-wire"
+description = "Experimental public wire profile owned by Renee"
+keywords = ["protocol", "serialization", "webtransport"]
+categories = ["encoding", "network-programming"]
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -13,9 +13,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-renee-wire = { path = "../renee-wire" }
 tokio.workspace = true
-wtransport.workspace = true
 
 [lints]
 workspace = true

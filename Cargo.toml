@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/renee-conformance",
   "crates/renee-gatewayd",
   "crates/renee-model",
   "crates/renee-sessiond",
@@ -7,6 +8,7 @@ members = [
   "crates/renee-stored",
   "crates/renee-supervisord",
   "crates/renee-types",
+  "crates/renee-wire",
 ]
 resolver = "3"
 

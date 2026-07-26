@@ -76,6 +76,7 @@ struct Configuration {
     certificate: Option<PathBuf>,
     gatewayd: PathBuf,
     private_key: Option<PathBuf>,
+    sessiond: PathBuf,
     shutdown_on_stdin_eof: bool,
     stored: PathBuf,
 }
@@ -195,6 +196,8 @@ impl Configuration {
             take_path_or_sibling(&mut values, "--gatewayd", &sibling_directory, "renee-gatewayd");
         let stored =
             take_path_or_sibling(&mut values, "--stored", &sibling_directory, "renee-stored");
+        let sessiond =
+            take_path_or_sibling(&mut values, "--sessiond", &sibling_directory, "renee-sessiond");
         let bind_address = take_required_utf8_or_default(&mut values, "--bind", "127.0.0.1:4433")?;
         let certificate = take_optional_path(&mut values, "--certificate");
         let private_key = take_optional_path(&mut values, "--private-key");
@@ -206,7 +209,15 @@ impl Configuration {
             .into());
         }
 
-        Ok(Self { bind_address, certificate, gatewayd, private_key, shutdown_on_stdin_eof, stored })
+        Ok(Self {
+            bind_address,
+            certificate,
+            gatewayd,
+            private_key,
+            sessiond,
+            shutdown_on_stdin_eof,
+            stored,
+        })
     }
 
     fn child_specs(&self) -> [ChildSpec; 2] {
@@ -220,14 +231,15 @@ impl Configuration {
                 private_key.as_os_str().to_owned(),
             ]);
         }
+        gateway_arguments
+            .extend([OsString::from("--sessiond"), self.sessiond.as_os_str().to_owned()]);
 
         // Array order is startup order and therefore part of the lifecycle
         // contract. Shutdown iterates this collection in reverse: gatewayd
         // stops before stored, preventing new work while storage drains.
         //
-        // sessiond is intentionally absent. It will be a temporary,
-        // connection-scoped child created by gatewayd and must never be
-        // restarted behind an existing client connection.
+        // sessiond is intentionally absent. Gatewayd receives its executable
+        // path and creates one temporary child per connection.
         [
             ChildSpec { arguments: Vec::new(), executable: self.stored.clone(), role: "stored" },
             ChildSpec {
@@ -240,6 +252,7 @@ impl Configuration {
 
     fn validate(&self) -> io::Result<()> {
         validate_executable("gatewayd", &self.gatewayd)?;
+        validate_executable("sessiond", &self.sessiond)?;
         validate_executable("stored", &self.stored)?;
         match (&self.certificate, &self.private_key) {
             (Some(certificate), Some(private_key)) => {

@@ -2,7 +2,7 @@
 //!
 //! This crate drives the real Renee daemons as the subject under test. It owns
 //! process lifecycle, transport clients, observable outcomes, and fault
-//! injection, while `renee-model` remains an independent deterministic oracle.
+//! injection.
 
 #![forbid(unsafe_code)]
 
@@ -14,6 +14,11 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use renee_wire::{
+    CLIENT_HELLO, ERROR_ALREADY_NEGOTIATED, ERROR_EXPECTED_HELLO, ERROR_UNSUPPORTED_PROFILE,
+    ERROR_UNSUPPORTED_VERSION, Envelope, PROFILE, PROTOCOL_ERROR, SERVER_HELLO, VERSION,
+    decode_body, decode_greeting, encode_body, encode_greeting, read_body, write_body,
+};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 use wtransport::endpoint::endpoint_side;
@@ -21,6 +26,8 @@ use wtransport::tls::{Sha256Digest, Sha256DigestFmt};
 use wtransport::{ClientConfig, Connection, Endpoint};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+/// The greeting sent by the Carbon client represented by this subject harness.
+pub const CARBON_BANNER: &str = "I couldn't stay away";
 
 /// A result produced by the Renee black-box test harness.
 pub type HarnessResult<T> = Result<T, Box<dyn Error>>;
@@ -47,6 +54,24 @@ pub enum PermanentDaemon {
 pub struct WebTransportConnection {
     connection: Connection,
     _endpoint: Endpoint<endpoint_side::Client>,
+}
+
+/// A normalized negotiation observation from the real subject.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NegotiationObservation {
+    /// The requested profile was selected.
+    Selected {
+        /// Informational greeting returned by the real server.
+        server_banner: String,
+    },
+    /// The envelope version is unsupported.
+    UnsupportedVersion,
+    /// The named profile is unsupported.
+    UnsupportedProfile,
+    /// The first message was not a hello.
+    ExpectedHello,
+    /// Negotiation was repeated after success.
+    AlreadyNegotiated,
 }
 
 impl ServerHarness {
@@ -233,6 +258,76 @@ impl ServerHarness {
 }
 
 impl WebTransportConnection {
+    /// Sends a structurally invalid envelope and verifies prompt session termination.
+    pub async fn reject_malformed_envelope(&self) -> HarnessResult<()> {
+        let mut stream =
+            wtransport::stream::BiStream::join(self.connection.open_bi().await?.await?);
+        write_body(&mut stream, b"not-an-envelope").await?;
+        tokio::io::AsyncWriteExt::shutdown(&mut stream).await?;
+
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), read_body(&mut stream)).await.map_err(
+                |_elapsed| io::Error::other("malformed envelope left client stream hanging"),
+            )?;
+        match response {
+            Ok(None) | Err(_) => Ok(()),
+            Ok(Some(_body)) => {
+                Err(io::Error::other("malformed envelope received an unexpected response").into())
+            }
+        }
+    }
+
+    /// Negotiates Renee's experimental profile over one reliable stream.
+    pub async fn negotiate(&self) -> HarnessResult<NegotiationObservation> {
+        self.hello(VERSION, PROFILE, CARBON_BANNER).await
+    }
+
+    /// Sends one experimental hello with caller-selected negotiation values.
+    pub async fn hello(
+        &self,
+        version: u16,
+        profile: &str,
+        banner: &str,
+    ) -> HarnessResult<NegotiationObservation> {
+        let correlation_id = [0x11; 16];
+        let request = Envelope {
+            correlation_id,
+            message_type: CLIENT_HELLO,
+            payload: encode_greeting(profile, banner)?,
+            version,
+        };
+        let mut stream =
+            wtransport::stream::BiStream::join(self.connection.open_bi().await?.await?);
+        write_body(&mut stream, &encode_body(&request)?).await?;
+        tokio::io::AsyncWriteExt::shutdown(&mut stream).await?;
+        let response_body = read_body(&mut stream)
+            .await?
+            .ok_or_else(|| io::Error::other("gateway closed before negotiation response"))?;
+        let response = decode_body(&response_body)?;
+        if response.correlation_id != correlation_id {
+            return Err(io::Error::other("negotiation correlation ID changed").into());
+        }
+        if response.message_type == SERVER_HELLO && response.version == VERSION {
+            let greeting = decode_greeting(&response.payload)?;
+            if greeting.profile != PROFILE {
+                return Err(io::Error::other("server selected an unexpected profile").into());
+            }
+            return Ok(NegotiationObservation::Selected {
+                server_banner: greeting.banner.to_owned(),
+            });
+        }
+        if response.message_type == PROTOCOL_ERROR {
+            return match response.payload.as_slice() {
+                ERROR_UNSUPPORTED_VERSION => Ok(NegotiationObservation::UnsupportedVersion),
+                ERROR_UNSUPPORTED_PROFILE => Ok(NegotiationObservation::UnsupportedProfile),
+                ERROR_EXPECTED_HELLO => Ok(NegotiationObservation::ExpectedHello),
+                ERROR_ALREADY_NEGOTIATED => Ok(NegotiationObservation::AlreadyNegotiated),
+                _ => Err(io::Error::other("unknown negotiation rejection").into()),
+            };
+        }
+        Err(io::Error::other("unexpected negotiation response").into())
+    }
+
     /// Closes the test connection without defining an application close protocol.
     pub fn close(self) {
         self.connection.close(0_u32.into(), b"conformance connection complete");
