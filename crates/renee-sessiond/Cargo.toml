@@ -1,8 +1,8 @@
 [package]
-name = "renee-conformance"
-description = "Model-based and fault-injection conformance harness for Renee"
-keywords = ["conformance", "fault-injection", "testing"]
-categories = ["development-tools::testing"]
+name = "renee-sessiond"
+description = "Connection session daemon for Renee"
+keywords = ["isolation", "server", "session"]
+categories = ["network-programming"]
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -11,6 +11,9 @@ publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+
+[dependencies]
+tokio.workspace = true
 
 [lints]
 workspace = true

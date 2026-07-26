@@ -1,8 +1,8 @@
 [package]
-name = "renee-store"
-description = "Authoritative durable store for Renee"
-keywords = ["persistence", "storage", "synchronization"]
-categories = ["database-implementations"]
+name = "renee-gatewayd"
+description = "Public WebTransport gateway daemon for Renee"
+keywords = ["networking", "server", "webtransport"]
+categories = ["network-programming"]
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -11,6 +11,10 @@ publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+wtransport.workspace = true
 
 [lints]
 workspace = true

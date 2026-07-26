@@ -1,0 +1,19 @@
+[package]
+name = "renee-supervisord"
+description = "Top-level process supervisor daemon for Renee"
+keywords = ["process", "server", "supervisor"]
+categories = ["command-line-utilities"]
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

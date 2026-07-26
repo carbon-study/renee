@@ -41,6 +41,7 @@ cargo clippy --workspace --all-targets --all-features -- \
   -Aclippy::tests-outside-test-module \
   -Aclippy::impl-trait-in-params \
   -Aclippy::missing_panics_doc \
+  -Aclippy::integer_division_remainder_used \
   -Aclippy::unwrap_used \
   -Aclippy::expect_used \
   -Aclippy::panic \

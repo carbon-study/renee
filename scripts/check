@@ -6,5 +6,6 @@ cd "$(dirname "$0")/.."
 
 cargo fmt --all --check
 cargo check --workspace --all-targets --all-features
+cargo build --workspace --bins --all-features
 cargo test --workspace --all-targets --all-features
 ./scripts/clippy

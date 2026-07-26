@@ -1,0 +1,20 @@
+[package]
+name = "renee-subject"
+description = "Black-box process and fault-injection harness for Renee"
+keywords = ["fault-injection", "integration-testing", "testing"]
+categories = ["development-tools::testing"]
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+wtransport.workspace = true
+
+[lints]
+workspace = true
