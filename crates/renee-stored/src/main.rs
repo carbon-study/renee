@@ -15,11 +15,11 @@ use std::sync::Arc;
 
 use renee_wire::{
     ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor,
-    ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, EnumerateResponse, Envelope, FETCH_UPDATE,
-    FETCH_UPDATE_RESPONSE, MAX_APPLICATION_PAYLOAD_LENGTH, UPDATE_ERROR, UpdateErrorCode, VERSION,
-    decode_acceptance_cursor, decode_body, decode_enumerate_request, decode_fetch_request,
-    decode_update_record, encode_accept_response, encode_acceptance_cursor, encode_body,
-    encode_enumerate_response, encode_fetch_response, encode_update_error,
+    ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, EnumerateResponse, EnumerateStart, Envelope,
+    FETCH_UPDATE, FETCH_UPDATE_RESPONSE, MAX_APPLICATION_PAYLOAD_LENGTH, UPDATE_ERROR,
+    UpdateErrorCode, VERSION, decode_acceptance_cursor, decode_body, decode_enumerate_request,
+    decode_fetch_request, decode_update_record, encode_accept_response, encode_acceptance_cursor,
+    encode_body, encode_enumerate_response, encode_fetch_response, encode_update_error,
     enumerate_response_base_length, read_body, write_body,
 };
 use store::{DurableUpdateStore, StoreAcceptOutcome, StoreError};
@@ -194,38 +194,73 @@ async fn handle_request(
                     );
                 }
             };
-            let cursor = if let Some(cursor) = enumerate.cursor.as_deref() {
-                match decode_acceptance_cursor(enumerate.document_id, cursor) {
-                    Ok(cursor) => cursor,
-                    Err(_error) => {
+            let cursor = match enumerate.start {
+                EnumerateStart::Origin => {
+                    let terminal_sequence = store
+                        .lock()
+                        .await
+                        .high_water_sequence(enumerate.document_id)
+                        .map_err(store_error)?;
+                    let Some(terminal_sequence) = terminal_sequence else {
+                        return response(
+                            request,
+                            ENUMERATE_UPDATES_RESPONSE,
+                            encode_enumerate_response(&EnumerateResponse {
+                                has_more: false,
+                                next_cursor: None,
+                                updates: Vec::new(),
+                            })
+                            .map_err(codec_error)?,
+                        );
+                    };
+                    AcceptanceCursor {
+                        position: renee_types::AcceptanceSequence::ORIGIN,
+                        terminal_sequence,
+                    }
+                }
+                EnumerateStart::Continue(encoded) => {
+                    match decode_acceptance_cursor(enumerate.document_id, &encoded) {
+                        Ok(cursor) => cursor,
+                        Err(_error) => {
+                            return response(
+                                request,
+                                UPDATE_ERROR,
+                                encode_update_error(UpdateErrorCode::InvalidCursor),
+                            );
+                        }
+                    }
+                }
+                EnumerateStart::AfterTail(encoded) => {
+                    let previous = match decode_acceptance_cursor(enumerate.document_id, &encoded) {
+                        Ok(cursor) if cursor.position == cursor.terminal_sequence => cursor,
+                        Ok(_) | Err(_) => {
+                            return response(
+                                request,
+                                UPDATE_ERROR,
+                                encode_update_error(UpdateErrorCode::InvalidCursor),
+                            );
+                        }
+                    };
+                    let terminal_sequence = store
+                        .lock()
+                        .await
+                        .high_water_sequence(enumerate.document_id)
+                        .map_err(store_error)?;
+                    let Some(terminal_sequence) = terminal_sequence else {
+                        return response(
+                            request,
+                            UPDATE_ERROR,
+                            encode_update_error(UpdateErrorCode::InvalidCursor),
+                        );
+                    };
+                    if terminal_sequence < previous.position {
                         return response(
                             request,
                             UPDATE_ERROR,
                             encode_update_error(UpdateErrorCode::InvalidCursor),
                         );
                     }
-                }
-            } else {
-                let terminal_sequence = store
-                    .lock()
-                    .await
-                    .high_water_sequence(enumerate.document_id)
-                    .map_err(store_error)?;
-                let Some(terminal_sequence) = terminal_sequence else {
-                    return response(
-                        request,
-                        ENUMERATE_UPDATES_RESPONSE,
-                        encode_enumerate_response(&EnumerateResponse {
-                            has_more: false,
-                            next_cursor: None,
-                            updates: Vec::new(),
-                        })
-                        .map_err(codec_error)?,
-                    );
-                };
-                AcceptanceCursor {
-                    position: renee_types::AcceptanceSequence::ORIGIN,
-                    terminal_sequence,
+                    AcceptanceCursor { position: previous.position, terminal_sequence }
                 }
             };
             // Reserve the complete response prefix including a next cursor.

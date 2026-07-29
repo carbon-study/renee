@@ -21,8 +21,8 @@ use renee_wire::{
     ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, CLIENT_HELLO, ENUMERATE_UPDATES,
     ENUMERATE_UPDATES_RESPONSE, ERROR_ALREADY_NEGOTIATED, ERROR_EXPECTED_HELLO,
     ERROR_UNSUPPORTED_PROFILE, ERROR_UNSUPPORTED_VERSION, EnumerateRequest, EnumerateResponse,
-    Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE, PROFILE, PROTOCOL_ERROR, SERVER_HELLO,
-    UPDATE_ERROR, UpdateErrorCode, VERSION, decode_accept_response, decode_body,
+    EnumerateStart, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE, PROFILE, PROTOCOL_ERROR,
+    SERVER_HELLO, UPDATE_ERROR, UpdateErrorCode, VERSION, decode_accept_response, decode_body,
     decode_enumerate_response, decode_fetch_response, decode_greeting, decode_update_error,
     encode_body, encode_enumerate_request, encode_fetch_request, encode_greeting, read_body,
     write_body,
@@ -445,10 +445,36 @@ impl WebTransportConnection {
         document_id: DocumentId,
         cursor: Option<Vec<u8>>,
     ) -> HarnessResult<EnumerateObservation> {
+        let start = cursor.map_or(EnumerateStart::Origin, EnumerateStart::Continue);
+        self.enumerate_updates_start_observation(document_id, start).await
+    }
+
+    /// Captures a new finite read strictly after one completed tail cursor.
+    pub async fn enumerate_updates_after_tail(
+        &self,
+        document_id: DocumentId,
+        cursor: Vec<u8>,
+    ) -> HarnessResult<EnumerateResponse> {
+        match self
+            .enumerate_updates_start_observation(document_id, EnumerateStart::AfterTail(cursor))
+            .await?
+        {
+            EnumerateObservation::Page(page) => Ok(page),
+            EnumerateObservation::InvalidCursor => {
+                Err(io::Error::other("valid tail cursor received invalid-cursor").into())
+            }
+        }
+    }
+
+    async fn enumerate_updates_start_observation(
+        &self,
+        document_id: DocumentId,
+        start: EnumerateStart,
+    ) -> HarnessResult<EnumerateObservation> {
         let response = self
             .exchange(
                 ENUMERATE_UPDATES,
-                encode_enumerate_request(&EnumerateRequest { document_id, cursor })?,
+                encode_enumerate_request(&EnumerateRequest { document_id, start })?,
             )
             .await?;
         match response.message_type {

@@ -33,8 +33,11 @@ const LORO_PROFILE_CODE: u16 = 1;
 const RANGE_LENGTH: usize = 16;
 const RECORD_FIXED_LENGTH: usize = 50;
 const CURSOR_MAGIC: [u8; 8] = *b"RNECUR\0\0";
-const CURSOR_VERSION: u16 = 1;
+const CURSOR_VERSION: u16 = 2;
 const CURSOR_LENGTH: usize = 8 + 2 + IDENTIFIER_LENGTH + 8 + 8;
+const ENUMERATE_RESPONSE_WITH_CURSOR_LENGTH: usize = 1 + 2 + CURSOR_LENGTH + 2;
+const MAX_ENUMERABLE_METADATA_LENGTH: usize =
+    MAX_APPLICATION_PAYLOAD_LENGTH - ENUMERATE_RESPONSE_WITH_CURSOR_LENGTH;
 
 /// Successful immutable accept outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,8 +70,19 @@ pub enum UpdateErrorCode {
 pub struct EnumerateRequest {
     /// Return updates from this document.
     pub document_id: DocumentId,
-    /// Opaque Renee cursor returned by an earlier page.
-    pub cursor: Option<Vec<u8>>,
+    /// How this request establishes or resumes its finite read window.
+    pub start: EnumerateStart,
+}
+
+/// Starting point for one finite metadata enumeration window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EnumerateStart {
+    /// Capture the current high water and read from document origin.
+    Origin,
+    /// Resume the exact finite window encoded by this cursor.
+    Continue(Vec<u8>),
+    /// Capture a new high water strictly after this completed tail cursor.
+    AfterTail(Vec<u8>),
 }
 
 /// One bounded metadata page.
@@ -108,6 +122,8 @@ pub enum UpdateCodecError {
     InvalidLoroMetadata,
     /// A complete record exceeded the one-frame v1 limit.
     RecordTooLong,
+    /// One update's public metadata cannot fit a cursor-bearing enumeration page.
+    MetadataTooLong,
     /// The encrypted payload was empty.
     EmptyEncryptedPayload,
     /// An enum or boolean field used an unknown value.
@@ -128,6 +144,7 @@ impl fmt::Display for UpdateCodecError {
             Self::UnsupportedLoroProfile => f.write_str("unsupported public Loro profile"),
             Self::InvalidLoroMetadata => f.write_str("invalid public Loro metadata"),
             Self::RecordTooLong => f.write_str("update record exceeds the v1 frame limit"),
+            Self::MetadataTooLong => f.write_str("update metadata cannot fit one enumeration page"),
             Self::EmptyEncryptedPayload => f.write_str("opaque encrypted payload is empty"),
             Self::InvalidDiscriminant => f.write_str("invalid update payload discriminant"),
             Self::InvalidCursor => f.write_str("invalid update enumeration cursor"),
@@ -179,11 +196,15 @@ pub fn decode_update_record(encoded: &[u8]) -> Result<ImmutableUpdate, UpdateCod
     }
     let encrypted_payload = decoder.take(encrypted_payload_length)?.to_vec();
     decoder.finish()?;
-    Ok(ImmutableUpdate::new(document_id, update_id, public_loro_ranges, encrypted_payload))
+    let update =
+        ImmutableUpdate::new(document_id, update_id, public_loro_ranges, encrypted_payload);
+    ensure_metadata_is_enumerable(&update)?;
+    Ok(update)
 }
 
 /// Re-encodes one update in Carbon's canonical durable v1 representation.
 pub fn encode_update_record(update: &ImmutableUpdate) -> Result<Vec<u8>, UpdateCodecError> {
+    ensure_metadata_is_enumerable(update)?;
     let range_count = u16::try_from(update.public_loro_ranges().as_slice().len())
         .map_err(|_error| UpdateCodecError::IntegerOutOfRange)?;
     let payload_length = u32::try_from(update.encrypted_payload().len())
@@ -236,13 +257,19 @@ pub fn decode_accept_response(payload: &[u8]) -> Result<AcceptUpdateOutcome, Upd
 
 /// Encodes a metadata enumeration request.
 pub fn encode_enumerate_request(request: &EnumerateRequest) -> Result<Vec<u8>, UpdateCodecError> {
-    let cursor_length = cursor_length(request.cursor.as_deref())?;
-    let mut payload = Vec::with_capacity(IDENTIFIER_LENGTH + 2 + cursor_length);
+    let (mode, cursor) = match &request.start {
+        EnumerateStart::Origin => (0, None),
+        EnumerateStart::Continue(cursor) => (1, Some(cursor.as_slice())),
+        EnumerateStart::AfterTail(cursor) => (2, Some(cursor.as_slice())),
+    };
+    let cursor_length = cursor_length(cursor)?;
+    let mut payload = Vec::with_capacity(IDENTIFIER_LENGTH + 1 + 2 + cursor_length);
     payload.extend_from_slice(&request.document_id.into_bytes());
+    payload.push(mode);
     let cursor_length =
         u16::try_from(cursor_length).map_err(|_error| UpdateCodecError::IntegerOutOfRange)?;
     payload.extend_from_slice(&cursor_length.to_be_bytes());
-    if let Some(cursor) = &request.cursor {
+    if let Some(cursor) = cursor {
         payload.extend_from_slice(cursor);
     }
     Ok(payload)
@@ -252,14 +279,16 @@ pub fn encode_enumerate_request(request: &EnumerateRequest) -> Result<Vec<u8>, U
 pub fn decode_enumerate_request(payload: &[u8]) -> Result<EnumerateRequest, UpdateCodecError> {
     let mut decoder = Decoder::new(payload);
     let document_id = DocumentId::from_bytes(decoder.take_array()?);
+    let mode = decoder.take_byte()?;
     let cursor_length = usize::from(u16::from_be_bytes(decoder.take_array()?));
-    let cursor = match cursor_length {
-        0 => None,
-        CURSOR_LENGTH => Some(decoder.take(cursor_length)?.to_vec()),
+    let cursor = match (mode, cursor_length) {
+        (0, 0) => EnumerateStart::Origin,
+        (1, CURSOR_LENGTH) => EnumerateStart::Continue(decoder.take(cursor_length)?.to_vec()),
+        (2, CURSOR_LENGTH) => EnumerateStart::AfterTail(decoder.take(cursor_length)?.to_vec()),
         _invalid => return Err(UpdateCodecError::InvalidCursor),
     };
     decoder.finish()?;
-    Ok(EnumerateRequest { document_id, cursor })
+    Ok(EnumerateRequest { document_id, start: cursor })
 }
 
 /// Encodes an opaque cursor after one accepted update.
@@ -322,6 +351,20 @@ pub fn metadata_encoded_length(metadata: &UpdateMetadata) -> Result<usize, Updat
         .and_then(|length| length.checked_add(ranges_length))
         .and_then(|length| length.checked_add(4))
         .ok_or(UpdateCodecError::IntegerOutOfRange)
+}
+
+fn ensure_metadata_is_enumerable(update: &ImmutableUpdate) -> Result<(), UpdateCodecError> {
+    let encrypted_payload_length = u32::try_from(update.encrypted_payload().len())
+        .map_err(|_error| UpdateCodecError::IntegerOutOfRange)?;
+    let metadata = UpdateMetadata {
+        encrypted_payload_length,
+        public_loro_ranges: update.public_loro_ranges().clone(),
+        update_id: update.update_id(),
+    };
+    if metadata_encoded_length(&metadata)? > MAX_ENUMERABLE_METADATA_LENGTH {
+        return Err(UpdateCodecError::MetadataTooLong);
+    }
+    Ok(())
 }
 
 /// Encodes one complete bounded enumeration page.
@@ -602,6 +645,63 @@ mod tests {
     }
 
     #[test]
+    fn admission_rejects_metadata_that_cannot_fit_a_cursor_bearing_page() {
+        let ranges = |count: u64| {
+            PublicLoroRanges::new(
+                (0..count)
+                    .map(|peer_id| {
+                        LoroRange::new(peer_id, 0, 1).expect("fixture range must be valid")
+                    })
+                    .collect(),
+            )
+            .expect("fixture ranges must be canonical")
+        };
+        let document_id = DocumentId::from_bytes([0x61; IDENTIFIER_LENGTH]);
+        let update_id = UpdateId::from_bytes([0x62; IDENTIFIER_LENGTH]);
+        let maximum = ImmutableUpdate::new(document_id, update_id, ranges(250), vec![0x01]);
+        assert_eq!(
+            metadata_encoded_length(&UpdateMetadata {
+                encrypted_payload_length: 1,
+                public_loro_ranges: maximum.public_loro_ranges().clone(),
+                update_id,
+            })
+            .expect("metadata length must encode")
+                + ENUMERATE_RESPONSE_WITH_CURSOR_LENGTH,
+            4_069
+        );
+        assert_eq!(
+            encode_update_record(&maximum).expect("largest enumerable range set must encode").len(),
+            4_051
+        );
+
+        let poison = ImmutableUpdate::new(document_id, update_id, ranges(251), vec![0x01]);
+        assert_eq!(
+            metadata_encoded_length(&UpdateMetadata {
+                encrypted_payload_length: 1,
+                public_loro_ranges: poison.public_loro_ranges().clone(),
+                update_id,
+            })
+            .expect("metadata length must encode")
+                + ENUMERATE_RESPONSE_WITH_CURSOR_LENGTH,
+            4_085
+        );
+        assert_eq!(encode_update_record(&poison), Err(UpdateCodecError::MetadataTooLong));
+
+        let mut raw = Vec::with_capacity(4_067);
+        raw.extend_from_slice(&RECORD_MAGIC);
+        raw.extend_from_slice(&RECORD_VERSION.to_be_bytes());
+        raw.extend_from_slice(&LORO_PROFILE_CODE.to_be_bytes());
+        raw.extend_from_slice(&document_id.into_bytes());
+        raw.extend_from_slice(&update_id.into_bytes());
+        raw.extend_from_slice(&251_u16.to_be_bytes());
+        append_ranges(&mut raw, poison.public_loro_ranges());
+        raw.extend_from_slice(&1_u32.to_be_bytes());
+        raw.push(0x01);
+        assert_eq!(raw.len(), 4_067);
+        assert_eq!(decode_update_record(&raw), Err(UpdateCodecError::MetadataTooLong));
+    }
+
+    #[test]
     fn acceptance_cursor_is_document_bound_and_versioned() {
         let document_id = DocumentId::from_bytes([0x21; IDENTIFIER_LENGTH]);
         let other_document = DocumentId::from_bytes([0x22; IDENTIFIER_LENGTH]);
@@ -652,14 +752,19 @@ mod tests {
             },
         )
         .expect("valid cursor must encode");
-        let request =
-            EnumerateRequest { document_id: record.document_id(), cursor: Some(cursor.clone()) };
-        assert_eq!(
-            decode_enumerate_request(
-                &encode_enumerate_request(&request).expect("request must encode")
-            ),
-            Ok(request)
-        );
+        for start in [
+            EnumerateStart::Origin,
+            EnumerateStart::Continue(cursor.clone()),
+            EnumerateStart::AfterTail(cursor.clone()),
+        ] {
+            let request = EnumerateRequest { document_id: record.document_id(), start };
+            assert_eq!(
+                decode_enumerate_request(
+                    &encode_enumerate_request(&request).expect("request must encode")
+                ),
+                Ok(request)
+            );
+        }
 
         let response = EnumerateResponse {
             has_more: true,

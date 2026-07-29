@@ -22,8 +22,8 @@ mod update;
 pub use update::{
     ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor,
     ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, EnumerateRequest, EnumerateResponse,
-    FETCH_UPDATE, FETCH_UPDATE_RESPONSE, UPDATE_ERROR, UpdateCodecError, UpdateErrorCode,
-    decode_accept_response, decode_acceptance_cursor, decode_enumerate_request,
+    EnumerateStart, FETCH_UPDATE, FETCH_UPDATE_RESPONSE, UPDATE_ERROR, UpdateCodecError,
+    UpdateErrorCode, decode_accept_response, decode_acceptance_cursor, decode_enumerate_request,
     decode_enumerate_response, decode_fetch_request, decode_fetch_response, decode_update_error,
     decode_update_record, encode_accept_response, encode_acceptance_cursor,
     encode_enumerate_request, encode_enumerate_response, encode_fetch_request,

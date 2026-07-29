@@ -156,10 +156,18 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
         return Err(io::Error::other("retry or conflict consumed an acceptance sequence").into());
     }
     let captured_window =
-        connection.enumerate_updates(first.document_id(), Some(first_cursor)).await?;
+        connection.enumerate_updates(first.document_id(), Some(first_cursor.clone())).await?;
     if captured_window.has_more || !captured_window.updates.is_empty() {
         return Err(io::Error::other(
             "acceptance after the captured terminal extended a finite read",
+        )
+        .into());
+    }
+    let tail_page =
+        connection.enumerate_updates_after_tail(first.document_id(), first_cursor.clone()).await?;
+    if tail_page.has_more || tail_page.updates != vec![expected_metadata(&later)] {
+        return Err(io::Error::other(
+            "new high-water read after a stable tail did not return only later acceptances",
         )
         .into());
     }
@@ -264,13 +272,15 @@ async fn acknowledged_update_survives_store_restart() -> HarnessResult<()> {
     {
         return Err(io::Error::other("post-restart update was not inserted").into());
     }
-    let resumed = recovered.enumerate_updates(accepted.document_id(), Some(durable_cursor)).await?;
+    let resumed =
+        recovered.enumerate_updates(accepted.document_id(), Some(durable_cursor.clone())).await?;
     if resumed.has_more || !resumed.updates.is_empty() {
         return Err(io::Error::other("pre-restart finite cursor changed its terminal").into());
     }
-    let refreshed = recovered.enumerate_updates(accepted.document_id(), None).await?;
-    if refreshed.updates != vec![expected_metadata(&accepted), expected_metadata(&later)] {
-        return Err(io::Error::other("new post-restart finite read omitted an update").into());
+    let refreshed =
+        recovered.enumerate_updates_after_tail(accepted.document_id(), durable_cursor).await?;
+    if refreshed.updates != vec![expected_metadata(&later)] {
+        return Err(io::Error::other("tail read repeated history or omitted a new update").into());
     }
 
     recovered.close();
