@@ -12,5 +12,8 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[dependencies]
+renee-types = { path = "../renee-types" }
+
 [lints]
 workspace = true

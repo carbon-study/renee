@@ -1,7 +1,7 @@
 //! Public WebTransport gateway daemon for Renee.
 //!
-//! The current implementation owns only transport admission and connection
-//! lifetime. It deliberately defines no application wire messages yet.
+//! The gateway owns transport admission and connection lifetime. Application
+//! envelopes remain opaque while it relays them through one session process.
 
 #![forbid(unsafe_code)]
 
@@ -24,12 +24,14 @@ use wtransport::tls::Sha256DigestFmt;
 use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:4433";
+const DEFAULT_STORE_ADDRESS: &str = "127.0.0.1:4434";
 
 struct Configuration {
     bind_address: SocketAddr,
     certificate: Option<PathBuf>,
     private_key: Option<PathBuf>,
     sessiond: PathBuf,
+    store_address: SocketAddr,
 }
 
 #[tokio::main]
@@ -62,8 +64,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::select! {
             incoming = endpoint.accept() => {
                 let sessiond = configuration.sessiond.clone();
+                let store_address = configuration.store_address;
                 tokio::spawn(async move {
-                    let _session_result = hold_session(incoming, sessiond).await;
+                    let _session_result = hold_session(incoming, sessiond, store_address).await;
                 });
             }
             read = stdin.read(&mut parent_byte) => {
@@ -87,6 +90,7 @@ impl Configuration {
         let mut certificate = None;
         let mut private_key = None;
         let mut sessiond = None;
+        let mut store_address = OsString::from(DEFAULT_STORE_ADDRESS);
 
         while let Some(argument) = arguments.next() {
             let argument = argument.into_string().map_err(|_argument| {
@@ -100,6 +104,7 @@ impl Configuration {
                 "--certificate" => certificate = Some(PathBuf::from(value)),
                 "--private-key" => private_key = Some(PathBuf::from(value)),
                 "--sessiond" => sessiond = Some(PathBuf::from(value)),
+                "--store" => store_address = value,
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -133,7 +138,13 @@ impl Configuration {
                 .and_then(|path| path.parent().map(|parent| parent.join("renee-sessiond")))
                 .unwrap_or_else(|| PathBuf::from("renee-sessiond"))
         });
-        Ok(Self { bind_address, certificate, private_key, sessiond })
+        let store_address = store_address
+            .into_string()
+            .map_err(|_address| {
+                io::Error::new(io::ErrorKind::InvalidInput, "--store value is not UTF-8")
+            })?
+            .parse()?;
+        Ok(Self { bind_address, certificate, private_key, sessiond, store_address })
     }
 
     fn validate(&self) -> io::Result<()> {
@@ -183,10 +194,11 @@ struct SessionProcess {
 async fn hold_session(
     incoming: IncomingSession,
     sessiond: PathBuf,
+    store_address: SocketAddr,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let request = incoming.await?;
     let connection = request.accept().await?;
-    let mut session = spawn_session(sessiond).await?;
+    let mut session = spawn_session(sessiond, store_address).await?;
 
     let relay_result = relay_session(&connection, &mut session).await;
     let shutdown_result = shutdown_session(session).await;
@@ -243,8 +255,10 @@ async fn shutdown_session(mut session: SessionProcess) -> Result<(), Box<dyn Err
 
 async fn spawn_session(
     executable: PathBuf,
+    store_address: SocketAddr,
 ) -> Result<SessionProcess, Box<dyn Error + Send + Sync>> {
     let mut child = Command::new(executable)
+        .args(["--store", &store_address.to_string()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

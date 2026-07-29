@@ -241,7 +241,11 @@ impl Configuration {
         // sessiond is intentionally absent. Gatewayd receives its executable
         // path and creates one temporary child per connection.
         [
-            ChildSpec { arguments: Vec::new(), executable: self.stored.clone(), role: "stored" },
+            ChildSpec {
+                arguments: vec![OsString::from("--bind"), OsString::from("127.0.0.1:0")],
+                executable: self.stored.clone(),
+                role: "stored",
+            },
             ChildSpec {
                 arguments: gateway_arguments,
                 executable: self.gatewayd.clone(),
@@ -364,20 +368,56 @@ async fn start_group(specifications: &[ChildSpec]) -> RunningGroup {
         let mut children = Vec::new();
         let mut readiness = BTreeMap::new();
         let mut group_failed = false;
+        let mut store_address = None;
 
         for specification in specifications {
+            let mut active_spec = specification.clone();
+            if active_spec.role == "gatewayd" {
+                let Some(address) = store_address.as_ref() else {
+                    write_diagnostic(
+                        active_spec.role,
+                        "store-address-unavailable",
+                        io::ErrorKind::InvalidData,
+                    );
+                    group_failed = true;
+                    break;
+                };
+                active_spec.arguments.extend([OsString::from("--store"), OsString::from(address)]);
+            }
             let mut budget = RestartBudget::new();
             loop {
-                match spawn_ready_child(specification).await {
+                match spawn_ready_child(&active_spec).await {
                     Ok((child, record)) => {
-                        let managed =
-                            ManagedChild::from_started(specification.clone(), child, budget);
-                        readiness.insert(specification.role, record);
+                        if active_spec.role == "stored" {
+                            let Some(address) = readiness_field(&record, "address") else {
+                                drop(child);
+                                write_diagnostic(
+                                    active_spec.role,
+                                    "readiness-address-missing",
+                                    io::ErrorKind::InvalidData,
+                                );
+                                if !budget.record_failure() {
+                                    group_failed = true;
+                                    break;
+                                }
+                                tokio::time::sleep(RESTART_DELAY).await;
+                                continue;
+                            };
+                            // Port zero is resolved exactly once per group.
+                            // The concrete address becomes both stored's stable
+                            // restart bind and gateway/sessiond's dependency.
+                            active_spec.arguments =
+                                vec![OsString::from("--bind"), OsString::from(address)];
+                            store_address = Some(address.to_owned());
+                        }
+                        let role = active_spec.role;
+                        let managed = ManagedChild::from_started(active_spec, child, budget);
+                        readiness.insert(role, record);
                         children.push(managed);
                         break;
                     }
                     Err(error) => {
-                        write_diagnostic(specification.role, "initial-start-failed", error.kind());
+                        write_diagnostic(active_spec.role, "initial-start-failed", error.kind());
                         if !budget.record_failure() {
                             group_failed = true;
                             break;
@@ -474,6 +514,13 @@ async fn read_readiness(role: &'static str, stdout: ChildStdout) -> io::Result<S
         ));
     }
     Ok(record)
+}
+
+fn readiness_field<'record>(record: &'record str, name: &str) -> Option<&'record str> {
+    record.split_ascii_whitespace().find_map(|field| {
+        let (candidate, value) = field.split_once('=')?;
+        (candidate == name && !value.is_empty()).then_some(value)
+    })
 }
 
 async fn shutdown_children(children: &mut [ManagedChild]) {

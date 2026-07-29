@@ -23,7 +23,7 @@ rust-version = "1.85"
 version = "0.0.0"
 
 [workspace.dependencies]
-tokio = { version = "1.53.0", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1.53.0", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 wtransport = "0.6.1"
 
 [workspace.lints.rust]

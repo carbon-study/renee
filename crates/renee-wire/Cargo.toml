@@ -13,6 +13,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+renee-types = { path = "../renee-types" }
 tokio.workspace = true
 
 [lints]

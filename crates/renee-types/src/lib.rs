@@ -7,8 +7,15 @@
 
 use core::fmt;
 
-const IDENTIFIER_LENGTH: usize = 16;
+/// Bytes in every public document and update identifier.
+pub const IDENTIFIER_LENGTH: usize = 16;
 const SECRET_LENGTH: usize = 32;
+/// Maximum public Loro peers named by one immutable update.
+pub const MAX_LORO_PEERS: usize = 256;
+/// Largest counter representable by Carbon's pinned Loro profile.
+pub const MAX_LORO_COUNTER: u32 = 0x7fff_ffff;
+/// Maximum operations represented by one update's public ranges.
+pub const MAX_UPDATE_OPERATIONS: u32 = 0x0010_0000;
 
 macro_rules! identifier {
     ($name:ident, $description:literal) => {
@@ -41,6 +48,179 @@ identifier!(CapabilityId, "An opaque capability identifier scoped to one documen
 identifier!(RequestId, "An opaque idempotency request identifier.");
 identifier!(UpdateId, "An opaque immutable-update identifier scoped to one document.");
 identifier!(CheckpointId, "An opaque checkpoint identifier scoped to one document.");
+
+/// One public, nonempty, half-open Loro operation range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoroRange {
+    end_counter: u32,
+    peer_id: u64,
+    start_counter: u32,
+}
+
+impl LoroRange {
+    /// Validates one public range against the frozen v1 Loro profile.
+    pub const fn new(
+        peer_id: u64,
+        start_counter: u32,
+        end_counter: u32,
+    ) -> Result<Self, LoroMetadataError> {
+        if start_counter > MAX_LORO_COUNTER || end_counter > MAX_LORO_COUNTER {
+            return Err(LoroMetadataError::CounterOutOfRange);
+        }
+        if start_counter >= end_counter {
+            return Err(LoroMetadataError::EmptyOrReversedRange);
+        }
+        if end_counter - start_counter > MAX_UPDATE_OPERATIONS {
+            return Err(LoroMetadataError::TooManyOperations);
+        }
+        Ok(Self { end_counter, peer_id, start_counter })
+    }
+
+    /// Returns the exclusive operation counter.
+    pub const fn end_counter(self) -> u32 {
+        self.end_counter
+    }
+
+    /// Returns the persisted Loro replica peer.
+    pub const fn peer_id(self) -> u64 {
+        self.peer_id
+    }
+
+    /// Returns the inclusive operation counter.
+    pub const fn start_counter(self) -> u32 {
+        self.start_counter
+    }
+
+    const fn operation_count(self) -> u32 {
+        self.end_counter - self.start_counter
+    }
+}
+
+/// Canonical, nonempty public Loro metadata for one update.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicLoroRanges(Vec<LoroRange>);
+
+impl PublicLoroRanges {
+    /// Validates peer ordering, uniqueness, and aggregate work.
+    pub fn new(ranges: Vec<LoroRange>) -> Result<Self, LoroMetadataError> {
+        if ranges.is_empty() {
+            return Err(LoroMetadataError::Empty);
+        }
+        if ranges.len() > MAX_LORO_PEERS {
+            return Err(LoroMetadataError::TooManyPeers);
+        }
+
+        let mut previous_peer = None;
+        let mut operation_count = 0_u32;
+        for range in &ranges {
+            if previous_peer.is_some_and(|peer| peer >= range.peer_id) {
+                return Err(LoroMetadataError::NonCanonicalPeerOrder);
+            }
+            operation_count = operation_count
+                .checked_add(range.operation_count())
+                .ok_or(LoroMetadataError::TooManyOperations)?;
+            if operation_count > MAX_UPDATE_OPERATIONS {
+                return Err(LoroMetadataError::TooManyOperations);
+            }
+            previous_peer = Some(range.peer_id);
+        }
+        Ok(Self(ranges))
+    }
+
+    /// Returns the canonical public ranges.
+    pub fn as_slice(&self) -> &[LoroRange] {
+        &self.0
+    }
+}
+
+/// Structural failure in public Loro metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoroMetadataError {
+    /// The update named no operations.
+    Empty,
+    /// More than the frozen peer limit was supplied.
+    TooManyPeers,
+    /// A counter cannot be represented by the pinned profile.
+    CounterOutOfRange,
+    /// A range selected no operations or ran backwards.
+    EmptyOrReversedRange,
+    /// Aggregate selected operations exceeded the v1 limit.
+    TooManyOperations,
+    /// Peers were not strictly ascending and unique.
+    NonCanonicalPeerOrder,
+}
+
+impl fmt::Display for LoroMetadataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("public Loro ranges are empty"),
+            Self::TooManyPeers => f.write_str("public Loro peer limit exceeded"),
+            Self::CounterOutOfRange => f.write_str("public Loro counter is out of range"),
+            Self::EmptyOrReversedRange => f.write_str("public Loro range is empty or reversed"),
+            Self::TooManyOperations => f.write_str("public Loro operation limit exceeded"),
+            Self::NonCanonicalPeerOrder => {
+                f.write_str("public Loro peers are not strictly ascending")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LoroMetadataError {}
+
+/// One immutable update as understood by Renee.
+///
+/// The encrypted payload is deliberately an opaque byte string. This type has
+/// no dependency on Carbon's cryptographic envelope implementation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImmutableUpdate {
+    document_id: DocumentId,
+    encrypted_payload: Vec<u8>,
+    public_loro_ranges: PublicLoroRanges,
+    update_id: UpdateId,
+}
+
+impl ImmutableUpdate {
+    /// Creates one already-validated immutable update.
+    pub const fn new(
+        document_id: DocumentId,
+        update_id: UpdateId,
+        public_loro_ranges: PublicLoroRanges,
+        encrypted_payload: Vec<u8>,
+    ) -> Self {
+        Self { document_id, encrypted_payload, public_loro_ranges, update_id }
+    }
+
+    /// Returns the update's document.
+    pub const fn document_id(&self) -> DocumentId {
+        self.document_id
+    }
+
+    /// Returns the opaque encrypted bytes without interpreting them.
+    pub fn encrypted_payload(&self) -> &[u8] {
+        &self.encrypted_payload
+    }
+
+    /// Returns the visible normalized Loro metadata.
+    pub const fn public_loro_ranges(&self) -> &PublicLoroRanges {
+        &self.public_loro_ranges
+    }
+
+    /// Returns the immutable document-scoped update identifier.
+    pub const fn update_id(&self) -> UpdateId {
+        self.update_id
+    }
+}
+
+/// Public metadata returned by update enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateMetadata {
+    /// Opaque encrypted payload length.
+    pub encrypted_payload_length: u32,
+    /// Visible normalized Loro ranges.
+    pub public_loro_ranges: PublicLoroRanges,
+    /// Immutable document-scoped update identifier.
+    pub update_id: UpdateId,
+}
 
 /// A 32-byte bearer capability authenticator.
 ///

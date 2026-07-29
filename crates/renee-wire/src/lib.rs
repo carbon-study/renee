@@ -17,6 +17,18 @@ use std::str;
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
+mod update;
+
+pub use update::{
+    ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, ENUMERATE_UPDATES,
+    ENUMERATE_UPDATES_RESPONSE, EnumerateRequest, EnumerateResponse, FETCH_UPDATE,
+    FETCH_UPDATE_RESPONSE, UPDATE_ERROR, UpdateCodecError, UpdateErrorCode, decode_accept_response,
+    decode_enumerate_request, decode_enumerate_response, decode_fetch_request,
+    decode_fetch_response, decode_update_error, decode_update_record, encode_accept_response,
+    encode_enumerate_request, encode_enumerate_response, encode_fetch_request,
+    encode_fetch_response, encode_update_error, encode_update_record, metadata_encoded_length,
+};
+
 /// Experimental profile identifier carried by negotiation messages.
 pub const PROFILE: &str = "renee-experimental-v0";
 /// Byte representation of the experimental profile identifier.
@@ -41,11 +53,14 @@ pub const ERROR_ALREADY_NEGOTIATED: &[u8] = b"already-negotiated";
 pub const ERROR_MALFORMED_HELLO: &[u8] = b"malformed-client-hello";
 /// Maximum body length accepted by this experimental profile.
 pub const MAX_BODY_LENGTH: usize = 4_096;
+/// Magic, version, message type, and correlation identifier overhead.
+pub const ENVELOPE_HEADER_LENGTH: usize = 24;
+/// Largest application payload inside one Renee frame body.
+pub const MAX_APPLICATION_PAYLOAD_LENGTH: usize = MAX_BODY_LENGTH - ENVELOPE_HEADER_LENGTH;
 /// Maximum UTF-8 byte length of either greeting field.
 pub const MAX_GREETING_FIELD_LENGTH: usize = 256;
 
 const MAGIC: [u8; 4] = *b"RNE0";
-const HEADER_LENGTH: usize = 24;
 
 /// One decoded experimental application envelope.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,7 +147,7 @@ pub fn encode_frame(envelope: &Envelope) -> io::Result<Vec<u8>> {
 
 /// Encodes one envelope body without its length prefix.
 pub fn encode_body(envelope: &Envelope) -> io::Result<Vec<u8>> {
-    let body_length = HEADER_LENGTH
+    let body_length = ENVELOPE_HEADER_LENGTH
         .checked_add(envelope.payload.len())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame length overflow"))?;
     if body_length > MAX_BODY_LENGTH {
@@ -152,7 +167,7 @@ pub fn decode_body(body: &[u8]) -> Result<Envelope, DecodeError> {
     if body.len() > MAX_BODY_LENGTH {
         return Err(DecodeError::TooLong);
     }
-    if body.len() < HEADER_LENGTH {
+    if body.len() < ENVELOPE_HEADER_LENGTH {
         return Err(DecodeError::Truncated);
     }
     if body.get(..4) != Some(MAGIC.as_slice()) {
@@ -161,7 +176,7 @@ pub fn decode_body(body: &[u8]) -> Result<Envelope, DecodeError> {
     let version = u16::from_be_bytes(copy_array(body, 4)?);
     let message_type = u16::from_be_bytes(copy_array(body, 6)?);
     let correlation_id = copy_array(body, 8)?;
-    let payload = body.get(HEADER_LENGTH..).ok_or(DecodeError::Truncated)?.to_vec();
+    let payload = body.get(ENVELOPE_HEADER_LENGTH..).ok_or(DecodeError::Truncated)?.to_vec();
     Ok(Envelope { correlation_id, message_type, payload, version })
 }
 

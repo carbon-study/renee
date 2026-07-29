@@ -14,10 +14,16 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use renee_types::{DocumentId, UpdateId};
 use renee_wire::{
-    CLIENT_HELLO, ERROR_ALREADY_NEGOTIATED, ERROR_EXPECTED_HELLO, ERROR_UNSUPPORTED_PROFILE,
-    ERROR_UNSUPPORTED_VERSION, Envelope, PROFILE, PROTOCOL_ERROR, SERVER_HELLO, VERSION,
-    decode_body, decode_greeting, encode_body, encode_greeting, read_body, write_body,
+    ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, CLIENT_HELLO, ENUMERATE_UPDATES,
+    ENUMERATE_UPDATES_RESPONSE, ERROR_ALREADY_NEGOTIATED, ERROR_EXPECTED_HELLO,
+    ERROR_UNSUPPORTED_PROFILE, ERROR_UNSUPPORTED_VERSION, EnumerateRequest, EnumerateResponse,
+    Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE, PROFILE, PROTOCOL_ERROR, SERVER_HELLO,
+    UPDATE_ERROR, UpdateErrorCode, VERSION, decode_accept_response, decode_body,
+    decode_enumerate_response, decode_fetch_response, decode_greeting, decode_update_error,
+    encode_body, encode_enumerate_request, encode_fetch_request, encode_greeting, read_body,
+    write_body,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
@@ -72,6 +78,28 @@ pub enum NegotiationObservation {
     ExpectedHello,
     /// Negotiation was repeated after success.
     AlreadyNegotiated,
+}
+
+/// Subject observation for immutable accept.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcceptObservation {
+    /// A new idempotency key was inserted.
+    Inserted,
+    /// The exact same immutable bytes were already present.
+    AlreadyPresent,
+    /// The document-scoped update ID named different immutable input.
+    IdentifierConflict,
+    /// Renee rejected the record structure.
+    Malformed,
+}
+
+/// Subject observation for an authorized fetch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FetchObservation {
+    /// Renee returned the exact opaque encrypted bytes.
+    Found(Vec<u8>),
+    /// No update exists under the complete idempotency key.
+    NotFound,
 }
 
 impl ServerHarness {
@@ -328,9 +356,88 @@ impl WebTransportConnection {
         Err(io::Error::other("unexpected negotiation response").into())
     }
 
+    /// Submits one exact canonical record to Renee.
+    pub async fn accept_update(&self, encoded_record: &[u8]) -> HarnessResult<AcceptObservation> {
+        let response = self.exchange(ACCEPT_UPDATE, encoded_record.to_vec()).await?;
+        match response.message_type {
+            ACCEPT_UPDATE_RESPONSE => match decode_accept_response(&response.payload)? {
+                AcceptUpdateOutcome::Inserted => Ok(AcceptObservation::Inserted),
+                AcceptUpdateOutcome::AlreadyPresent => Ok(AcceptObservation::AlreadyPresent),
+            },
+            UPDATE_ERROR => match decode_update_error(&response.payload)? {
+                UpdateErrorCode::IdentifierConflict => Ok(AcceptObservation::IdentifierConflict),
+                UpdateErrorCode::Malformed => Ok(AcceptObservation::Malformed),
+                UpdateErrorCode::NotFound | UpdateErrorCode::NotNegotiated => {
+                    Err(io::Error::other("unexpected accept rejection").into())
+                }
+            },
+            unexpected => Err(io::Error::other(format!(
+                "unexpected accept response type {unexpected} payload {:?}",
+                response.payload
+            ))
+            .into()),
+        }
+    }
+
+    /// Enumerates one bounded page of public update metadata.
+    pub async fn enumerate_updates(
+        &self,
+        document_id: DocumentId,
+        after: Option<UpdateId>,
+    ) -> HarnessResult<EnumerateResponse> {
+        let response = self
+            .exchange(
+                ENUMERATE_UPDATES,
+                encode_enumerate_request(EnumerateRequest { document_id, after }),
+            )
+            .await?;
+        if response.message_type != ENUMERATE_UPDATES_RESPONSE {
+            return Err(io::Error::other("unexpected enumerate response").into());
+        }
+        Ok(decode_enumerate_response(&response.payload)?)
+    }
+
+    /// Fetches one exact opaque encrypted payload.
+    pub async fn fetch_update(
+        &self,
+        document_id: DocumentId,
+        update_id: UpdateId,
+    ) -> HarnessResult<FetchObservation> {
+        let response =
+            self.exchange(FETCH_UPDATE, encode_fetch_request(document_id, update_id)).await?;
+        match response.message_type {
+            FETCH_UPDATE_RESPONSE => {
+                Ok(FetchObservation::Found(decode_fetch_response(&response.payload)?.to_vec()))
+            }
+            UPDATE_ERROR
+                if decode_update_error(&response.payload)? == UpdateErrorCode::NotFound =>
+            {
+                Ok(FetchObservation::NotFound)
+            }
+            _unexpected => Err(io::Error::other("unexpected fetch response").into()),
+        }
+    }
+
     /// Closes the test connection without defining an application close protocol.
     pub fn close(self) {
         self.connection.close(0_u32.into(), b"conformance connection complete");
+    }
+
+    async fn exchange(&self, message_type: u16, payload: Vec<u8>) -> HarnessResult<Envelope> {
+        let correlation_id = [0x22_u8; 16];
+        let request = Envelope { correlation_id, message_type, payload, version: VERSION };
+        let mut stream =
+            wtransport::stream::BiStream::join(self.connection.open_bi().await?.await?);
+        write_body(&mut stream, &encode_body(&request)?).await?;
+        tokio::io::AsyncWriteExt::shutdown(&mut stream).await?;
+        let response_body = read_body(&mut stream)
+            .await?
+            .ok_or_else(|| io::Error::other("gateway closed before application response"))?;
+        let response = decode_body(&response_body)?;
+        if response.correlation_id != correlation_id || response.version != VERSION {
+            return Err(io::Error::other("application response envelope changed").into());
+        }
+        Ok(response)
     }
 }
 
