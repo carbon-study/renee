@@ -14,9 +14,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use renee_wire::{
-    ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, ENUMERATE_UPDATES,
-    ENUMERATE_UPDATES_RESPONSE, EnumerateResponse, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE,
-    MAX_APPLICATION_PAYLOAD_LENGTH, UPDATE_ERROR, UpdateErrorCode, VERSION,
+    ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor,
+    ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, EnumerateResponse, Envelope, FETCH_UPDATE,
+    FETCH_UPDATE_RESPONSE, MAX_APPLICATION_PAYLOAD_LENGTH, UPDATE_ERROR, UpdateErrorCode, VERSION,
     decode_acceptance_cursor, decode_body, decode_enumerate_request, decode_fetch_request,
     decode_update_record, encode_accept_response, encode_acceptance_cursor, encode_body,
     encode_enumerate_response, encode_fetch_response, encode_update_error,
@@ -194,9 +194,9 @@ async fn handle_request(
                     );
                 }
             };
-            let after = match enumerate.cursor.as_deref() {
-                Some(cursor) => match decode_acceptance_cursor(enumerate.document_id, cursor) {
-                    Ok(sequence) => sequence,
+            let cursor = if let Some(cursor) = enumerate.cursor.as_deref() {
+                match decode_acceptance_cursor(enumerate.document_id, cursor) {
+                    Ok(cursor) => cursor,
                     Err(_error) => {
                         return response(
                             request,
@@ -204,15 +204,39 @@ async fn handle_request(
                             encode_update_error(UpdateErrorCode::InvalidCursor),
                         );
                     }
-                },
-                None => renee_types::AcceptanceSequence::ORIGIN,
+                }
+            } else {
+                let terminal_sequence = store
+                    .lock()
+                    .await
+                    .high_water_sequence(enumerate.document_id)
+                    .map_err(store_error)?;
+                let Some(terminal_sequence) = terminal_sequence else {
+                    return response(
+                        request,
+                        ENUMERATE_UPDATES_RESPONSE,
+                        encode_enumerate_response(&EnumerateResponse {
+                            has_more: false,
+                            next_cursor: None,
+                            updates: Vec::new(),
+                        })
+                        .map_err(codec_error)?,
+                    );
+                };
+                AcceptanceCursor {
+                    position: renee_types::AcceptanceSequence::ORIGIN,
+                    terminal_sequence,
+                }
             };
             // Reserve the complete response prefix including a next cursor.
             // This makes every nonempty page encodable without revisiting the
             // database result or trusting a rough framing estimate.
             let example_cursor = encode_acceptance_cursor(
                 enumerate.document_id,
-                renee_types::AcceptanceSequence::FIRST,
+                AcceptanceCursor {
+                    position: renee_types::AcceptanceSequence::FIRST,
+                    terminal_sequence: renee_types::AcceptanceSequence::FIRST,
+                },
             )
             .map_err(codec_error)?;
             let response_overhead =
@@ -220,8 +244,12 @@ async fn handle_request(
             let metadata_byte_limit = MAX_APPLICATION_PAYLOAD_LENGTH
                 .checked_sub(response_overhead)
                 .ok_or_else(|| io::Error::other("enumeration response overhead exceeds frame"))?;
-            let page_result =
-                store.lock().await.enumerate(enumerate.document_id, after, metadata_byte_limit);
+            let page_result = store.lock().await.enumerate(
+                enumerate.document_id,
+                cursor.position,
+                cursor.terminal_sequence,
+                metadata_byte_limit,
+            );
             let page = match page_result {
                 Ok(page) => page,
                 Err(StoreError::InvalidCursor) => {
@@ -235,7 +263,12 @@ async fn handle_request(
             };
             let next_cursor = page
                 .last_sequence
-                .map(|sequence| encode_acceptance_cursor(enumerate.document_id, sequence))
+                .map(|position| {
+                    encode_acceptance_cursor(
+                        enumerate.document_id,
+                        AcceptanceCursor { position, terminal_sequence: cursor.terminal_sequence },
+                    )
+                })
                 .transpose()
                 .map_err(codec_error)?;
             let updates = page.updates.into_iter().map(|(_sequence, metadata)| metadata).collect();

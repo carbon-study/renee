@@ -34,7 +34,7 @@ const RANGE_LENGTH: usize = 16;
 const RECORD_FIXED_LENGTH: usize = 50;
 const CURSOR_MAGIC: [u8; 8] = *b"RNECUR\0\0";
 const CURSOR_VERSION: u16 = 1;
-const CURSOR_LENGTH: usize = 8 + 2 + IDENTIFIER_LENGTH + 8;
+const CURSOR_LENGTH: usize = 8 + 2 + IDENTIFIER_LENGTH + 8 + 8;
 
 /// Successful immutable accept outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +80,15 @@ pub struct EnumerateResponse {
     pub next_cursor: Option<Vec<u8>>,
     /// Public metadata in Renee acceptance order.
     pub updates: Vec<UpdateMetadata>,
+}
+
+/// Renee-owned finite-read bounds recovered from an opaque cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcceptanceCursor {
+    /// Exclusive position already returned to the client.
+    pub position: AcceptanceSequence,
+    /// Inclusive high-water sequence captured by the first request.
+    pub terminal_sequence: AcceptanceSequence,
 }
 
 /// Frozen update payload codec failure.
@@ -256,24 +265,28 @@ pub fn decode_enumerate_request(payload: &[u8]) -> Result<EnumerateRequest, Upda
 /// Encodes an opaque cursor after one accepted update.
 pub fn encode_acceptance_cursor(
     document_id: DocumentId,
-    sequence: AcceptanceSequence,
+    cursor: AcceptanceCursor,
 ) -> Result<Vec<u8>, UpdateCodecError> {
-    if sequence == AcceptanceSequence::ORIGIN {
+    if cursor.position == AcceptanceSequence::ORIGIN
+        || cursor.terminal_sequence == AcceptanceSequence::ORIGIN
+        || cursor.position > cursor.terminal_sequence
+    {
         return Err(UpdateCodecError::InvalidCursor);
     }
-    let mut cursor = Vec::with_capacity(CURSOR_LENGTH);
-    cursor.extend_from_slice(&CURSOR_MAGIC);
-    cursor.extend_from_slice(&CURSOR_VERSION.to_be_bytes());
-    cursor.extend_from_slice(&document_id.into_bytes());
-    cursor.extend_from_slice(&sequence.to_be_bytes());
-    Ok(cursor)
+    let mut encoded = Vec::with_capacity(CURSOR_LENGTH);
+    encoded.extend_from_slice(&CURSOR_MAGIC);
+    encoded.extend_from_slice(&CURSOR_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&document_id.into_bytes());
+    encoded.extend_from_slice(&cursor.position.to_be_bytes());
+    encoded.extend_from_slice(&cursor.terminal_sequence.to_be_bytes());
+    Ok(encoded)
 }
 
 /// Validates and opens a cursor for the named document.
 pub fn decode_acceptance_cursor(
     document_id: DocumentId,
     encoded: &[u8],
-) -> Result<AcceptanceSequence, UpdateCodecError> {
+) -> Result<AcceptanceCursor, UpdateCodecError> {
     let mut decoder = Decoder::new(encoded);
     if decoder.take_array()? != CURSOR_MAGIC {
         return Err(UpdateCodecError::InvalidCursor);
@@ -284,12 +297,16 @@ pub fn decode_acceptance_cursor(
     if DocumentId::from_bytes(decoder.take_array()?) != document_id {
         return Err(UpdateCodecError::InvalidCursor);
     }
-    let sequence = AcceptanceSequence::from_be_bytes(decoder.take_array()?);
-    if sequence == AcceptanceSequence::ORIGIN {
+    let position = AcceptanceSequence::from_be_bytes(decoder.take_array()?);
+    let terminal_sequence = AcceptanceSequence::from_be_bytes(decoder.take_array()?);
+    if position == AcceptanceSequence::ORIGIN
+        || terminal_sequence == AcceptanceSequence::ORIGIN
+        || position > terminal_sequence
+    {
         return Err(UpdateCodecError::InvalidCursor);
     }
     decoder.finish()?;
-    Ok(sequence)
+    Ok(AcceptanceCursor { position, terminal_sequence })
 }
 
 /// Returns the exact bytes required by one metadata entry.
@@ -588,12 +605,14 @@ mod tests {
     fn acceptance_cursor_is_document_bound_and_versioned() {
         let document_id = DocumentId::from_bytes([0x21; IDENTIFIER_LENGTH]);
         let other_document = DocumentId::from_bytes([0x22; IDENTIFIER_LENGTH]);
-        let sequence = AcceptanceSequence::from_be_bytes([0, 0, 0, 0, 0, 0, 0, 37]);
+        let position = AcceptanceSequence::from_be_bytes([0, 0, 0, 0, 0, 0, 0, 37]);
+        let terminal_sequence = AcceptanceSequence::from_be_bytes([0, 0, 0, 0, 0, 0, 0, 41]);
+        let decoded = AcceptanceCursor { position, terminal_sequence };
         let cursor =
-            encode_acceptance_cursor(document_id, sequence).expect("valid cursor must encode");
+            encode_acceptance_cursor(document_id, decoded).expect("valid cursor must encode");
 
         assert_eq!(cursor.len(), CURSOR_LENGTH);
-        assert_eq!(decode_acceptance_cursor(document_id, &cursor), Ok(sequence));
+        assert_eq!(decode_acceptance_cursor(document_id, &cursor), Ok(decoded));
         assert_eq!(
             decode_acceptance_cursor(other_document, &cursor),
             Err(UpdateCodecError::InvalidCursor)
@@ -606,7 +625,17 @@ mod tests {
             Err(UpdateCodecError::InvalidCursor)
         );
         assert_eq!(
-            encode_acceptance_cursor(document_id, AcceptanceSequence::ORIGIN),
+            encode_acceptance_cursor(
+                document_id,
+                AcceptanceCursor { position: AcceptanceSequence::ORIGIN, terminal_sequence },
+            ),
+            Err(UpdateCodecError::InvalidCursor)
+        );
+        assert_eq!(
+            encode_acceptance_cursor(
+                document_id,
+                AcceptanceCursor { position: terminal_sequence, terminal_sequence: position },
+            ),
             Err(UpdateCodecError::InvalidCursor)
         );
     }
@@ -615,8 +644,14 @@ mod tests {
     fn enumeration_request_and_response_preserve_opaque_cursor() {
         let record =
             decode_update_record(&decode_hex(FIXED_RECORD_HEX)).expect("Carbon vector must decode");
-        let cursor = encode_acceptance_cursor(record.document_id(), AcceptanceSequence::FIRST)
-            .expect("valid cursor must encode");
+        let cursor = encode_acceptance_cursor(
+            record.document_id(),
+            AcceptanceCursor {
+                position: AcceptanceSequence::FIRST,
+                terminal_sequence: AcceptanceSequence::FIRST,
+            },
+        )
+        .expect("valid cursor must encode");
         let request =
             EnumerateRequest { document_id: record.document_id(), cursor: Some(cursor.clone()) };
         assert_eq!(

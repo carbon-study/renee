@@ -17,7 +17,9 @@ use renee_types::{
     AcceptanceSequence, DocumentId, ImmutableUpdate, LoroRange, PublicLoroRanges, UpdateId,
     UpdateMetadata,
 };
-use renee_wire::{decode_acceptance_cursor, encode_acceptance_cursor, encode_update_record};
+use renee_wire::{
+    AcceptanceCursor, decode_acceptance_cursor, encode_acceptance_cursor, encode_update_record,
+};
 
 fn update(document: u8, update: u8, payload: &[u8]) -> ImmutableUpdate {
     let ranges = PublicLoroRanges::new(vec![
@@ -97,7 +99,13 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
     let first_cursor = first_page
         .next_cursor
         .ok_or_else(|| io::Error::other("nonempty page omitted its cursor"))?;
-    if decode_acceptance_cursor(first.document_id(), &first_cursor)? != AcceptanceSequence::FIRST {
+    let decoded_first_cursor = decode_acceptance_cursor(first.document_id(), &first_cursor)?;
+    if decoded_first_cursor
+        != (AcceptanceCursor {
+            position: AcceptanceSequence::FIRST,
+            terminal_sequence: AcceptanceSequence::FIRST,
+        })
+    {
         return Err(io::Error::other("first acceptance received the wrong cursor position").into());
     }
 
@@ -109,8 +117,11 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
         return Err(io::Error::other("second document update was not inserted").into());
     }
 
+    let terminal_sequence = model
+        .high_water_sequence(first.document_id())
+        .ok_or_else(|| io::Error::other("model omitted the enumeration high-water sequence"))?;
     let expected_page = model
-        .enumerate(first.document_id(), None)
+        .enumerate(first.document_id(), None, terminal_sequence)
         .map(|(_sequence, metadata)| metadata)
         .collect::<Vec<_>>();
     let observed_page = connection.enumerate_updates(first.document_id(), None).await?;
@@ -120,26 +131,37 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
     if observed_page.updates != vec![expected_metadata(&first), expected_metadata(&later)] {
         return Err(io::Error::other("enumeration exposed wrong public metadata").into());
     }
-    let first_sequence = model
-        .acceptance_sequence(first.document_id(), first.update_id())
-        .ok_or_else(|| io::Error::other("model omitted first acceptance sequence"))?;
     let expected_after = model
-        .enumerate(first.document_id(), Some(first_sequence))
+        .enumerate(first.document_id(), Some(terminal_sequence), terminal_sequence)
         .map(|(_sequence, metadata)| metadata)
         .collect::<Vec<_>>();
-    let observed_after =
-        connection.enumerate_updates(first.document_id(), Some(first_cursor)).await?;
+    let observed_after = connection
+        .enumerate_updates(first.document_id(), observed_page.next_cursor.clone())
+        .await?;
     if observed_after.has_more || observed_after.updates != expected_after {
         return Err(io::Error::other("enumeration cursor was not exclusive").into());
     }
-    let later_cursor = observed_after
+    let later_cursor = observed_page
         .next_cursor
-        .ok_or_else(|| io::Error::other("resumed nonempty page omitted its cursor"))?;
+        .ok_or_else(|| io::Error::other("nonempty finite page omitted its cursor"))?;
     let expected_later_sequence = AcceptanceSequence::FIRST
         .checked_next()
         .ok_or_else(|| io::Error::other("fixture acceptance sequence overflowed"))?;
-    if decode_acceptance_cursor(first.document_id(), &later_cursor)? != expected_later_sequence {
+    if decode_acceptance_cursor(first.document_id(), &later_cursor)?
+        != (AcceptanceCursor {
+            position: expected_later_sequence,
+            terminal_sequence: expected_later_sequence,
+        })
+    {
         return Err(io::Error::other("retry or conflict consumed an acceptance sequence").into());
+    }
+    let captured_window =
+        connection.enumerate_updates(first.document_id(), Some(first_cursor)).await?;
+    if captured_window.has_more || !captured_window.updates.is_empty() {
+        return Err(io::Error::other(
+            "acceptance after the captured terminal extended a finite read",
+        )
+        .into());
     }
 
     let wrong_document = DocumentId::from_bytes([0x77; 16]);
@@ -156,7 +178,10 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
     }
     let impossible_cursor = encode_acceptance_cursor(
         first.document_id(),
-        AcceptanceSequence::from_be_bytes([0xff; 8]),
+        AcceptanceCursor {
+            position: AcceptanceSequence::from_be_bytes([0xff; 8]),
+            terminal_sequence: AcceptanceSequence::from_be_bytes([0xff; 8]),
+        },
     )?;
     if connection
         .enumerate_updates_observation(first.document_id(), Some(impossible_cursor))
@@ -240,8 +265,12 @@ async fn acknowledged_update_survives_store_restart() -> HarnessResult<()> {
         return Err(io::Error::other("post-restart update was not inserted").into());
     }
     let resumed = recovered.enumerate_updates(accepted.document_id(), Some(durable_cursor)).await?;
-    if resumed.updates != vec![expected_metadata(&later)] {
-        return Err(io::Error::other("pre-restart cursor did not resume after restart").into());
+    if resumed.has_more || !resumed.updates.is_empty() {
+        return Err(io::Error::other("pre-restart finite cursor changed its terminal").into());
+    }
+    let refreshed = recovered.enumerate_updates(accepted.document_id(), None).await?;
+    if refreshed.updates != vec![expected_metadata(&accepted), expected_metadata(&later)] {
+        return Err(io::Error::other("new post-restart finite read omitted an update").into());
     }
 
     recovered.close();

@@ -188,21 +188,49 @@ impl DurableUpdateStore {
         Ok(StoreAcceptOutcome::Inserted)
     }
 
-    /// Enumerates a byte-bounded page in document acceptance order.
+    /// Returns the current inclusive document high-water sequence.
+    pub fn high_water_sequence(
+        &self,
+        document_id: DocumentId,
+    ) -> Result<Option<AcceptanceSequence>, StoreError> {
+        let document_bytes = document_id.into_bytes();
+        self.connection
+            .query_row(
+                "SELECT acceptance_sequence
+                 FROM updates
+                 WHERE document_id = ?1
+                 ORDER BY acceptance_sequence DESC
+                 LIMIT 1",
+                params![document_bytes.as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|encoded| decode_sequence(&encoded))
+            .transpose()
+    }
+
+    /// Enumerates one byte-bounded page inside a captured finite-read window.
     pub fn enumerate(
         &self,
         document_id: DocumentId,
-        after: AcceptanceSequence,
+        position: AcceptanceSequence,
+        terminal_sequence: AcceptanceSequence,
         metadata_byte_limit: usize,
     ) -> Result<StoredUpdatePage, StoreError> {
         let document_bytes = document_id.into_bytes();
-        if after != AcceptanceSequence::ORIGIN {
+        if terminal_sequence == AcceptanceSequence::ORIGIN || position > terminal_sequence {
+            return Err(StoreError::InvalidCursor);
+        }
+        for sequence in [position, terminal_sequence] {
+            if sequence == AcceptanceSequence::ORIGIN {
+                continue;
+            }
             let exists = self
                 .connection
                 .query_row(
                     "SELECT 1 FROM updates
                      WHERE document_id = ?1 AND acceptance_sequence = ?2",
-                    params![document_bytes.as_slice(), after.to_be_bytes().as_slice()],
+                    params![document_bytes.as_slice(), sequence.to_be_bytes().as_slice()],
                     |_row| Ok(()),
                 )
                 .optional()?
@@ -214,11 +242,16 @@ impl DurableUpdateStore {
         let mut statement = self.connection.prepare(
             "SELECT acceptance_sequence, encoded_record
              FROM updates
-             WHERE document_id = ?1 AND acceptance_sequence > ?2
+             WHERE document_id = ?1
+               AND acceptance_sequence > ?2
+               AND acceptance_sequence <= ?3
              ORDER BY acceptance_sequence",
         )?;
-        let mut rows =
-            statement.query(params![document_bytes.as_slice(), after.to_be_bytes().as_slice()])?;
+        let mut rows = statement.query(params![
+            document_bytes.as_slice(),
+            position.to_be_bytes().as_slice(),
+            terminal_sequence.to_be_bytes().as_slice(),
+        ])?;
         let mut used = 0_usize;
         let mut updates = Vec::new();
         let mut last_sequence = None;
@@ -464,7 +497,12 @@ mod tests {
             StoreAcceptOutcome::AlreadyPresent
         );
         let page = recovered
-            .enumerate(update.document_id(), AcceptanceSequence::ORIGIN, usize::MAX)
+            .enumerate(
+                update.document_id(),
+                AcceptanceSequence::ORIGIN,
+                AcceptanceSequence::FIRST,
+                usize::MAX,
+            )
             .expect("recovered row must enumerate");
         assert_eq!(page.updates.len(), 1);
         assert_eq!(

@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::ops::Bound::{Excluded, Unbounded};
+use std::ops::Bound::{Excluded, Included};
 
 use renee_types::{AcceptanceSequence, DocumentId, ImmutableUpdate, UpdateId, UpdateMetadata};
 
@@ -130,18 +130,28 @@ impl UpdateModel {
         AcceptOutcome::Inserted
     }
 
-    /// Enumerates metadata in stable Renee acceptance order after a cursor.
+    /// Returns the current inclusive document high-water sequence.
+    pub fn high_water_sequence(&self, document_id: DocumentId) -> Option<AcceptanceSequence> {
+        const MAX_SEQUENCE: AcceptanceSequence = AcceptanceSequence::from_be_bytes([0xff; 8]);
+        self.acceptance_order
+            .range((
+                Included((document_id, AcceptanceSequence::FIRST)),
+                Included((document_id, MAX_SEQUENCE)),
+            ))
+            .next_back()
+            .map(|((_, sequence), _)| *sequence)
+    }
+
+    /// Enumerates metadata inside one captured finite-read acceptance window.
     pub fn enumerate(
         &self,
         document_id: DocumentId,
         after: Option<AcceptanceSequence>,
+        terminal_sequence: AcceptanceSequence,
     ) -> impl Iterator<Item = (AcceptanceSequence, UpdateMetadata)> + '_ {
         let after = after.unwrap_or(AcceptanceSequence::ORIGIN);
         self.acceptance_order
-            .range((Excluded((document_id, after)), Unbounded))
-            .take_while(move |((candidate_document, _sequence), _update_id)| {
-                candidate_document == &document_id
-            })
+            .range((Excluded((document_id, after)), Included((document_id, terminal_sequence))))
             .filter_map(move |((_document_id, sequence), update_id)| {
                 let accepted = self.updates.get(&(document_id, *update_id))?;
                 Some((
