@@ -6,8 +6,9 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Unbounded};
 
-use renee_types::{DocumentId, ImmutableUpdate, UpdateId, UpdateMetadata};
+use renee_types::{AcceptanceSequence, DocumentId, ImmutableUpdate, UpdateId, UpdateMetadata};
 
 /// The model's supported experimental profile.
 pub const EXPERIMENTAL_PROFILE: &str = "renee-experimental-v0";
@@ -88,12 +89,22 @@ pub enum AcceptOutcome {
     AlreadyPresent,
     /// The idempotency key already named different immutable input.
     IdentifierConflict,
+    /// The document-scoped acceptance sequence cannot advance.
+    CounterExhausted,
+}
+
+#[derive(Debug)]
+struct AcceptedUpdate {
+    sequence: AcceptanceSequence,
+    update: ImmutableUpdate,
 }
 
 /// Deterministic immutable-update oracle.
 #[derive(Debug, Default)]
 pub struct UpdateModel {
-    updates: BTreeMap<(DocumentId, UpdateId), ImmutableUpdate>,
+    acceptance_order: BTreeMap<(DocumentId, AcceptanceSequence), UpdateId>,
+    next_sequences: BTreeMap<DocumentId, AcceptanceSequence>,
+    updates: BTreeMap<(DocumentId, UpdateId), AcceptedUpdate>,
 }
 
 impl UpdateModel {
@@ -101,38 +112,65 @@ impl UpdateModel {
     pub fn accept(&mut self, update: ImmutableUpdate) -> AcceptOutcome {
         let key = (update.document_id(), update.update_id());
         if let Some(existing) = self.updates.get(&key) {
-            return if existing == &update {
+            return if existing.update == update {
                 AcceptOutcome::AlreadyPresent
             } else {
                 AcceptOutcome::IdentifierConflict
             };
         }
-        self.updates.insert(key, update);
+        let document_id = update.document_id();
+        let sequence =
+            self.next_sequences.get(&document_id).copied().unwrap_or(AcceptanceSequence::FIRST);
+        let Some(next_sequence) = sequence.checked_next() else {
+            return AcceptOutcome::CounterExhausted;
+        };
+        self.next_sequences.insert(document_id, next_sequence);
+        self.acceptance_order.insert((document_id, sequence), update.update_id());
+        self.updates.insert(key, AcceptedUpdate { sequence, update });
         AcceptOutcome::Inserted
     }
 
-    /// Enumerates metadata in stable update-ID order after an optional cursor.
+    /// Enumerates metadata in stable Renee acceptance order after a cursor.
     pub fn enumerate(
         &self,
         document_id: DocumentId,
-        after: Option<UpdateId>,
-    ) -> impl Iterator<Item = UpdateMetadata> + '_ {
-        self.updates
-            .range((document_id, UpdateId::from_bytes([0; 16]))..)
-            .take_while(move |((candidate_document, _update_id), _update)| {
+        after: Option<AcceptanceSequence>,
+    ) -> impl Iterator<Item = (AcceptanceSequence, UpdateMetadata)> + '_ {
+        let after = after.unwrap_or(AcceptanceSequence::ORIGIN);
+        self.acceptance_order
+            .range((Excluded((document_id, after)), Unbounded))
+            .take_while(move |((candidate_document, _sequence), _update_id)| {
                 candidate_document == &document_id
             })
-            .filter(move |((_, update_id), _)| after.is_none_or(|cursor| update_id > &cursor))
-            .map(|((_document_id, _update_id), update)| UpdateMetadata {
-                encrypted_payload_length: u32::try_from(update.encrypted_payload().len())
-                    .unwrap_or(u32::MAX),
-                public_loro_ranges: update.public_loro_ranges().clone(),
-                update_id: update.update_id(),
+            .filter_map(move |((_document_id, sequence), update_id)| {
+                let accepted = self.updates.get(&(document_id, *update_id))?;
+                Some((
+                    *sequence,
+                    UpdateMetadata {
+                        encrypted_payload_length: u32::try_from(
+                            accepted.update.encrypted_payload().len(),
+                        )
+                        .unwrap_or(u32::MAX),
+                        public_loro_ranges: accepted.update.public_loro_ranges().clone(),
+                        update_id: accepted.update.update_id(),
+                    },
+                ))
             })
     }
 
     /// Fetches an authorized opaque payload by its complete idempotency key.
     pub fn fetch(&self, document_id: DocumentId, update_id: UpdateId) -> Option<&[u8]> {
-        self.updates.get(&(document_id, update_id)).map(ImmutableUpdate::encrypted_payload)
+        self.updates
+            .get(&(document_id, update_id))
+            .map(|accepted| accepted.update.encrypted_payload())
+    }
+
+    /// Returns the assigned first-acceptance sequence for conformance checks.
+    pub fn acceptance_sequence(
+        &self,
+        document_id: DocumentId,
+        update_id: UpdateId,
+    ) -> Option<AcceptanceSequence> {
+        self.updates.get(&(document_id, update_id)).map(|accepted| accepted.sequence)
     }
 }

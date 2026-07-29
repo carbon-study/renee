@@ -49,6 +49,51 @@ identifier!(RequestId, "An opaque idempotency request identifier.");
 identifier!(UpdateId, "An opaque immutable-update identifier scoped to one document.");
 identifier!(CheckpointId, "An opaque checkpoint identifier scoped to one document.");
 
+/// Renee-owned document-scoped first-acceptance position.
+///
+/// This value exists only for finite-read pagination. It is not Loro, causal,
+/// authored, or application order and is never exposed as update metadata.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AcceptanceSequence(u64);
+
+impl AcceptanceSequence {
+    /// Cursor origin before the first accepted update.
+    pub const ORIGIN: Self = Self(0);
+    /// First accepted update in one document.
+    pub const FIRST: Self = Self(1);
+
+    /// Reconstructs a sequence from its canonical network-order storage representation.
+    #[expect(
+        clippy::big_endian_bytes,
+        reason = "acceptance sequences use canonical network order in storage and on the wire"
+    )]
+    pub const fn from_be_bytes(bytes: [u8; 8]) -> Self {
+        Self(u64::from_be_bytes(bytes))
+    }
+
+    /// Returns the canonical network-order `SQLite`/wire representation.
+    #[expect(
+        clippy::big_endian_bytes,
+        reason = "acceptance sequences use canonical network order in storage and on the wire"
+    )]
+    pub const fn to_be_bytes(self) -> [u8; 8] {
+        self.0.to_be_bytes()
+    }
+
+    /// Returns the internal counter for checked model and store arithmetic.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Advances within the acceptance-sequence domain.
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+}
+
 /// One public, nonempty, half-open Loro operation range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoroRange {

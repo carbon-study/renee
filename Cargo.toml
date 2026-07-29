@@ -23,6 +23,7 @@ rust-version = "1.85"
 version = "0.0.0"
 
 [workspace.dependencies]
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
 tokio = { version = "1.53.0", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 wtransport = "0.6.1"
 

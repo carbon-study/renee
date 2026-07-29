@@ -23,10 +23,11 @@ pub use update::{
     ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, ENUMERATE_UPDATES,
     ENUMERATE_UPDATES_RESPONSE, EnumerateRequest, EnumerateResponse, FETCH_UPDATE,
     FETCH_UPDATE_RESPONSE, UPDATE_ERROR, UpdateCodecError, UpdateErrorCode, decode_accept_response,
-    decode_enumerate_request, decode_enumerate_response, decode_fetch_request,
-    decode_fetch_response, decode_update_error, decode_update_record, encode_accept_response,
-    encode_enumerate_request, encode_enumerate_response, encode_fetch_request,
-    encode_fetch_response, encode_update_error, encode_update_record, metadata_encoded_length,
+    decode_acceptance_cursor, decode_enumerate_request, decode_enumerate_response,
+    decode_fetch_request, decode_fetch_response, decode_update_error, decode_update_record,
+    encode_accept_response, encode_acceptance_cursor, encode_enumerate_request,
+    encode_enumerate_response, encode_fetch_request, encode_fetch_response, encode_update_error,
+    encode_update_record, enumerate_response_base_length, metadata_encoded_length,
 };
 
 /// Experimental profile identifier carried by negotiation messages.

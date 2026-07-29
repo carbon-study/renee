@@ -78,6 +78,7 @@ struct Configuration {
     private_key: Option<PathBuf>,
     sessiond: PathBuf,
     shutdown_on_stdin_eof: bool,
+    store_database: PathBuf,
     stored: PathBuf,
 }
 
@@ -201,6 +202,7 @@ impl Configuration {
         let bind_address = take_required_utf8_or_default(&mut values, "--bind", "127.0.0.1:4433")?;
         let certificate = take_optional_path(&mut values, "--certificate");
         let private_key = take_optional_path(&mut values, "--private-key");
+        let store_database = take_required_path(&mut values, "--store-database")?;
         if let Some((unknown, _value)) = values.first_key_value() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -216,6 +218,7 @@ impl Configuration {
             private_key,
             sessiond,
             shutdown_on_stdin_eof,
+            store_database,
             stored,
         })
     }
@@ -242,7 +245,12 @@ impl Configuration {
         // path and creates one temporary child per connection.
         [
             ChildSpec {
-                arguments: vec![OsString::from("--bind"), OsString::from("127.0.0.1:0")],
+                arguments: vec![
+                    OsString::from("--bind"),
+                    OsString::from("127.0.0.1:0"),
+                    OsString::from("--database"),
+                    self.store_database.as_os_str().to_owned(),
+                ],
                 executable: self.stored.clone(),
                 role: "stored",
             },
@@ -255,6 +263,18 @@ impl Configuration {
     }
 
     fn validate(&self) -> io::Result<()> {
+        let bind_address = self.bind_address.parse::<std::net::SocketAddr>().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("gateway bind address is invalid: {error}"),
+            )
+        })?;
+        if !bind_address.ip().is_loopback() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "non-loopback gateway binding is disabled until capability authorization is implemented",
+            ));
+        }
         validate_executable("gatewayd", &self.gatewayd)?;
         validate_executable("sessiond", &self.sessiond)?;
         validate_executable("stored", &self.stored)?;
@@ -406,8 +426,20 @@ async fn start_group(specifications: &[ChildSpec]) -> RunningGroup {
                             // Port zero is resolved exactly once per group.
                             // The concrete address becomes both stored's stable
                             // restart bind and gateway/sessiond's dependency.
-                            active_spec.arguments =
-                                vec![OsString::from("--bind"), OsString::from(address)];
+                            if !replace_argument_value(
+                                &mut active_spec.arguments,
+                                "--bind",
+                                OsString::from(address),
+                            ) {
+                                drop(child);
+                                write_diagnostic(
+                                    active_spec.role,
+                                    "restart-bind-argument-missing",
+                                    io::ErrorKind::InvalidData,
+                                );
+                                group_failed = true;
+                                break;
+                            }
                             store_address = Some(address.to_owned());
                         }
                         let role = active_spec.role;
@@ -629,6 +661,31 @@ fn take_optional_path(
     name: &'static str,
 ) -> Option<PathBuf> {
     values.remove(name).map(PathBuf::from)
+}
+
+fn take_required_path(
+    values: &mut BTreeMap<String, OsString>,
+    name: &'static str,
+) -> io::Result<PathBuf> {
+    values.remove(name).map(PathBuf::from).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("{name} requires a value"))
+    })
+}
+
+fn replace_argument_value(
+    arguments: &mut [OsString],
+    name: &'static str,
+    replacement: OsString,
+) -> bool {
+    let mut replace_next = false;
+    for argument in arguments {
+        if replace_next {
+            *argument = replacement;
+            return true;
+        }
+        replace_next = argument == name;
+    }
+    false
 }
 
 fn take_required_utf8_or_default(

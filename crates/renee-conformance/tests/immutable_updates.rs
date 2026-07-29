@@ -9,11 +9,15 @@
 use std::io;
 
 use renee_model::{AcceptOutcome, UpdateModel};
-use renee_subject::{AcceptObservation, FetchObservation, HarnessResult, ServerHarness};
-use renee_types::{
-    DocumentId, ImmutableUpdate, LoroRange, PublicLoroRanges, UpdateId, UpdateMetadata,
+use renee_subject::{
+    AcceptObservation, EnumerateObservation, FetchObservation, HarnessResult, PermanentDaemon,
+    ServerHarness,
 };
-use renee_wire::encode_update_record;
+use renee_types::{
+    AcceptanceSequence, DocumentId, ImmutableUpdate, LoroRange, PublicLoroRanges, UpdateId,
+    UpdateMetadata,
+};
+use renee_wire::{decode_acceptance_cursor, encode_acceptance_cursor, encode_update_record};
 
 fn update(document: u8, update: u8, payload: &[u8]) -> ImmutableUpdate {
     let ranges = PublicLoroRanges::new(vec![
@@ -39,6 +43,10 @@ fn expected_metadata(update: &ImmutableUpdate) -> UpdateMetadata {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one sequential model/subject scenario keeps the compared history visible"
+)]
 async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessResult<()> {
     let server = ServerHarness::start().await?;
     let connection = server.connect_webtransport().await?;
@@ -50,7 +58,7 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
 
     // Deliberately not a Carbon crypto envelope: Renee must preserve these
     // bytes without learning or validating their encrypted representation.
-    let first = update(1, 2, b"opaque-to-renee");
+    let first = update(1, 5, b"opaque-to-renee");
     let first_record = encode_update_record(&first)?;
     if model.accept(first.clone()) != AcceptOutcome::Inserted
         || connection.accept_update(&first_record).await? != AcceptObservation::Inserted
@@ -63,7 +71,7 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
         return Err(io::Error::other("model and subject disagreed on exact retry").into());
     }
 
-    let conflict = update(1, 2, b"different-opaque-bytes");
+    let conflict = update(1, 5, b"different-opaque-bytes");
     if model.accept(conflict.clone()) != AcceptOutcome::IdentifierConflict
         || connection.accept_update(&encode_update_record(&conflict)?).await?
             != AcceptObservation::IdentifierConflict
@@ -72,7 +80,7 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
     }
 
     // Update IDs are scoped by document rather than service-wide.
-    let other_document = update(3, 2, b"same-update-id-other-document");
+    let other_document = update(3, 5, b"same-update-id-other-document");
     if model.accept(other_document.clone()) != AcceptOutcome::Inserted
         || connection.accept_update(&encode_update_record(&other_document)?).await?
             != AcceptObservation::Inserted
@@ -80,7 +88,20 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
         return Err(io::Error::other("document-scoped identity was not preserved").into());
     }
 
-    let later = update(1, 5, b"later-opaque-update");
+    // Capture the cursor before accepting a lexically lower update ID. This
+    // is the case update-ID pagination skipped permanently.
+    let first_page = connection.enumerate_updates(first.document_id(), None).await?;
+    if first_page.updates != vec![expected_metadata(&first)] {
+        return Err(io::Error::other("first acceptance page was incorrect").into());
+    }
+    let first_cursor = first_page
+        .next_cursor
+        .ok_or_else(|| io::Error::other("nonempty page omitted its cursor"))?;
+    if decode_acceptance_cursor(first.document_id(), &first_cursor)? != AcceptanceSequence::FIRST {
+        return Err(io::Error::other("first acceptance received the wrong cursor position").into());
+    }
+
+    let later = update(1, 3, b"later-opaque-update");
     if model.accept(later.clone()) != AcceptOutcome::Inserted
         || connection.accept_update(&encode_update_record(&later)?).await?
             != AcceptObservation::Inserted
@@ -88,7 +109,10 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
         return Err(io::Error::other("second document update was not inserted").into());
     }
 
-    let expected_page = model.enumerate(first.document_id(), None).collect::<Vec<_>>();
+    let expected_page = model
+        .enumerate(first.document_id(), None)
+        .map(|(_sequence, metadata)| metadata)
+        .collect::<Vec<_>>();
     let observed_page = connection.enumerate_updates(first.document_id(), None).await?;
     if observed_page.has_more || observed_page.updates != expected_page {
         return Err(io::Error::other("model and subject disagreed on enumeration").into());
@@ -96,12 +120,50 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
     if observed_page.updates != vec![expected_metadata(&first), expected_metadata(&later)] {
         return Err(io::Error::other("enumeration exposed wrong public metadata").into());
     }
-    let expected_after =
-        model.enumerate(first.document_id(), Some(first.update_id())).collect::<Vec<_>>();
+    let first_sequence = model
+        .acceptance_sequence(first.document_id(), first.update_id())
+        .ok_or_else(|| io::Error::other("model omitted first acceptance sequence"))?;
+    let expected_after = model
+        .enumerate(first.document_id(), Some(first_sequence))
+        .map(|(_sequence, metadata)| metadata)
+        .collect::<Vec<_>>();
     let observed_after =
-        connection.enumerate_updates(first.document_id(), Some(first.update_id())).await?;
+        connection.enumerate_updates(first.document_id(), Some(first_cursor)).await?;
     if observed_after.has_more || observed_after.updates != expected_after {
         return Err(io::Error::other("enumeration cursor was not exclusive").into());
+    }
+    let later_cursor = observed_after
+        .next_cursor
+        .ok_or_else(|| io::Error::other("resumed nonempty page omitted its cursor"))?;
+    let expected_later_sequence = AcceptanceSequence::FIRST
+        .checked_next()
+        .ok_or_else(|| io::Error::other("fixture acceptance sequence overflowed"))?;
+    if decode_acceptance_cursor(first.document_id(), &later_cursor)? != expected_later_sequence {
+        return Err(io::Error::other("retry or conflict consumed an acceptance sequence").into());
+    }
+
+    let wrong_document = DocumentId::from_bytes([0x77; 16]);
+    if connection.enumerate_updates_observation(wrong_document, Some(later_cursor.clone())).await?
+        != EnumerateObservation::InvalidCursor
+    {
+        return Err(io::Error::other("cross-document cursor was accepted").into());
+    }
+    let malformed_cursor = vec![0_u8; later_cursor.len()];
+    if connection.enumerate_updates_observation(first.document_id(), Some(malformed_cursor)).await?
+        != EnumerateObservation::InvalidCursor
+    {
+        return Err(io::Error::other("malformed cursor was accepted").into());
+    }
+    let impossible_cursor = encode_acceptance_cursor(
+        first.document_id(),
+        AcceptanceSequence::from_be_bytes([0xff; 8]),
+    )?;
+    if connection
+        .enumerate_updates_observation(first.document_id(), Some(impossible_cursor))
+        .await?
+        != EnumerateObservation::InvalidCursor
+    {
+        return Err(io::Error::other("impossible cursor position was accepted").into());
     }
 
     let expected_payload = model
@@ -121,5 +183,67 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
     }
 
     connection.close();
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn acknowledged_update_survives_store_restart() -> HarnessResult<()> {
+    let mut server = ServerHarness::start().await?;
+    let connection = server.connect_webtransport().await?;
+    if !matches!(
+        connection.negotiate().await?,
+        renee_subject::NegotiationObservation::Selected { .. }
+    ) {
+        return Err(io::Error::other("subject did not negotiate before update API").into());
+    }
+
+    let accepted = update(9, 4, b"durable-opaque-update");
+    let accepted_record = encode_update_record(&accepted)?;
+    if connection.accept_update(&accepted_record).await? != AcceptObservation::Inserted {
+        return Err(io::Error::other("durable fixture was not inserted").into());
+    }
+    let before_restart = connection.enumerate_updates(accepted.document_id(), None).await?;
+    let durable_cursor = before_restart
+        .next_cursor
+        .ok_or_else(|| io::Error::other("accepted update omitted durable cursor"))?;
+    connection.close();
+
+    server.kill_and_wait_for_restart(PermanentDaemon::Store).await?;
+    let recovered = server.connect_webtransport().await?;
+    if !matches!(
+        recovered.negotiate().await?,
+        renee_subject::NegotiationObservation::Selected { .. }
+    ) {
+        return Err(io::Error::other("recovered subject did not negotiate").into());
+    }
+    if recovered.accept_update(&accepted_record).await? != AcceptObservation::AlreadyPresent {
+        return Err(io::Error::other("exact retry changed after store restart").into());
+    }
+    let conflict = update(9, 4, b"conflict-after-restart");
+    if recovered.accept_update(&encode_update_record(&conflict)?).await?
+        != AcceptObservation::IdentifierConflict
+    {
+        return Err(io::Error::other("conflicting retry changed after store restart").into());
+    }
+    let page = recovered.enumerate_updates(accepted.document_id(), None).await?;
+    if page.updates != vec![expected_metadata(&accepted)] {
+        return Err(io::Error::other("acknowledged metadata was lost across restart").into());
+    }
+    if recovered.fetch_update(accepted.document_id(), accepted.update_id()).await?
+        != FetchObservation::Found(accepted.encrypted_payload().to_vec())
+    {
+        return Err(io::Error::other("acknowledged payload was lost across restart").into());
+    }
+    let later = update(9, 1, b"accepted-after-restart");
+    if recovered.accept_update(&encode_update_record(&later)?).await? != AcceptObservation::Inserted
+    {
+        return Err(io::Error::other("post-restart update was not inserted").into());
+    }
+    let resumed = recovered.enumerate_updates(accepted.document_id(), Some(durable_cursor)).await?;
+    if resumed.updates != vec![expected_metadata(&later)] {
+        return Err(io::Error::other("pre-restart cursor did not resume after restart").into());
+    }
+
+    recovered.close();
     server.shutdown().await
 }

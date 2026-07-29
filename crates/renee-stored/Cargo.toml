@@ -13,8 +13,9 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-renee-model = { path = "../renee-model" }
+renee-types = { path = "../renee-types" }
 renee-wire = { path = "../renee-wire" }
+rusqlite.workspace = true
 tokio.workspace = true
 
 [lints]

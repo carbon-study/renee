@@ -68,6 +68,28 @@ async fn standalone_gateway_rejects_an_unavailable_sessiond_before_readiness() -
     Ok(())
 }
 
+#[tokio::test]
+async fn gateway_rejects_non_loopback_deployment_without_authorization() -> HarnessResult<()> {
+    let output = Command::new(daemon_path("renee-gatewayd")?)
+        .args(["--bind", "0.0.0.0:0"])
+        .arg("--sessiond")
+        .arg(daemon_path("renee-sessiond")?)
+        .stdin(Stdio::null())
+        .output()
+        .await?;
+    if output.status.success() {
+        return Err(io::Error::other("unauthorized non-loopback gateway was enabled").into());
+    }
+    if !output.stdout.is_empty() {
+        return Err(io::Error::other("gateway emitted readiness before deployment gating").into());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.contains("disabled until capability authorization is implemented") {
+        return Err(io::Error::other("gateway rejection omitted the authorization gate").into());
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn non_utf8_supervisor_arguments_are_rejected_without_panicking() -> HarnessResult<()> {

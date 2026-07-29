@@ -6,8 +6,8 @@
 use core::fmt;
 
 use renee_types::{
-    DocumentId, IDENTIFIER_LENGTH, ImmutableUpdate, LoroRange, MAX_LORO_PEERS, PublicLoroRanges,
-    UpdateId, UpdateMetadata,
+    AcceptanceSequence, DocumentId, IDENTIFIER_LENGTH, ImmutableUpdate, LoroRange, MAX_LORO_PEERS,
+    PublicLoroRanges, UpdateId, UpdateMetadata,
 };
 
 use crate::MAX_APPLICATION_PAYLOAD_LENGTH;
@@ -32,6 +32,9 @@ const RECORD_VERSION: u16 = 1;
 const LORO_PROFILE_CODE: u16 = 1;
 const RANGE_LENGTH: usize = 16;
 const RECORD_FIXED_LENGTH: usize = 50;
+const CURSOR_MAGIC: [u8; 8] = *b"RNECUR\0\0";
+const CURSOR_VERSION: u16 = 1;
+const CURSOR_LENGTH: usize = 8 + 2 + IDENTIFIER_LENGTH + 8;
 
 /// Successful immutable accept outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,23 +56,29 @@ pub enum UpdateErrorCode {
     NotFound,
     /// An application operation arrived before negotiation.
     NotNegotiated,
+    /// The finite-read cursor was malformed or belonged to another document.
+    InvalidCursor,
+    /// A Renee-owned counter cannot advance without wrapping.
+    CounterExhausted,
 }
 
 /// One metadata enumeration cursor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnumerateRequest {
     /// Return updates from this document.
     pub document_id: DocumentId,
-    /// Return only update IDs strictly greater than this cursor.
-    pub after: Option<UpdateId>,
+    /// Opaque Renee cursor returned by an earlier page.
+    pub cursor: Option<Vec<u8>>,
 }
 
 /// One bounded metadata page.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnumerateResponse {
-    /// Whether another request after the final returned ID can continue.
+    /// Whether another request after the returned cursor can continue.
     pub has_more: bool,
-    /// Public metadata in strictly ascending update-ID order.
+    /// Opaque cursor after the last returned acceptance.
+    pub next_cursor: Option<Vec<u8>>,
+    /// Public metadata in Renee acceptance order.
     pub updates: Vec<UpdateMetadata>,
 }
 
@@ -94,8 +103,8 @@ pub enum UpdateCodecError {
     EmptyEncryptedPayload,
     /// An enum or boolean field used an unknown value.
     InvalidDiscriminant,
-    /// A metadata page was not in canonical update-ID order.
-    NonCanonicalUpdateOrder,
+    /// An opaque finite-read cursor was malformed.
+    InvalidCursor,
     /// A value cannot be represented by the frozen codec.
     IntegerOutOfRange,
 }
@@ -112,7 +121,7 @@ impl fmt::Display for UpdateCodecError {
             Self::RecordTooLong => f.write_str("update record exceeds the v1 frame limit"),
             Self::EmptyEncryptedPayload => f.write_str("opaque encrypted payload is empty"),
             Self::InvalidDiscriminant => f.write_str("invalid update payload discriminant"),
-            Self::NonCanonicalUpdateOrder => f.write_str("update metadata is not strictly ordered"),
+            Self::InvalidCursor => f.write_str("invalid update enumeration cursor"),
             Self::IntegerOutOfRange => f.write_str("update field is out of range"),
         }
     }
@@ -217,30 +226,70 @@ pub fn decode_accept_response(payload: &[u8]) -> Result<AcceptUpdateOutcome, Upd
 }
 
 /// Encodes a metadata enumeration request.
-pub fn encode_enumerate_request(request: EnumerateRequest) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(1 + (IDENTIFIER_LENGTH * 2));
+pub fn encode_enumerate_request(request: &EnumerateRequest) -> Result<Vec<u8>, UpdateCodecError> {
+    let cursor_length = cursor_length(request.cursor.as_deref())?;
+    let mut payload = Vec::with_capacity(IDENTIFIER_LENGTH + 2 + cursor_length);
     payload.extend_from_slice(&request.document_id.into_bytes());
-    match request.after {
-        Some(after) => {
-            payload.push(1);
-            payload.extend_from_slice(&after.into_bytes());
-        }
-        None => payload.push(0),
+    let cursor_length =
+        u16::try_from(cursor_length).map_err(|_error| UpdateCodecError::IntegerOutOfRange)?;
+    payload.extend_from_slice(&cursor_length.to_be_bytes());
+    if let Some(cursor) = &request.cursor {
+        payload.extend_from_slice(cursor);
     }
-    payload
+    Ok(payload)
 }
 
 /// Decodes a metadata enumeration request.
 pub fn decode_enumerate_request(payload: &[u8]) -> Result<EnumerateRequest, UpdateCodecError> {
     let mut decoder = Decoder::new(payload);
     let document_id = DocumentId::from_bytes(decoder.take_array()?);
-    let after = match decoder.take_byte()? {
+    let cursor_length = usize::from(u16::from_be_bytes(decoder.take_array()?));
+    let cursor = match cursor_length {
         0 => None,
-        1 => Some(UpdateId::from_bytes(decoder.take_array()?)),
-        _unknown => return Err(UpdateCodecError::InvalidDiscriminant),
+        CURSOR_LENGTH => Some(decoder.take(cursor_length)?.to_vec()),
+        _invalid => return Err(UpdateCodecError::InvalidCursor),
     };
     decoder.finish()?;
-    Ok(EnumerateRequest { document_id, after })
+    Ok(EnumerateRequest { document_id, cursor })
+}
+
+/// Encodes an opaque cursor after one accepted update.
+pub fn encode_acceptance_cursor(
+    document_id: DocumentId,
+    sequence: AcceptanceSequence,
+) -> Result<Vec<u8>, UpdateCodecError> {
+    if sequence == AcceptanceSequence::ORIGIN {
+        return Err(UpdateCodecError::InvalidCursor);
+    }
+    let mut cursor = Vec::with_capacity(CURSOR_LENGTH);
+    cursor.extend_from_slice(&CURSOR_MAGIC);
+    cursor.extend_from_slice(&CURSOR_VERSION.to_be_bytes());
+    cursor.extend_from_slice(&document_id.into_bytes());
+    cursor.extend_from_slice(&sequence.to_be_bytes());
+    Ok(cursor)
+}
+
+/// Validates and opens a cursor for the named document.
+pub fn decode_acceptance_cursor(
+    document_id: DocumentId,
+    encoded: &[u8],
+) -> Result<AcceptanceSequence, UpdateCodecError> {
+    let mut decoder = Decoder::new(encoded);
+    if decoder.take_array()? != CURSOR_MAGIC {
+        return Err(UpdateCodecError::InvalidCursor);
+    }
+    if u16::from_be_bytes(decoder.take_array()?) != CURSOR_VERSION {
+        return Err(UpdateCodecError::InvalidCursor);
+    }
+    if DocumentId::from_bytes(decoder.take_array()?) != document_id {
+        return Err(UpdateCodecError::InvalidCursor);
+    }
+    let sequence = AcceptanceSequence::from_be_bytes(decoder.take_array()?);
+    if sequence == AcceptanceSequence::ORIGIN {
+        return Err(UpdateCodecError::InvalidCursor);
+    }
+    decoder.finish()?;
+    Ok(sequence)
 }
 
 /// Returns the exact bytes required by one metadata entry.
@@ -264,14 +313,18 @@ pub fn encode_enumerate_response(
 ) -> Result<Vec<u8>, UpdateCodecError> {
     let count = u16::try_from(response.updates.len())
         .map_err(|_error| UpdateCodecError::IntegerOutOfRange)?;
-    let mut payload = Vec::new();
+    let cursor_length = cursor_length(response.next_cursor.as_deref())?;
+    let cursor_length_u16 =
+        u16::try_from(cursor_length).map_err(|_error| UpdateCodecError::IntegerOutOfRange)?;
+    let mut payload =
+        Vec::with_capacity(enumerate_response_base_length(response.next_cursor.as_deref())?);
     payload.push(u8::from(response.has_more));
+    payload.extend_from_slice(&cursor_length_u16.to_be_bytes());
+    if let Some(cursor) = &response.next_cursor {
+        payload.extend_from_slice(cursor);
+    }
     payload.extend_from_slice(&count.to_be_bytes());
-    let mut previous = None;
     for metadata in &response.updates {
-        if previous.is_some_and(|update_id| update_id >= metadata.update_id) {
-            return Err(UpdateCodecError::NonCanonicalUpdateOrder);
-        }
         payload.extend_from_slice(&metadata.update_id.into_bytes());
         let ranges = &metadata.public_loro_ranges;
         let range_count = u16::try_from(ranges.as_slice().len())
@@ -279,7 +332,6 @@ pub fn encode_enumerate_response(
         payload.extend_from_slice(&range_count.to_be_bytes());
         append_ranges(&mut payload, ranges);
         payload.extend_from_slice(&metadata.encrypted_payload_length.to_be_bytes());
-        previous = Some(metadata.update_id);
     }
     if payload.len() > MAX_APPLICATION_PAYLOAD_LENGTH {
         return Err(UpdateCodecError::RecordTooLong);
@@ -298,14 +350,16 @@ pub fn decode_enumerate_response(payload: &[u8]) -> Result<EnumerateResponse, Up
         1 => true,
         _unknown => return Err(UpdateCodecError::InvalidDiscriminant),
     };
+    let cursor_length = usize::from(u16::from_be_bytes(decoder.take_array()?));
+    let next_cursor = match cursor_length {
+        0 => None,
+        CURSOR_LENGTH => Some(decoder.take(cursor_length)?.to_vec()),
+        _invalid => return Err(UpdateCodecError::InvalidCursor),
+    };
     let count = usize::from(u16::from_be_bytes(decoder.take_array()?));
     let mut updates = Vec::new();
-    let mut previous = None;
     for _entry_index in 0..count {
         let update_id = UpdateId::from_bytes(decoder.take_array()?);
-        if previous.is_some_and(|prior| prior >= update_id) {
-            return Err(UpdateCodecError::NonCanonicalUpdateOrder);
-        }
         let range_count = usize::from(u16::from_be_bytes(decoder.take_array()?));
         if range_count == 0 || range_count > MAX_LORO_PEERS {
             return Err(UpdateCodecError::InvalidLoroMetadata);
@@ -325,10 +379,19 @@ pub fn decode_enumerate_response(payload: &[u8]) -> Result<EnumerateResponse, Up
             .map_err(|_error| UpdateCodecError::InvalidLoroMetadata)?;
         let encrypted_payload_length = u32::from_be_bytes(decoder.take_array()?);
         updates.push(UpdateMetadata { encrypted_payload_length, public_loro_ranges, update_id });
-        previous = Some(update_id);
     }
     decoder.finish()?;
-    Ok(EnumerateResponse { has_more, updates })
+    Ok(EnumerateResponse { has_more, next_cursor, updates })
+}
+
+/// Returns the fixed response bytes before metadata entries.
+pub fn enumerate_response_base_length(cursor: Option<&[u8]>) -> Result<usize, UpdateCodecError> {
+    let cursor_length = cursor_length(cursor)?;
+    1_usize
+        .checked_add(2)
+        .and_then(|length| length.checked_add(cursor_length))
+        .and_then(|length| length.checked_add(2))
+        .ok_or(UpdateCodecError::IntegerOutOfRange)
 }
 
 /// Encodes a fetch request under the full idempotency key.
@@ -374,6 +437,8 @@ pub fn encode_update_error(error: UpdateErrorCode) -> Vec<u8> {
         UpdateErrorCode::IdentifierConflict => 1,
         UpdateErrorCode::NotFound => 2,
         UpdateErrorCode::NotNegotiated => 3,
+        UpdateErrorCode::InvalidCursor => 4,
+        UpdateErrorCode::CounterExhausted => 5,
     }]
 }
 
@@ -384,8 +449,18 @@ pub fn decode_update_error(payload: &[u8]) -> Result<UpdateErrorCode, UpdateCode
         [1] => Ok(UpdateErrorCode::IdentifierConflict),
         [2] => Ok(UpdateErrorCode::NotFound),
         [3] => Ok(UpdateErrorCode::NotNegotiated),
+        [4] => Ok(UpdateErrorCode::InvalidCursor),
+        [5] => Ok(UpdateErrorCode::CounterExhausted),
         [_unknown] => Err(UpdateCodecError::InvalidDiscriminant),
         _ => Err(UpdateCodecError::TrailingBytes),
+    }
+}
+
+fn cursor_length(cursor: Option<&[u8]>) -> Result<usize, UpdateCodecError> {
+    match cursor {
+        Some(cursor) if cursor.len() == CURSOR_LENGTH => Ok(CURSOR_LENGTH),
+        Some(_invalid) => Err(UpdateCodecError::InvalidCursor),
+        None => Ok(0),
     }
 }
 
@@ -506,6 +581,66 @@ mod tests {
         assert_eq!(
             decode_update_record(&vec![0_u8; MAX_APPLICATION_PAYLOAD_LENGTH + 1]),
             Err(UpdateCodecError::RecordTooLong)
+        );
+    }
+
+    #[test]
+    fn acceptance_cursor_is_document_bound_and_versioned() {
+        let document_id = DocumentId::from_bytes([0x21; IDENTIFIER_LENGTH]);
+        let other_document = DocumentId::from_bytes([0x22; IDENTIFIER_LENGTH]);
+        let sequence = AcceptanceSequence::from_be_bytes([0, 0, 0, 0, 0, 0, 0, 37]);
+        let cursor =
+            encode_acceptance_cursor(document_id, sequence).expect("valid cursor must encode");
+
+        assert_eq!(cursor.len(), CURSOR_LENGTH);
+        assert_eq!(decode_acceptance_cursor(document_id, &cursor), Ok(sequence));
+        assert_eq!(
+            decode_acceptance_cursor(other_document, &cursor),
+            Err(UpdateCodecError::InvalidCursor)
+        );
+
+        let mut wrong_version = cursor;
+        wrong_version[CURSOR_MAGIC.len() + 1] ^= 1;
+        assert_eq!(
+            decode_acceptance_cursor(document_id, &wrong_version),
+            Err(UpdateCodecError::InvalidCursor)
+        );
+        assert_eq!(
+            encode_acceptance_cursor(document_id, AcceptanceSequence::ORIGIN),
+            Err(UpdateCodecError::InvalidCursor)
+        );
+    }
+
+    #[test]
+    fn enumeration_request_and_response_preserve_opaque_cursor() {
+        let record =
+            decode_update_record(&decode_hex(FIXED_RECORD_HEX)).expect("Carbon vector must decode");
+        let cursor = encode_acceptance_cursor(record.document_id(), AcceptanceSequence::FIRST)
+            .expect("valid cursor must encode");
+        let request =
+            EnumerateRequest { document_id: record.document_id(), cursor: Some(cursor.clone()) };
+        assert_eq!(
+            decode_enumerate_request(
+                &encode_enumerate_request(&request).expect("request must encode")
+            ),
+            Ok(request)
+        );
+
+        let response = EnumerateResponse {
+            has_more: true,
+            next_cursor: Some(cursor),
+            updates: vec![UpdateMetadata {
+                encrypted_payload_length: u32::try_from(record.encrypted_payload().len())
+                    .expect("fixture payload length must fit"),
+                public_loro_ranges: record.public_loro_ranges().clone(),
+                update_id: record.update_id(),
+            }],
+        };
+        assert_eq!(
+            decode_enumerate_response(
+                &encode_enumerate_response(&response).expect("response must encode")
+            ),
+            Ok(response)
         );
     }
 }

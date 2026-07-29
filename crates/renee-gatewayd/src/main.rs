@@ -148,6 +148,12 @@ impl Configuration {
     }
 
     fn validate(&self) -> io::Result<()> {
+        if !self.bind_address.ip().is_loopback() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "non-loopback gateway binding is disabled until capability authorization is implemented",
+            ));
+        }
         validate_executable("sessiond", &self.sessiond)
     }
 

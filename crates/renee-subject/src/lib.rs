@@ -9,9 +9,11 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use renee_types::{DocumentId, UpdateId};
@@ -44,6 +46,7 @@ pub struct ServerHarness {
     certificate_hash: Sha256Digest,
     output: BufReader<ChildStdout>,
     permanent_child_pids: BTreeMap<&'static str, u32>,
+    _state_directory: TemporaryDirectory,
     supervisor: Child,
 }
 
@@ -102,12 +105,45 @@ pub enum FetchObservation {
     NotFound,
 }
 
+/// Subject observation for one finite metadata read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EnumerateObservation {
+    /// Renee returned a bounded page and an opaque continuation cursor.
+    Page(EnumerateResponse),
+    /// The cursor was malformed or bound to another document.
+    InvalidCursor,
+}
+
+struct TemporaryDirectory {
+    path: PathBuf,
+}
+
 impl ServerHarness {
     /// Starts every Renee daemon and waits for the complete process tree to be ready.
     pub async fn start() -> HarnessResult<Self> {
         let supervisor_path = daemon_path("renee-supervisord")?;
+        Self::start_with_supervisor(supervisor_path).await
+    }
+
+    /// Starts Renee from an explicitly built daemon directory.
+    ///
+    /// Cross-repository conformance uses this entry point so Carbon can build
+    /// Renee into a dedicated target directory without coupling either Cargo
+    /// workspace to the other's production crates.
+    pub async fn start_with_daemon_directory(daemon_directory: &Path) -> HarnessResult<Self> {
+        Self::start_with_supervisor(
+            daemon_directory.join(format!("renee-supervisord{}", env::consts::EXE_SUFFIX)),
+        )
+        .await
+    }
+
+    async fn start_with_supervisor(supervisor_path: PathBuf) -> HarnessResult<Self> {
+        let state_directory = TemporaryDirectory::create()?;
+        let store_database = state_directory.path.join("renee.sqlite3");
         let mut supervisor = Command::new(supervisor_path)
             .args(["--bind", "127.0.0.1:0", "--shutdown-on-stdin-eof"])
+            .arg("--store-database")
+            .arg(store_database)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -143,7 +179,14 @@ impl ServerHarness {
         .into_iter()
         .collect();
 
-        Ok(Self { address, certificate_hash, output, permanent_child_pids, supervisor })
+        Ok(Self {
+            address,
+            certificate_hash,
+            output,
+            permanent_child_pids,
+            _state_directory: state_directory,
+            supervisor,
+        })
     }
 
     /// Opens a certificate-pinned WebTransport connection to the running gateway.
@@ -367,7 +410,10 @@ impl WebTransportConnection {
             UPDATE_ERROR => match decode_update_error(&response.payload)? {
                 UpdateErrorCode::IdentifierConflict => Ok(AcceptObservation::IdentifierConflict),
                 UpdateErrorCode::Malformed => Ok(AcceptObservation::Malformed),
-                UpdateErrorCode::NotFound | UpdateErrorCode::NotNegotiated => {
+                UpdateErrorCode::NotFound
+                | UpdateErrorCode::NotNegotiated
+                | UpdateErrorCode::InvalidCursor
+                | UpdateErrorCode::CounterExhausted => {
                     Err(io::Error::other("unexpected accept rejection").into())
                 }
             },
@@ -383,18 +429,39 @@ impl WebTransportConnection {
     pub async fn enumerate_updates(
         &self,
         document_id: DocumentId,
-        after: Option<UpdateId>,
+        cursor: Option<Vec<u8>>,
     ) -> HarnessResult<EnumerateResponse> {
+        match self.enumerate_updates_observation(document_id, cursor).await? {
+            EnumerateObservation::Page(page) => Ok(page),
+            EnumerateObservation::InvalidCursor => {
+                Err(io::Error::other("valid enumerate request received invalid-cursor").into())
+            }
+        }
+    }
+
+    /// Enumerates while preserving an invalid-cursor protocol observation.
+    pub async fn enumerate_updates_observation(
+        &self,
+        document_id: DocumentId,
+        cursor: Option<Vec<u8>>,
+    ) -> HarnessResult<EnumerateObservation> {
         let response = self
             .exchange(
                 ENUMERATE_UPDATES,
-                encode_enumerate_request(EnumerateRequest { document_id, after }),
+                encode_enumerate_request(&EnumerateRequest { document_id, cursor })?,
             )
             .await?;
-        if response.message_type != ENUMERATE_UPDATES_RESPONSE {
-            return Err(io::Error::other("unexpected enumerate response").into());
+        match response.message_type {
+            ENUMERATE_UPDATES_RESPONSE => {
+                Ok(EnumerateObservation::Page(decode_enumerate_response(&response.payload)?))
+            }
+            UPDATE_ERROR
+                if decode_update_error(&response.payload)? == UpdateErrorCode::InvalidCursor =>
+            {
+                Ok(EnumerateObservation::InvalidCursor)
+            }
+            _unexpected => Err(io::Error::other("unexpected enumerate response").into()),
         }
-        Ok(decode_enumerate_response(&response.payload)?)
     }
 
     /// Fetches one exact opaque encrypted payload.
@@ -447,6 +514,42 @@ impl PermanentDaemon {
             Self::Gateway => "gatewayd",
             Self::Store => "stored",
         }
+    }
+}
+
+impl TemporaryDirectory {
+    // Atomic reservation specifically requires `create_dir`: `create_dir_all`
+    // would report success when a colliding directory already existed.
+    #[expect(
+        clippy::create_dir,
+        reason = "atomic exclusive reservation must reject an already existing directory"
+    )]
+    fn create() -> io::Result<Self> {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        let base = env::temp_dir();
+        let process_id = std::process::id();
+        for _attempt in 0..100 {
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("renee-subject-{process_id}-{sequence}"));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not reserve a unique Renee subject state directory",
+        ))
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        // This exact directory was atomically created and exclusively owned by
+        // the harness. Best-effort cleanup must never obscure test outcomes.
+        drop(fs::remove_dir_all(&self.path));
     }
 }
 
