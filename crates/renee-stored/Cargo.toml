@@ -12,6 +12,10 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+default = []
+conformance = []
+
 [dependencies]
 renee-types = { path = "../renee-types" }
 renee-wire = { path = "../renee-wire" }

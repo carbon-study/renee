@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod store;
+#[cfg(feature = "conformance")]
 mod test_barrier;
 
 use std::env;
@@ -159,9 +160,9 @@ async fn handle_request(
             // Preserve the exact canonical bytes. Exact retry compares these
             // bytes, and the transaction commits both identity and content
             // before an acknowledgement can be constructed.
-            let outcome = store
-                .lock()
-                .await
+            let mut locked_store = store.lock().await;
+            #[cfg(feature = "conformance")]
+            let outcome = locked_store
                 .accept_with_test_barriers(
                     &update,
                     &request.payload,
@@ -169,9 +170,13 @@ async fn handle_request(
                     || test_barrier::checkpoint("store-exact-retry").map_err(StoreError::from),
                 )
                 .map_err(store_error)?;
+            #[cfg(not(feature = "conformance"))]
+            let outcome = locked_store.accept(&update, &request.payload).map_err(store_error)?;
+            drop(locked_store);
             // An inserted row is durable at this point. Killing stored at this
             // barrier deliberately loses only the response, forcing Carbon to
             // resolve the ambiguous outcome through an exact-byte retry.
+            #[cfg(feature = "conformance")]
             if outcome == StoreAcceptOutcome::Inserted {
                 test_barrier::checkpoint("store-after-commit-before-response")?;
             }

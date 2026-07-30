@@ -123,22 +123,40 @@ impl DurableUpdateStore {
     }
 
     /// Commits a first acceptance or resolves an exact/conflicting retry.
-    #[cfg(test)]
+    #[cfg(any(not(feature = "conformance"), test))]
     pub fn accept(
         &mut self,
         update: &ImmutableUpdate,
         encoded_record: &[u8],
     ) -> Result<StoreAcceptOutcome, StoreError> {
-        self.accept_with_test_barriers(update, encoded_record, || Ok(()), || Ok(()))
+        self.accept_internal(
+            update,
+            encoded_record,
+            #[cfg(feature = "conformance")]
+            || Ok(()),
+            #[cfg(feature = "conformance")]
+            || Ok(()),
+        )
     }
 
     /// Exposes daemon-owned barriers around commit and exact retry resolution.
+    #[cfg(feature = "conformance")]
     pub fn accept_with_test_barriers(
         &mut self,
         update: &ImmutableUpdate,
         encoded_record: &[u8],
         before_commit: impl FnOnce() -> Result<(), StoreError>,
         before_exact_retry: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<StoreAcceptOutcome, StoreError> {
+        self.accept_internal(update, encoded_record, before_commit, before_exact_retry)
+    }
+
+    fn accept_internal(
+        &mut self,
+        update: &ImmutableUpdate,
+        encoded_record: &[u8],
+        #[cfg(feature = "conformance")] before_commit: impl FnOnce() -> Result<(), StoreError>,
+        #[cfg(feature = "conformance")] before_exact_retry: impl FnOnce() -> Result<(), StoreError>,
     ) -> Result<StoreAcceptOutcome, StoreError> {
         let document_id = update.document_id().into_bytes();
         let update_id = update.update_id().into_bytes();
@@ -155,6 +173,7 @@ impl DurableUpdateStore {
             .optional()?;
         if let Some(existing) = existing {
             return if existing == encoded_record {
+                #[cfg(feature = "conformance")]
                 before_exact_retry()?;
                 Ok(StoreAcceptOutcome::AlreadyPresent)
             } else {
@@ -197,6 +216,7 @@ impl DurableUpdateStore {
                 encoded_record,
             ],
         )?;
+        #[cfg(feature = "conformance")]
         before_commit()?;
         transaction.commit()?;
         Ok(StoreAcceptOutcome::Inserted)
