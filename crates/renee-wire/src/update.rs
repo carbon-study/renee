@@ -10,7 +10,7 @@ use renee_types::{
     PublicLoroRanges, UpdateId, UpdateMetadata,
 };
 
-use crate::MAX_APPLICATION_PAYLOAD_LENGTH;
+use crate::{MAX_APPLICATION_PAYLOAD_LENGTH, MAX_UPDATE_RECORD_LENGTH};
 
 /// Accept one exact encoded immutable-update record.
 pub const ACCEPT_UPDATE: u16 = 10;
@@ -63,6 +63,8 @@ pub enum UpdateErrorCode {
     InvalidCursor,
     /// A Renee-owned counter cannot advance without wrapping.
     CounterExhausted,
+    /// Document, capability, secret, ancestry, or operation authority was denied.
+    AuthorizationDenied,
 }
 
 /// One metadata enumeration cursor.
@@ -157,7 +159,7 @@ impl std::error::Error for UpdateCodecError {}
 
 /// Decodes one complete canonical Carbon update record.
 pub fn decode_update_record(encoded: &[u8]) -> Result<ImmutableUpdate, UpdateCodecError> {
-    if encoded.len() > MAX_APPLICATION_PAYLOAD_LENGTH {
+    if encoded.len() > MAX_UPDATE_RECORD_LENGTH {
         return Err(UpdateCodecError::RecordTooLong);
     }
     let mut decoder = Decoder::new(encoded);
@@ -220,7 +222,7 @@ pub fn encode_update_record(update: &ImmutableUpdate) -> Result<Vec<u8>, UpdateC
         )
         .and_then(|length| length.checked_add(update.encrypted_payload().len()))
         .ok_or(UpdateCodecError::RecordTooLong)?;
-    if encoded_length > MAX_APPLICATION_PAYLOAD_LENGTH {
+    if encoded_length > MAX_UPDATE_RECORD_LENGTH {
         return Err(UpdateCodecError::RecordTooLong);
     }
 
@@ -499,6 +501,7 @@ pub fn encode_update_error(error: UpdateErrorCode) -> Vec<u8> {
         UpdateErrorCode::NotNegotiated => 3,
         UpdateErrorCode::InvalidCursor => 4,
         UpdateErrorCode::CounterExhausted => 5,
+        UpdateErrorCode::AuthorizationDenied => 6,
     }]
 }
 
@@ -511,6 +514,7 @@ pub fn decode_update_error(payload: &[u8]) -> Result<UpdateErrorCode, UpdateCode
         [3] => Ok(UpdateErrorCode::NotNegotiated),
         [4] => Ok(UpdateErrorCode::InvalidCursor),
         [5] => Ok(UpdateErrorCode::CounterExhausted),
+        [6] => Ok(UpdateErrorCode::AuthorizationDenied),
         [_unknown] => Err(UpdateCodecError::InvalidDiscriminant),
         _ => Err(UpdateCodecError::TrailingBytes),
     }
@@ -615,11 +619,11 @@ mod tests {
     }
 
     #[test]
-    fn complete_record_limit_is_frozen_to_one_application_payload() {
+    fn complete_record_limit_reserves_update_authority() {
         let encoded = decode_hex(FIXED_RECORD_HEX);
         let update = decode_update_record(&encoded).expect("Carbon vector must decode");
         let payload_overhead = RECORD_FIXED_LENGTH + (2 * RANGE_LENGTH);
-        let largest_payload = MAX_APPLICATION_PAYLOAD_LENGTH - payload_overhead;
+        let largest_payload = MAX_UPDATE_RECORD_LENGTH - payload_overhead;
         let maximum = ImmutableUpdate::new(
             update.document_id(),
             update.update_id(),
@@ -628,7 +632,7 @@ mod tests {
         );
         assert_eq!(
             encode_update_record(&maximum).expect("exact limit must encode").len(),
-            MAX_APPLICATION_PAYLOAD_LENGTH
+            MAX_UPDATE_RECORD_LENGTH
         );
 
         let oversized = ImmutableUpdate::new(
@@ -639,13 +643,13 @@ mod tests {
         );
         assert_eq!(encode_update_record(&oversized), Err(UpdateCodecError::RecordTooLong));
         assert_eq!(
-            decode_update_record(&vec![0_u8; MAX_APPLICATION_PAYLOAD_LENGTH + 1]),
+            decode_update_record(&vec![0_u8; MAX_UPDATE_RECORD_LENGTH + 1]),
             Err(UpdateCodecError::RecordTooLong)
         );
     }
 
     #[test]
-    fn admission_rejects_metadata_that_cannot_fit_a_cursor_bearing_page() {
+    fn authorized_record_limit_is_stricter_than_enumeration_metadata_limit() {
         let ranges = |count: u64| {
             PublicLoroRanges::new(
                 (0..count)
@@ -658,7 +662,7 @@ mod tests {
         };
         let document_id = DocumentId::from_bytes([0x61; IDENTIFIER_LENGTH]);
         let update_id = UpdateId::from_bytes([0x62; IDENTIFIER_LENGTH]);
-        let maximum = ImmutableUpdate::new(document_id, update_id, ranges(250), vec![0x01]);
+        let maximum = ImmutableUpdate::new(document_id, update_id, ranges(248), vec![0x01]);
         assert_eq!(
             metadata_encoded_length(&UpdateMetadata {
                 encrypted_payload_length: 1,
@@ -667,14 +671,14 @@ mod tests {
             })
             .expect("metadata length must encode")
                 + ENUMERATE_RESPONSE_WITH_CURSOR_LENGTH,
-            4_069
+            4_037
         );
         assert_eq!(
             encode_update_record(&maximum).expect("largest enumerable range set must encode").len(),
-            4_051
+            4_019
         );
 
-        let poison = ImmutableUpdate::new(document_id, update_id, ranges(251), vec![0x01]);
+        let poison = ImmutableUpdate::new(document_id, update_id, ranges(249), vec![0x01]);
         assert_eq!(
             metadata_encoded_length(&UpdateMetadata {
                 encrypted_payload_length: 1,
@@ -683,22 +687,22 @@ mod tests {
             })
             .expect("metadata length must encode")
                 + ENUMERATE_RESPONSE_WITH_CURSOR_LENGTH,
-            4_085
+            4_053
         );
-        assert_eq!(encode_update_record(&poison), Err(UpdateCodecError::MetadataTooLong));
+        assert_eq!(encode_update_record(&poison), Err(UpdateCodecError::RecordTooLong));
 
-        let mut raw = Vec::with_capacity(4_067);
+        let mut raw = Vec::with_capacity(4_035);
         raw.extend_from_slice(&RECORD_MAGIC);
         raw.extend_from_slice(&RECORD_VERSION.to_be_bytes());
         raw.extend_from_slice(&LORO_PROFILE_CODE.to_be_bytes());
         raw.extend_from_slice(&document_id.into_bytes());
         raw.extend_from_slice(&update_id.into_bytes());
-        raw.extend_from_slice(&251_u16.to_be_bytes());
+        raw.extend_from_slice(&249_u16.to_be_bytes());
         append_ranges(&mut raw, poison.public_loro_ranges());
         raw.extend_from_slice(&1_u32.to_be_bytes());
         raw.push(0x01);
-        assert_eq!(raw.len(), 4_067);
-        assert_eq!(decode_update_record(&raw), Err(UpdateCodecError::MetadataTooLong));
+        assert_eq!(raw.len(), 4_035);
+        assert_eq!(decode_update_record(&raw), Err(UpdateCodecError::RecordTooLong));
     }
 
     #[test]

@@ -8,7 +8,11 @@
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included};
 
-use renee_types::{AcceptanceSequence, DocumentId, ImmutableUpdate, UpdateId, UpdateMetadata};
+use renee_types::{
+    AcceptanceSequence, Authenticator, CapabilityId, DocumentId, ImmutableUpdate, Operation,
+    OperationSet, RequestId, UpdateId, UpdateMetadata,
+};
+use sha2::{Digest as _, Sha256};
 
 /// The model's supported experimental profile.
 pub const EXPERIMENTAL_PROFILE: &str = "renee-experimental-v0";
@@ -78,6 +82,358 @@ impl NegotiationModel {
     pub const fn state(&self) -> NegotiationState {
         self.state
     }
+}
+
+/// Pure root-document creation outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreateDocumentOutcome {
+    /// A new document and root capability were created.
+    Inserted,
+    /// The exact root creation was already present.
+    AlreadyPresent,
+    /// The document identifier names different root input.
+    IdentifierConflict,
+}
+
+/// Pure grant/revoke outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlOutcome {
+    /// A new mutation was applied.
+    Inserted,
+    /// The exact issuer-scoped request was already applied.
+    AlreadyPresent,
+    /// Authority was denied without distinguishing its cause.
+    AuthorizationDenied,
+    /// A capability identifier names different input.
+    IdentifierConflict,
+    /// A request identifier names different input.
+    RequestConflict,
+    /// The control revision cannot advance.
+    CounterExhausted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModelVerifierPair {
+    live: [u8; 32],
+    receipt: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+struct ModelCapability {
+    operations: OperationSet,
+    parent: Option<CapabilityId>,
+    revoked: bool,
+    verifiers: ModelVerifierPair,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReceiptInput {
+    Grant {
+        descendant_id: CapabilityId,
+        descendant_verifiers: ModelVerifierPair,
+        operations: OperationSet,
+    },
+    Revoke {
+        target_id: CapabilityId,
+    },
+}
+
+#[derive(Debug)]
+struct CapabilityDocument {
+    capabilities: BTreeMap<CapabilityId, ModelCapability>,
+    receipts: BTreeMap<(CapabilityId, RequestId), ReceiptInput>,
+    revision: u64,
+    root_id: CapabilityId,
+}
+
+/// Deterministic document-capability state machine independent of storage and transport.
+#[derive(Debug, Default)]
+pub struct CapabilityModel {
+    documents: BTreeMap<DocumentId, CapabilityDocument>,
+}
+
+impl CapabilityModel {
+    /// Creates one document with a unique full-operation root capability.
+    pub fn create_document(
+        &mut self,
+        document_id: DocumentId,
+        root_id: CapabilityId,
+        authenticator: &Authenticator,
+    ) -> CreateDocumentOutcome {
+        let verifiers = model_verifiers(document_id, root_id, authenticator);
+        if let Some(document) = self.documents.get(&document_id) {
+            return if document.root_id == root_id
+                && document
+                    .capabilities
+                    .get(&root_id)
+                    .is_some_and(|root| root.verifiers == verifiers)
+            {
+                CreateDocumentOutcome::AlreadyPresent
+            } else {
+                CreateDocumentOutcome::IdentifierConflict
+            };
+        }
+        let mut capabilities = BTreeMap::new();
+        capabilities.insert(
+            root_id,
+            ModelCapability {
+                operations: OperationSet::FULL,
+                parent: None,
+                revoked: false,
+                verifiers,
+            },
+        );
+        self.documents.insert(
+            document_id,
+            CapabilityDocument { capabilities, receipts: BTreeMap::new(), revision: 1, root_id },
+        );
+        CreateDocumentOutcome::Inserted
+    }
+
+    /// Returns whether current authority permits one operation.
+    pub fn authorizes(
+        &self,
+        document_id: DocumentId,
+        capability_id: CapabilityId,
+        authenticator: &Authenticator,
+        operation: Operation,
+    ) -> bool {
+        let Some(document) = self.documents.get(&document_id) else {
+            return false;
+        };
+        let Some(presented) = document.capabilities.get(&capability_id) else {
+            return false;
+        };
+        if presented.verifiers.live
+            != model_verifiers(document_id, capability_id, authenticator).live
+            || !presented.operations.contains(operation)
+        {
+            return false;
+        }
+        let mut current = Some(capability_id);
+        for _depth in 0..64 {
+            let Some(current_id) = current else {
+                return true;
+            };
+            let Some(capability) = document.capabilities.get(&current_id) else {
+                return false;
+            };
+            if capability.revoked {
+                return false;
+            }
+            current = capability.parent;
+        }
+        false
+    }
+
+    /// Grants one nonempty attenuated descendant.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the normalized grant command intentionally keeps every authority and identity explicit"
+    )]
+    pub fn grant(
+        &mut self,
+        document_id: DocumentId,
+        issuer_id: CapabilityId,
+        issuer_authenticator: &Authenticator,
+        request_id: RequestId,
+        descendant_id: CapabilityId,
+        descendant_authenticator: &Authenticator,
+        operations: OperationSet,
+    ) -> ControlOutcome {
+        let descendant_verifiers =
+            model_verifiers(document_id, descendant_id, descendant_authenticator);
+        let input = ReceiptInput::Grant {
+            descendant_id,
+            descendant_verifiers: descendant_verifiers.clone(),
+            operations,
+        };
+        if let Some(outcome) =
+            self.receipt_outcome(document_id, issuer_id, issuer_authenticator, request_id, &input)
+        {
+            return outcome;
+        }
+        if !self.authorizes(document_id, issuer_id, issuer_authenticator, Operation::Grant) {
+            return ControlOutcome::AuthorizationDenied;
+        }
+        if !self
+            .documents
+            .get(&document_id)
+            .is_some_and(|document| issuer_has_descendant_capacity(document, issuer_id))
+        {
+            return ControlOutcome::AuthorizationDenied;
+        }
+        let Some(document) = self.documents.get_mut(&document_id) else {
+            return ControlOutcome::AuthorizationDenied;
+        };
+        let Some(issuer) = document.capabilities.get(&issuer_id) else {
+            return ControlOutcome::AuthorizationDenied;
+        };
+        let issuer_operations = issuer.operations;
+        if !issuer_operations.allows(operations) {
+            return ControlOutcome::AuthorizationDenied;
+        }
+        let Some(next_revision) = document.revision.checked_add(1) else {
+            return ControlOutcome::CounterExhausted;
+        };
+        if document.capabilities.contains_key(&descendant_id) {
+            return ControlOutcome::IdentifierConflict;
+        }
+        document.capabilities.insert(
+            descendant_id,
+            ModelCapability {
+                operations,
+                parent: Some(issuer_id),
+                revoked: false,
+                verifiers: descendant_verifiers,
+            },
+        );
+        document.receipts.insert((issuer_id, request_id), input);
+        document.revision = next_revision;
+        ControlOutcome::Inserted
+    }
+
+    /// Revokes an issuer capability or one transitive descendant subtree.
+    pub fn revoke(
+        &mut self,
+        document_id: DocumentId,
+        issuer_id: CapabilityId,
+        issuer_authenticator: &Authenticator,
+        request_id: RequestId,
+        target_id: CapabilityId,
+    ) -> ControlOutcome {
+        let input = ReceiptInput::Revoke { target_id };
+        if let Some(outcome) =
+            self.receipt_outcome(document_id, issuer_id, issuer_authenticator, request_id, &input)
+        {
+            return outcome;
+        }
+        if !self.authorizes(document_id, issuer_id, issuer_authenticator, Operation::Revoke)
+            || !self.is_active_descendant(document_id, issuer_id, target_id)
+        {
+            return ControlOutcome::AuthorizationDenied;
+        }
+        let Some(document) = self.documents.get_mut(&document_id) else {
+            return ControlOutcome::AuthorizationDenied;
+        };
+        let Some(next_revision) = document.revision.checked_add(1) else {
+            return ControlOutcome::CounterExhausted;
+        };
+        let ids = document.capabilities.keys().copied().collect::<Vec<_>>();
+        for capability_id in ids {
+            if is_descendant(document, target_id, capability_id) {
+                if let Some(capability) = document.capabilities.get_mut(&capability_id) {
+                    capability.revoked = true;
+                }
+            }
+        }
+        document.receipts.insert((issuer_id, request_id), input);
+        document.revision = next_revision;
+        ControlOutcome::Inserted
+    }
+
+    fn is_active_descendant(
+        &self,
+        document_id: DocumentId,
+        issuer_id: CapabilityId,
+        target_id: CapabilityId,
+    ) -> bool {
+        self.documents.get(&document_id).is_some_and(|document| {
+            document.capabilities.get(&target_id).is_some_and(|target| {
+                !target.revoked && is_descendant(document, issuer_id, target_id)
+            })
+        })
+    }
+
+    fn receipt_outcome(
+        &self,
+        document_id: DocumentId,
+        issuer_id: CapabilityId,
+        authenticator: &Authenticator,
+        request_id: RequestId,
+        input: &ReceiptInput,
+    ) -> Option<ControlOutcome> {
+        let document = self.documents.get(&document_id)?;
+        let stored = document.receipts.get(&(issuer_id, request_id))?;
+        let issuer = document.capabilities.get(&issuer_id)?;
+        if issuer.verifiers.receipt
+            != model_verifiers(document_id, issuer_id, authenticator).receipt
+        {
+            return Some(ControlOutcome::AuthorizationDenied);
+        }
+        Some(if stored == input {
+            ControlOutcome::AlreadyPresent
+        } else {
+            ControlOutcome::RequestConflict
+        })
+    }
+}
+
+fn is_descendant(
+    document: &CapabilityDocument,
+    ancestor_id: CapabilityId,
+    descendant_id: CapabilityId,
+) -> bool {
+    let mut current = Some(descendant_id);
+    for _depth in 0..64 {
+        let Some(current_id) = current else {
+            return false;
+        };
+        if current_id == ancestor_id {
+            return true;
+        }
+        current = document.capabilities.get(&current_id).and_then(|capability| capability.parent);
+    }
+    false
+}
+
+fn issuer_has_descendant_capacity(document: &CapabilityDocument, issuer_id: CapabilityId) -> bool {
+    let mut current = issuer_id;
+    for node_count in 1..=64 {
+        let Some(capability) = document.capabilities.get(&current) else {
+            return false;
+        };
+        let Some(parent) = capability.parent else {
+            return node_count < 64;
+        };
+        current = parent;
+    }
+    false
+}
+
+fn model_verifiers(
+    document_id: DocumentId,
+    capability_id: CapabilityId,
+    authenticator: &Authenticator,
+) -> ModelVerifierPair {
+    ModelVerifierPair {
+        live: model_verifier(
+            b"renee/capability/live-verifier/v1\0",
+            document_id,
+            capability_id,
+            authenticator,
+        ),
+        receipt: model_verifier(
+            b"renee/capability/receipt-verifier/v1\0",
+            document_id,
+            capability_id,
+            authenticator,
+        ),
+    }
+}
+
+fn model_verifier(
+    domain: &[u8],
+    document_id: DocumentId,
+    capability_id: CapabilityId,
+    authenticator: &Authenticator,
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    hash.update(document_id.into_bytes());
+    hash.update(capability_id.into_bytes());
+    hash.update(authenticator.as_bytes());
+    hash.finalize().into()
 }
 
 /// Result of accepting one document-scoped immutable update.

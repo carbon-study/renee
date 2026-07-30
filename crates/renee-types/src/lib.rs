@@ -354,6 +354,16 @@ impl OperationSet {
     /// The full pre-v0 root-capability operation set.
     pub const FULL: Self = Self(0x03ff);
 
+    /// Reconstructs a canonical operation set from its stable bit representation.
+    pub const fn from_bits(bits: u16) -> Option<Self> {
+        if bits & !Self::FULL.0 == 0 { Some(Self(bits)) } else { None }
+    }
+
+    /// Returns the stable bit representation used by wire and storage profiles.
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+
     /// Creates a singleton operation set.
     pub const fn one(operation: Operation) -> Self {
         Self(operation_mask(operation))

@@ -17,8 +17,21 @@ use std::str;
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
+mod capability;
 mod update;
 
+pub use capability::{
+    AuthorizedUpdateRequest, CAPABILITY_ERROR, CREATE_DOCUMENT, CREATE_DOCUMENT_RESPONSE,
+    CapabilityAuthority, CapabilityCodecError, CapabilityErrorCode, ControlMutationOutcome,
+    CreateDocumentOutcome, CreateDocumentRequest, GRANT_CAPABILITY, GRANT_CAPABILITY_RESPONSE,
+    GrantCapabilityRequest, REVOKE_CAPABILITY, REVOKE_CAPABILITY_RESPONSE, RevokeCapabilityRequest,
+    decode_authorized_update_request, decode_capability_error, decode_control_mutation_response,
+    decode_create_document_request, decode_create_document_response,
+    decode_grant_capability_request, decode_revoke_capability_request,
+    encode_authorized_update_request, encode_capability_error, encode_control_mutation_response,
+    encode_create_document_request, encode_create_document_response,
+    encode_grant_capability_request, encode_revoke_capability_request,
+};
 pub use update::{
     ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor,
     ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, EnumerateRequest, EnumerateResponse,
@@ -63,6 +76,11 @@ pub const MAX_BODY_LENGTH: usize = 4_096;
 pub const ENVELOPE_HEADER_LENGTH: usize = 24;
 /// Largest application payload inside one Renee frame body.
 pub const MAX_APPLICATION_PAYLOAD_LENGTH: usize = MAX_BODY_LENGTH - ENVELOPE_HEADER_LENGTH;
+/// Capability identifier plus authenticator attached to every update submission.
+pub const CAPABILITY_AUTHORITY_LENGTH: usize = 16 + 32;
+/// Largest canonical Carbon update record after reserving update authority.
+pub const MAX_UPDATE_RECORD_LENGTH: usize =
+    MAX_APPLICATION_PAYLOAD_LENGTH - CAPABILITY_AUTHORITY_LENGTH;
 /// Maximum UTF-8 byte length of either greeting field.
 pub const MAX_GREETING_FIELD_LENGTH: usize = 256;
 

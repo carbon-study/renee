@@ -5,6 +5,7 @@
 mod store;
 #[cfg(feature = "conformance")]
 mod test_barrier;
+mod verifier;
 
 use std::env;
 use std::error::Error;
@@ -16,15 +17,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use renee_wire::{
-    ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor,
-    ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, EnumerateResponse, EnumerateStart, Envelope,
-    FETCH_UPDATE, FETCH_UPDATE_RESPONSE, MAX_APPLICATION_PAYLOAD_LENGTH, UPDATE_ERROR,
-    UpdateErrorCode, VERSION, decode_acceptance_cursor, decode_body, decode_enumerate_request,
-    decode_fetch_request, decode_update_record, encode_accept_response, encode_acceptance_cursor,
-    encode_body, encode_enumerate_response, encode_fetch_response, encode_update_error,
-    enumerate_response_base_length, read_body, write_body,
+    ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor, CAPABILITY_ERROR,
+    CREATE_DOCUMENT, CREATE_DOCUMENT_RESPONSE, CapabilityErrorCode, ControlMutationOutcome,
+    CreateDocumentOutcome, ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, EnumerateResponse,
+    EnumerateStart, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE, GRANT_CAPABILITY,
+    GRANT_CAPABILITY_RESPONSE, MAX_APPLICATION_PAYLOAD_LENGTH, REVOKE_CAPABILITY,
+    REVOKE_CAPABILITY_RESPONSE, UPDATE_ERROR, UpdateErrorCode, VERSION, decode_acceptance_cursor,
+    decode_authorized_update_request, decode_body, decode_create_document_request,
+    decode_enumerate_request, decode_fetch_request, decode_grant_capability_request,
+    decode_revoke_capability_request, decode_update_record, encode_accept_response,
+    encode_acceptance_cursor, encode_body, encode_capability_error,
+    encode_control_mutation_response, encode_create_document_response, encode_enumerate_response,
+    encode_fetch_response, encode_update_error, enumerate_response_base_length, read_body,
+    write_body,
 };
-use store::{DurableUpdateStore, StoreAcceptOutcome, StoreError};
+use store::{
+    DurableUpdateStore, StoreAcceptOutcome, StoreControlOutcome, StoreCreateOutcome, StoreError,
+};
 use tokio::io::AsyncReadExt as _;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -146,8 +155,162 @@ async fn handle_request(
     }
 
     match request.message_type {
+        CREATE_DOCUMENT => {
+            let create = match decode_create_document_request(&request.payload) {
+                Ok(create) => create,
+                Err(_error) => {
+                    return response(
+                        request,
+                        CAPABILITY_ERROR,
+                        encode_capability_error(CapabilityErrorCode::Malformed),
+                    );
+                }
+            };
+            let outcome = store
+                .lock()
+                .await
+                .create_document(
+                    create.document_id,
+                    create.root.capability_id,
+                    &create.root.authenticator,
+                )
+                .map_err(store_error)?;
+            match outcome {
+                StoreCreateOutcome::Inserted => response(
+                    request,
+                    CREATE_DOCUMENT_RESPONSE,
+                    encode_create_document_response(CreateDocumentOutcome::Inserted),
+                ),
+                StoreCreateOutcome::AlreadyPresent => response(
+                    request,
+                    CREATE_DOCUMENT_RESPONSE,
+                    encode_create_document_response(CreateDocumentOutcome::AlreadyPresent),
+                ),
+                StoreCreateOutcome::IdentifierConflict => response(
+                    request,
+                    CAPABILITY_ERROR,
+                    encode_capability_error(CapabilityErrorCode::IdentifierConflict),
+                ),
+            }
+        }
+        GRANT_CAPABILITY => {
+            let grant = match decode_grant_capability_request(&request.payload) {
+                Ok(grant) => grant,
+                Err(_error) => {
+                    return response(
+                        request,
+                        CAPABILITY_ERROR,
+                        encode_capability_error(CapabilityErrorCode::Malformed),
+                    );
+                }
+            };
+            let mut locked_store = store.lock().await;
+            #[cfg(feature = "conformance")]
+            let outcome = locked_store
+                .grant_capability_with_test_barriers(
+                    grant.document_id,
+                    grant.issuer.capability_id,
+                    &grant.issuer.authenticator,
+                    grant.request_id,
+                    grant.descendant.capability_id,
+                    &grant.descendant.authenticator,
+                    grant.operations,
+                    || {
+                        test_barrier::checkpoint("store-grant-after-authorization")
+                            .map_err(StoreError::from)
+                    },
+                    || {
+                        test_barrier::checkpoint("store-grant-before-commit")
+                            .map_err(StoreError::from)
+                    },
+                    || {
+                        test_barrier::checkpoint("store-grant-exact-retry")
+                            .map_err(StoreError::from)
+                    },
+                )
+                .map_err(store_error)?;
+            #[cfg(not(feature = "conformance"))]
+            let outcome = locked_store
+                .grant_capability(
+                    grant.document_id,
+                    grant.issuer.capability_id,
+                    &grant.issuer.authenticator,
+                    grant.request_id,
+                    grant.descendant.capability_id,
+                    &grant.descendant.authenticator,
+                    grant.operations,
+                )
+                .map_err(store_error)?;
+            drop(locked_store);
+            #[cfg(feature = "conformance")]
+            if outcome == StoreControlOutcome::Inserted {
+                test_barrier::checkpoint("store-grant-after-commit-before-response")?;
+            }
+            control_response(request, GRANT_CAPABILITY_RESPONSE, outcome)
+        }
+        REVOKE_CAPABILITY => {
+            let revoke = match decode_revoke_capability_request(&request.payload) {
+                Ok(revoke) => revoke,
+                Err(_error) => {
+                    return response(
+                        request,
+                        CAPABILITY_ERROR,
+                        encode_capability_error(CapabilityErrorCode::Malformed),
+                    );
+                }
+            };
+            let mut locked_store = store.lock().await;
+            #[cfg(feature = "conformance")]
+            let outcome = locked_store
+                .revoke_capability_with_test_barriers(
+                    revoke.document_id,
+                    revoke.issuer.capability_id,
+                    &revoke.issuer.authenticator,
+                    revoke.request_id,
+                    revoke.target_capability_id,
+                    || {
+                        test_barrier::checkpoint("store-revoke-after-authorization")
+                            .map_err(StoreError::from)
+                    },
+                    || {
+                        test_barrier::checkpoint("store-revoke-before-commit")
+                            .map_err(StoreError::from)
+                    },
+                    || {
+                        test_barrier::checkpoint("store-revoke-exact-retry")
+                            .map_err(StoreError::from)
+                    },
+                )
+                .map_err(store_error)?;
+            #[cfg(not(feature = "conformance"))]
+            let outcome = locked_store
+                .revoke_capability(
+                    revoke.document_id,
+                    revoke.issuer.capability_id,
+                    &revoke.issuer.authenticator,
+                    revoke.request_id,
+                    revoke.target_capability_id,
+                )
+                .map_err(store_error)?;
+            drop(locked_store);
+            #[cfg(feature = "conformance")]
+            if outcome == StoreControlOutcome::Inserted {
+                test_barrier::checkpoint("store-revoke-after-commit-before-response")?;
+            }
+            control_response(request, REVOKE_CAPABILITY_RESPONSE, outcome)
+        }
         ACCEPT_UPDATE => {
-            let update = match decode_update_record(&request.payload) {
+            let authorized = match decode_authorized_update_request(&request.payload) {
+                Ok(authorized) => authorized,
+                Err(_error) => {
+                    return response(
+                        request,
+                        UPDATE_ERROR,
+                        encode_update_error(UpdateErrorCode::Malformed),
+                    );
+                }
+            };
+            let update = match decode_update_record(authorized.encoded_record) {
                 Ok(update) => update,
                 Err(_error) => {
                     return response(
@@ -164,14 +327,27 @@ async fn handle_request(
             #[cfg(feature = "conformance")]
             let outcome = locked_store
                 .accept_with_test_barriers(
+                    authorized.authority.capability_id,
+                    &authorized.authority.authenticator,
                     &update,
-                    &request.payload,
+                    authorized.encoded_record,
+                    || {
+                        test_barrier::checkpoint("store-after-authorization")
+                            .map_err(StoreError::from)
+                    },
                     || test_barrier::checkpoint("store-before-commit").map_err(StoreError::from),
                     || test_barrier::checkpoint("store-exact-retry").map_err(StoreError::from),
                 )
                 .map_err(store_error)?;
             #[cfg(not(feature = "conformance"))]
-            let outcome = locked_store.accept(&update, &request.payload).map_err(store_error)?;
+            let outcome = locked_store
+                .accept(
+                    authorized.authority.capability_id,
+                    &authorized.authority.authenticator,
+                    &update,
+                    authorized.encoded_record,
+                )
+                .map_err(store_error)?;
             drop(locked_store);
             // An inserted row is durable at this point. Killing stored at this
             // barrier deliberately loses only the response, forcing Carbon to
@@ -200,6 +376,11 @@ async fn handle_request(
                     request,
                     UPDATE_ERROR,
                     encode_update_error(UpdateErrorCode::CounterExhausted),
+                ),
+                StoreAcceptOutcome::AuthorizationDenied => response(
+                    request,
+                    UPDATE_ERROR,
+                    encode_update_error(UpdateErrorCode::AuthorizationDenied),
                 ),
             }
         }
@@ -364,6 +545,45 @@ async fn handle_request(
         _unknown => {
             response(request, UPDATE_ERROR, encode_update_error(UpdateErrorCode::Malformed))
         }
+    }
+}
+
+fn control_response(
+    request: &Envelope,
+    success_message_type: u16,
+    outcome: StoreControlOutcome,
+) -> io::Result<Vec<u8>> {
+    match outcome {
+        StoreControlOutcome::Inserted => response(
+            request,
+            success_message_type,
+            encode_control_mutation_response(ControlMutationOutcome::Inserted),
+        ),
+        StoreControlOutcome::AlreadyPresent => response(
+            request,
+            success_message_type,
+            encode_control_mutation_response(ControlMutationOutcome::AlreadyPresent),
+        ),
+        StoreControlOutcome::AuthorizationDenied => response(
+            request,
+            CAPABILITY_ERROR,
+            encode_capability_error(CapabilityErrorCode::AuthorizationDenied),
+        ),
+        StoreControlOutcome::IdentifierConflict => response(
+            request,
+            CAPABILITY_ERROR,
+            encode_capability_error(CapabilityErrorCode::IdentifierConflict),
+        ),
+        StoreControlOutcome::RequestConflict => response(
+            request,
+            CAPABILITY_ERROR,
+            encode_capability_error(CapabilityErrorCode::RequestConflict),
+        ),
+        StoreControlOutcome::CounterExhausted => response(
+            request,
+            CAPABILITY_ERROR,
+            encode_capability_error(CapabilityErrorCode::CounterExhausted),
+        ),
     }
 }
 

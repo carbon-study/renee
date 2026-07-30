@@ -9,20 +9,26 @@
 use core::fmt;
 
 use renee_types::{
-    AcceptanceSequence, DocumentId, ImmutableUpdate, LoroRange, PublicLoroRanges, UpdateId,
-    UpdateMetadata,
+    AcceptanceSequence, Authenticator, CapabilityId, DocumentId, ImmutableUpdate, LoroRange,
+    Operation, OperationSet, PublicLoroRanges, RequestId, UpdateId, UpdateMetadata,
 };
 use renee_wire::{
     ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor,
-    CERTIFICATE_MANIFEST, CERTIFICATE_MANIFEST_RESPONSE, CLIENT_HELLO, ENUMERATE_UPDATES,
-    ENUMERATE_UPDATES_RESPONSE, ERROR_ALREADY_NEGOTIATED, ERROR_EXPECTED_HELLO,
+    AuthorizedUpdateRequest, CAPABILITY_ERROR, CERTIFICATE_MANIFEST, CERTIFICATE_MANIFEST_RESPONSE,
+    CLIENT_HELLO, CREATE_DOCUMENT, CREATE_DOCUMENT_RESPONSE, CapabilityAuthority,
+    CapabilityErrorCode, ControlMutationOutcome, CreateDocumentOutcome, CreateDocumentRequest,
+    ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, ERROR_ALREADY_NEGOTIATED, ERROR_EXPECTED_HELLO,
     ERROR_MALFORMED_HELLO, ERROR_UNSUPPORTED_PROFILE, ERROR_UNSUPPORTED_VERSION, EnumerateRequest,
     EnumerateResponse, EnumerateStart, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE,
-    MAX_APPLICATION_PAYLOAD_LENGTH, PROFILE, PROTOCOL_ERROR, SERVER_HELLO, UPDATE_ERROR,
+    GRANT_CAPABILITY, GRANT_CAPABILITY_RESPONSE, GrantCapabilityRequest,
+    MAX_APPLICATION_PAYLOAD_LENGTH, PROFILE, PROTOCOL_ERROR, REVOKE_CAPABILITY,
+    REVOKE_CAPABILITY_RESPONSE, RevokeCapabilityRequest, SERVER_HELLO, UPDATE_ERROR,
     UpdateErrorCode, VERSION, encode_accept_response, encode_acceptance_cursor,
-    encode_enumerate_request, encode_enumerate_response, encode_fetch_request,
-    encode_fetch_response, encode_frame, encode_greeting, encode_update_error,
-    encode_update_record,
+    encode_authorized_update_request, encode_capability_error, encode_control_mutation_response,
+    encode_create_document_request, encode_create_document_response, encode_enumerate_request,
+    encode_enumerate_response, encode_fetch_request, encode_fetch_response, encode_frame,
+    encode_grant_capability_request, encode_greeting, encode_revoke_capability_request,
+    encode_update_error, encode_update_record,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
@@ -60,6 +66,14 @@ pub fn generate() -> Result<String, GenerateError> {
     let update_id = UpdateId::from_bytes([0x44; 16]);
     let update = fixture_update(document_id, update_id)?;
     let record = encode_update_record(&update)?;
+    let root = CapabilityAuthority {
+        capability_id: CapabilityId::from_bytes([0x55; 16]),
+        authenticator: Authenticator::from_bytes([0x56; 32]),
+    };
+    let editor = CapabilityAuthority {
+        capability_id: CapabilityId::from_bytes([0x57; 16]),
+        authenticator: Authenticator::from_bytes([0x58; 32]),
+    };
     let cursor = encode_acceptance_cursor(
         document_id,
         AcceptanceCursor {
@@ -104,7 +118,93 @@ pub fn generate() -> Result<String, GenerateError> {
             0x18,
             certificate_manifest.clone(),
         )?,
-        frame("accept.request", "accept", ACCEPT_UPDATE, 0x22, record)?,
+        frame(
+            "document.create.request",
+            "capability",
+            CREATE_DOCUMENT,
+            0x20,
+            encode_create_document_request(&CreateDocumentRequest {
+                document_id,
+                root: root.clone(),
+            }),
+        )?,
+        frame(
+            "document.create.response.inserted",
+            "capability",
+            CREATE_DOCUMENT_RESPONSE,
+            0x20,
+            encode_create_document_response(CreateDocumentOutcome::Inserted),
+        )?,
+        frame(
+            "document.create.response.already-present",
+            "capability",
+            CREATE_DOCUMENT_RESPONSE,
+            0x20,
+            encode_create_document_response(CreateDocumentOutcome::AlreadyPresent),
+        )?,
+        frame(
+            "capability.grant.request",
+            "capability",
+            GRANT_CAPABILITY,
+            0x21,
+            encode_grant_capability_request(&GrantCapabilityRequest {
+                document_id,
+                issuer: root.clone(),
+                request_id: RequestId::from_bytes([0x59; 16]),
+                descendant: editor.clone(),
+                operations: OperationSet::one(Operation::Update),
+            }),
+        )?,
+        frame(
+            "capability.grant.response.inserted",
+            "capability",
+            GRANT_CAPABILITY_RESPONSE,
+            0x21,
+            encode_control_mutation_response(ControlMutationOutcome::Inserted),
+        )?,
+        frame(
+            "capability.grant.response.already-present",
+            "capability",
+            GRANT_CAPABILITY_RESPONSE,
+            0x21,
+            encode_control_mutation_response(ControlMutationOutcome::AlreadyPresent),
+        )?,
+        frame(
+            "capability.revoke.request",
+            "capability",
+            REVOKE_CAPABILITY,
+            0x23,
+            encode_revoke_capability_request(&RevokeCapabilityRequest {
+                document_id,
+                issuer: root.clone(),
+                request_id: RequestId::from_bytes([0x5a; 16]),
+                target_capability_id: editor.capability_id,
+            }),
+        )?,
+        frame(
+            "capability.revoke.response.inserted",
+            "capability",
+            REVOKE_CAPABILITY_RESPONSE,
+            0x23,
+            encode_control_mutation_response(ControlMutationOutcome::Inserted),
+        )?,
+        frame(
+            "capability.revoke.response.already-present",
+            "capability",
+            REVOKE_CAPABILITY_RESPONSE,
+            0x23,
+            encode_control_mutation_response(ControlMutationOutcome::AlreadyPresent),
+        )?,
+        frame(
+            "accept.request.authorized",
+            "accept",
+            ACCEPT_UPDATE,
+            0x22,
+            encode_authorized_update_request(&AuthorizedUpdateRequest {
+                authority: root.clone(),
+                encoded_record: &record,
+            })?,
+        )?,
         frame(
             "accept.response.inserted",
             "accept",
@@ -203,8 +303,18 @@ pub fn generate() -> Result<String, GenerateError> {
         ("error.update.not-negotiated", UpdateErrorCode::NotNegotiated),
         ("error.update.invalid-cursor", UpdateErrorCode::InvalidCursor),
         ("error.update.counter-exhausted", UpdateErrorCode::CounterExhausted),
+        ("error.update.authorization-denied", UpdateErrorCode::AuthorizationDenied),
     ] {
         frames.push(frame(name, "errors", UPDATE_ERROR, 0x51, encode_update_error(error))?);
+    }
+    for (name, error) in [
+        ("error.capability.malformed", CapabilityErrorCode::Malformed),
+        ("error.capability.authorization-denied", CapabilityErrorCode::AuthorizationDenied),
+        ("error.capability.identifier-conflict", CapabilityErrorCode::IdentifierConflict),
+        ("error.capability.request-conflict", CapabilityErrorCode::RequestConflict),
+        ("error.capability.counter-exhausted", CapabilityErrorCode::CounterExhausted),
+    ] {
+        frames.push(frame(name, "errors", CAPABILITY_ERROR, 0x52, encode_capability_error(error))?);
     }
 
     let maximum_greeting_field = "p".repeat(256);
@@ -221,7 +331,10 @@ pub fn generate() -> Result<String, GenerateError> {
         "limits",
         ACCEPT_UPDATE,
         0x62,
-        maximum_record,
+        encode_authorized_update_request(&AuthorizedUpdateRequest {
+            authority: root,
+            encoded_record: &maximum_record,
+        })?,
     )?);
 
     let oversized_greeting = oversized_greeting_payload();
@@ -298,6 +411,8 @@ fn maximum_update_record(
         .checked_sub(1)
         .ok_or_else(|| GenerateError::new("minimum update record has no payload byte"))?;
     let payload_length = MAX_APPLICATION_PAYLOAD_LENGTH
+        .checked_sub(16 + 32)
+        .ok_or_else(|| GenerateError::new("authority overhead exceeds application limit"))?
         .checked_sub(overhead)
         .ok_or_else(|| GenerateError::new("update record overhead exceeds application limit"))?;
     let encoded = encode_update_record(&ImmutableUpdate::new(
@@ -306,9 +421,9 @@ fn maximum_update_record(
         ranges,
         vec![0xa5; payload_length],
     ))?;
-    if encoded.len() != MAX_APPLICATION_PAYLOAD_LENGTH {
+    if encoded.len() + 16 + 32 != MAX_APPLICATION_PAYLOAD_LENGTH {
         return Err(GenerateError::new(
-            "maximum update record does not fill one application payload",
+            "maximum authorized update does not fill one application payload",
         ));
     }
     Ok(encoded)
@@ -392,6 +507,7 @@ fn render(
     output.push_str(SCHEMA);
     output.push_str("\",\n  \"max_body_length\": 4096,\n");
     output.push_str("  \"max_application_payload_length\": 4072,\n");
+    output.push_str("  \"max_update_record_length\": 4024,\n");
     output.push_str("  \"certificate_control_public_key_hex\": \"");
     output.push_str(&hex(control_public_key));
     output.push_str("\",\n  \"certificate_manifest_hex\": \"");
@@ -488,6 +604,12 @@ impl From<std::io::Error> for GenerateError {
 
 impl From<renee_types::LoroMetadataError> for GenerateError {
     fn from(error: renee_types::LoroMetadataError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+impl From<renee_wire::CapabilityCodecError> for GenerateError {
+    fn from(error: renee_wire::CapabilityCodecError) -> Self {
         Self::new(error.to_string())
     }
 }

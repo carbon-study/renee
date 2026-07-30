@@ -778,6 +778,7 @@ name = "renee-model"
 version = "0.0.0"
 dependencies = [
  "renee-types",
+ "sha2",
 ]
 
 [[package]]
@@ -794,7 +795,9 @@ version = "0.0.0"
 dependencies = [
  "renee-types",
  "renee-wire",
+ "ring",
  "rusqlite",
+ "subtle",
  "tokio",
 ]
 

@@ -18,13 +18,19 @@ use std::time::Duration;
 
 use renee_types::{DocumentId, UpdateId};
 use renee_wire::{
-    ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, CLIENT_HELLO, ENUMERATE_UPDATES,
-    ENUMERATE_UPDATES_RESPONSE, ERROR_ALREADY_NEGOTIATED, ERROR_EXPECTED_HELLO,
+    ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AuthorizedUpdateRequest,
+    CAPABILITY_ERROR, CLIENT_HELLO, CREATE_DOCUMENT, CREATE_DOCUMENT_RESPONSE, CapabilityAuthority,
+    CapabilityErrorCode, ControlMutationOutcome, CreateDocumentOutcome, CreateDocumentRequest,
+    ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, ERROR_ALREADY_NEGOTIATED, ERROR_EXPECTED_HELLO,
     ERROR_UNSUPPORTED_PROFILE, ERROR_UNSUPPORTED_VERSION, EnumerateRequest, EnumerateResponse,
-    EnumerateStart, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE, PROFILE, PROTOCOL_ERROR,
-    SERVER_HELLO, UPDATE_ERROR, UpdateErrorCode, VERSION, decode_accept_response, decode_body,
-    decode_enumerate_response, decode_fetch_response, decode_greeting, decode_update_error,
-    encode_body, encode_enumerate_request, encode_fetch_request, encode_greeting, read_body,
+    EnumerateStart, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE, GRANT_CAPABILITY,
+    GRANT_CAPABILITY_RESPONSE, GrantCapabilityRequest, PROFILE, PROTOCOL_ERROR, REVOKE_CAPABILITY,
+    REVOKE_CAPABILITY_RESPONSE, RevokeCapabilityRequest, SERVER_HELLO, UPDATE_ERROR,
+    UpdateErrorCode, VERSION, decode_accept_response, decode_body, decode_capability_error,
+    decode_control_mutation_response, decode_create_document_response, decode_enumerate_response,
+    decode_fetch_response, decode_greeting, decode_update_error, encode_authorized_update_request,
+    encode_body, encode_create_document_request, encode_enumerate_request, encode_fetch_request,
+    encode_grant_capability_request, encode_greeting, encode_revoke_capability_request, read_body,
     write_body,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
@@ -43,6 +49,7 @@ pub type HarnessResult<T> = Result<T, Box<dyn Error>>;
 /// A running Renee process tree controlled through its top-level supervisor.
 pub struct ServerHarness {
     address: String,
+    barrier_directory: PathBuf,
     certificate_hash: Sha256Digest,
     output: BufReader<ChildStdout>,
     permanent_child_pids: BTreeMap<&'static str, u32>,
@@ -94,6 +101,40 @@ pub enum AcceptObservation {
     IdentifierConflict,
     /// Renee rejected the record structure.
     Malformed,
+    /// Renee denied the indistinguishable document capability authority.
+    AuthorizationDenied,
+}
+
+/// Subject observation for root document creation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreateDocumentObservation {
+    /// The document and root capability were inserted.
+    Inserted,
+    /// The exact document and root authority were already durable.
+    AlreadyPresent,
+    /// The document identifier named different root input.
+    IdentifierConflict,
+    /// Renee rejected malformed creation input.
+    Malformed,
+}
+
+/// Subject observation for grant and revoke control mutations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlMutationObservation {
+    /// A new control mutation was committed.
+    Inserted,
+    /// The exact issuer-scoped request was already durable.
+    AlreadyPresent,
+    /// Authority was denied without disclosing its cause.
+    AuthorizationDenied,
+    /// A client-selected capability identifier names different input.
+    IdentifierConflict,
+    /// The request identifier names different input.
+    RequestConflict,
+    /// The control revision cannot advance.
+    CounterExhausted,
+    /// Renee rejected malformed control input.
+    Malformed,
 }
 
 /// Subject observation for an authorized fetch.
@@ -140,10 +181,13 @@ impl ServerHarness {
     async fn start_with_supervisor(supervisor_path: PathBuf) -> HarnessResult<Self> {
         let state_directory = TemporaryDirectory::create()?;
         let store_database = state_directory.path.join("renee.sqlite3");
+        let barrier_directory = state_directory.path.join("barriers");
+        fs::create_dir_all(&barrier_directory)?;
         let mut supervisor = Command::new(supervisor_path)
             .args(["--bind", "127.0.0.1:0", "--shutdown-on-stdin-eof"])
             .arg("--store-database")
             .arg(store_database)
+            .env("RENEE_TEST_BARRIER_DIRECTORY", &barrier_directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -181,12 +225,38 @@ impl ServerHarness {
 
         Ok(Self {
             address,
+            barrier_directory,
             certificate_hash,
             output,
             permanent_child_pids,
             _state_directory: state_directory,
             supervisor,
         })
+    }
+
+    /// Arms one externally acknowledged store transaction barrier.
+    pub fn arm_store_barrier(&self, name: &'static str) -> io::Result<()> {
+        fs::write(self.barrier_directory.join(format!("armed-{name}")), [])
+    }
+
+    /// Waits for an armed store barrier, kills stored there, and observes replacement.
+    pub async fn crash_store_at_barrier(&mut self, name: &'static str) -> HarnessResult<()> {
+        let reached = self.barrier_directory.join(format!("reached-{name}"));
+        tokio::time::timeout(STARTUP_TIMEOUT, async {
+            loop {
+                match reached.metadata() {
+                    Ok(_metadata) => break Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+        })
+        .await??;
+        self.kill_and_wait_for_restart(PermanentDaemon::Store).await?;
+        drop(fs::remove_file(reached));
+        Ok(())
     }
 
     /// Opens a certificate-pinned WebTransport connection to the running gateway.
@@ -405,9 +475,67 @@ impl WebTransportConnection {
         Err(io::Error::other("unexpected negotiation response").into())
     }
 
-    /// Submits one exact canonical record to Renee.
-    pub async fn accept_update(&self, encoded_record: &[u8]) -> HarnessResult<AcceptObservation> {
-        let response = self.exchange(ACCEPT_UPDATE, encoded_record.to_vec()).await?;
+    /// Creates one document and its full-operation root capability.
+    pub async fn create_document(
+        &self,
+        request: &CreateDocumentRequest,
+    ) -> HarnessResult<CreateDocumentObservation> {
+        let response =
+            self.exchange(CREATE_DOCUMENT, encode_create_document_request(request)).await?;
+        match response.message_type {
+            CREATE_DOCUMENT_RESPONSE => match decode_create_document_response(&response.payload)? {
+                CreateDocumentOutcome::Inserted => Ok(CreateDocumentObservation::Inserted),
+                CreateDocumentOutcome::AlreadyPresent => {
+                    Ok(CreateDocumentObservation::AlreadyPresent)
+                }
+            },
+            CAPABILITY_ERROR => match decode_capability_error(&response.payload)? {
+                CapabilityErrorCode::IdentifierConflict => {
+                    Ok(CreateDocumentObservation::IdentifierConflict)
+                }
+                CapabilityErrorCode::Malformed => Ok(CreateDocumentObservation::Malformed),
+                CapabilityErrorCode::AuthorizationDenied => {
+                    Err(io::Error::other("unexpected create authorization denial").into())
+                }
+                CapabilityErrorCode::RequestConflict | CapabilityErrorCode::CounterExhausted => {
+                    Err(io::Error::other("unexpected create control rejection").into())
+                }
+            },
+            _unexpected => Err(io::Error::other("unexpected create response").into()),
+        }
+    }
+
+    /// Grants one attenuated descendant capability.
+    pub async fn grant_capability(
+        &self,
+        request: &GrantCapabilityRequest,
+    ) -> HarnessResult<ControlMutationObservation> {
+        let response =
+            self.exchange(GRANT_CAPABILITY, encode_grant_capability_request(request)).await?;
+        control_observation(&response, GRANT_CAPABILITY_RESPONSE)
+    }
+
+    /// Revokes one capability subtree.
+    pub async fn revoke_capability(
+        &self,
+        request: &RevokeCapabilityRequest,
+    ) -> HarnessResult<ControlMutationObservation> {
+        let response =
+            self.exchange(REVOKE_CAPABILITY, encode_revoke_capability_request(request)).await?;
+        control_observation(&response, REVOKE_CAPABILITY_RESPONSE)
+    }
+
+    /// Submits one exact canonical record under current update authority.
+    pub async fn accept_update(
+        &self,
+        authority: &CapabilityAuthority,
+        encoded_record: &[u8],
+    ) -> HarnessResult<AcceptObservation> {
+        let payload = encode_authorized_update_request(&AuthorizedUpdateRequest {
+            authority: authority.clone(),
+            encoded_record,
+        })?;
+        let response = self.exchange(ACCEPT_UPDATE, payload).await?;
         match response.message_type {
             ACCEPT_UPDATE_RESPONSE => match decode_accept_response(&response.payload)? {
                 AcceptUpdateOutcome::Inserted => Ok(AcceptObservation::Inserted),
@@ -416,6 +544,7 @@ impl WebTransportConnection {
             UPDATE_ERROR => match decode_update_error(&response.payload)? {
                 UpdateErrorCode::IdentifierConflict => Ok(AcceptObservation::IdentifierConflict),
                 UpdateErrorCode::Malformed => Ok(AcceptObservation::Malformed),
+                UpdateErrorCode::AuthorizationDenied => Ok(AcceptObservation::AuthorizationDenied),
                 UpdateErrorCode::NotFound
                 | UpdateErrorCode::NotNegotiated
                 | UpdateErrorCode::InvalidCursor
@@ -538,6 +667,32 @@ impl WebTransportConnection {
         }
         Ok(response)
     }
+}
+
+fn control_observation(
+    response: &Envelope,
+    success_message_type: u16,
+) -> HarnessResult<ControlMutationObservation> {
+    if response.message_type == success_message_type {
+        return Ok(match decode_control_mutation_response(&response.payload)? {
+            ControlMutationOutcome::Inserted => ControlMutationObservation::Inserted,
+            ControlMutationOutcome::AlreadyPresent => ControlMutationObservation::AlreadyPresent,
+        });
+    }
+    if response.message_type == CAPABILITY_ERROR {
+        return Ok(match decode_capability_error(&response.payload)? {
+            CapabilityErrorCode::Malformed => ControlMutationObservation::Malformed,
+            CapabilityErrorCode::AuthorizationDenied => {
+                ControlMutationObservation::AuthorizationDenied
+            }
+            CapabilityErrorCode::IdentifierConflict => {
+                ControlMutationObservation::IdentifierConflict
+            }
+            CapabilityErrorCode::RequestConflict => ControlMutationObservation::RequestConflict,
+            CapabilityErrorCode::CounterExhausted => ControlMutationObservation::CounterExhausted,
+        });
+    }
+    Err(io::Error::other("unexpected control mutation response").into())
 }
 
 impl PermanentDaemon {

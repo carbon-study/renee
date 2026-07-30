@@ -10,15 +10,16 @@ use std::io;
 
 use renee_model::{AcceptOutcome, UpdateModel};
 use renee_subject::{
-    AcceptObservation, EnumerateObservation, FetchObservation, HarnessResult, PermanentDaemon,
-    ServerHarness,
+    AcceptObservation, CreateDocumentObservation, EnumerateObservation, FetchObservation,
+    HarnessResult, PermanentDaemon, ServerHarness,
 };
 use renee_types::{
-    AcceptanceSequence, DocumentId, ImmutableUpdate, LoroRange, PublicLoroRanges, UpdateId,
-    UpdateMetadata,
+    AcceptanceSequence, Authenticator, CapabilityId, DocumentId, ImmutableUpdate, LoroRange,
+    PublicLoroRanges, UpdateId, UpdateMetadata,
 };
 use renee_wire::{
-    AcceptanceCursor, decode_acceptance_cursor, encode_acceptance_cursor, encode_update_record,
+    AcceptanceCursor, CapabilityAuthority, CreateDocumentRequest, decode_acceptance_cursor,
+    encode_acceptance_cursor, encode_update_record,
 };
 
 fn update(document: u8, update: u8, payload: &[u8]) -> ImmutableUpdate {
@@ -44,6 +45,16 @@ fn expected_metadata(update: &ImmutableUpdate) -> UpdateMetadata {
     }
 }
 
+fn root(document: u8) -> CreateDocumentRequest {
+    CreateDocumentRequest {
+        document_id: DocumentId::from_bytes([document; 16]),
+        root: CapabilityAuthority {
+            capability_id: CapabilityId::from_bytes([document.wrapping_add(0x40); 16]),
+            authenticator: Authenticator::from_bytes([document.wrapping_add(0x80); 32]),
+        },
+    }
+}
+
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
@@ -57,25 +68,34 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
         return Err(io::Error::other("subject did not negotiate before update API").into());
     }
     let mut model = UpdateModel::default();
+    let first_root = root(1);
+    let other_root = root(3);
+    if connection.create_document(&first_root).await? != CreateDocumentObservation::Inserted
+        || connection.create_document(&other_root).await? != CreateDocumentObservation::Inserted
+    {
+        return Err(io::Error::other("subject did not create root-authorized documents").into());
+    }
 
     // Deliberately not a Carbon crypto envelope: Renee must preserve these
     // bytes without learning or validating their encrypted representation.
     let first = update(1, 5, b"opaque-to-renee");
     let first_record = encode_update_record(&first)?;
     if model.accept(first.clone()) != AcceptOutcome::Inserted
-        || connection.accept_update(&first_record).await? != AcceptObservation::Inserted
+        || connection.accept_update(&first_root.root, &first_record).await?
+            != AcceptObservation::Inserted
     {
         return Err(io::Error::other("model and subject disagreed on insertion").into());
     }
     if model.accept(first.clone()) != AcceptOutcome::AlreadyPresent
-        || connection.accept_update(&first_record).await? != AcceptObservation::AlreadyPresent
+        || connection.accept_update(&first_root.root, &first_record).await?
+            != AcceptObservation::AlreadyPresent
     {
         return Err(io::Error::other("model and subject disagreed on exact retry").into());
     }
 
     let conflict = update(1, 5, b"different-opaque-bytes");
     if model.accept(conflict.clone()) != AcceptOutcome::IdentifierConflict
-        || connection.accept_update(&encode_update_record(&conflict)?).await?
+        || connection.accept_update(&first_root.root, &encode_update_record(&conflict)?).await?
             != AcceptObservation::IdentifierConflict
     {
         return Err(io::Error::other("model and subject disagreed on identifier conflict").into());
@@ -84,7 +104,9 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
     // Update IDs are scoped by document rather than service-wide.
     let other_document = update(3, 5, b"same-update-id-other-document");
     if model.accept(other_document.clone()) != AcceptOutcome::Inserted
-        || connection.accept_update(&encode_update_record(&other_document)?).await?
+        || connection
+            .accept_update(&other_root.root, &encode_update_record(&other_document)?)
+            .await?
             != AcceptObservation::Inserted
     {
         return Err(io::Error::other("document-scoped identity was not preserved").into());
@@ -111,7 +133,7 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
 
     let later = update(1, 3, b"later-opaque-update");
     if model.accept(later.clone()) != AcceptOutcome::Inserted
-        || connection.accept_update(&encode_update_record(&later)?).await?
+        || connection.accept_update(&first_root.root, &encode_update_record(&later)?).await?
             != AcceptObservation::Inserted
     {
         return Err(io::Error::other("second document update was not inserted").into());
@@ -232,7 +254,13 @@ async fn acknowledged_update_survives_store_restart() -> HarnessResult<()> {
 
     let accepted = update(9, 4, b"durable-opaque-update");
     let accepted_record = encode_update_record(&accepted)?;
-    if connection.accept_update(&accepted_record).await? != AcceptObservation::Inserted {
+    let accepted_root = root(9);
+    if connection.create_document(&accepted_root).await? != CreateDocumentObservation::Inserted {
+        return Err(io::Error::other("durable fixture document was not created").into());
+    }
+    if connection.accept_update(&accepted_root.root, &accepted_record).await?
+        != AcceptObservation::Inserted
+    {
         return Err(io::Error::other("durable fixture was not inserted").into());
     }
     let before_restart = connection.enumerate_updates(accepted.document_id(), None).await?;
@@ -249,11 +277,13 @@ async fn acknowledged_update_survives_store_restart() -> HarnessResult<()> {
     ) {
         return Err(io::Error::other("recovered subject did not negotiate").into());
     }
-    if recovered.accept_update(&accepted_record).await? != AcceptObservation::AlreadyPresent {
+    if recovered.accept_update(&accepted_root.root, &accepted_record).await?
+        != AcceptObservation::AlreadyPresent
+    {
         return Err(io::Error::other("exact retry changed after store restart").into());
     }
     let conflict = update(9, 4, b"conflict-after-restart");
-    if recovered.accept_update(&encode_update_record(&conflict)?).await?
+    if recovered.accept_update(&accepted_root.root, &encode_update_record(&conflict)?).await?
         != AcceptObservation::IdentifierConflict
     {
         return Err(io::Error::other("conflicting retry changed after store restart").into());
@@ -268,7 +298,8 @@ async fn acknowledged_update_survives_store_restart() -> HarnessResult<()> {
         return Err(io::Error::other("acknowledged payload was lost across restart").into());
     }
     let later = update(9, 1, b"accepted-after-restart");
-    if recovered.accept_update(&encode_update_record(&later)?).await? != AcceptObservation::Inserted
+    if recovered.accept_update(&accepted_root.root, &encode_update_record(&later)?).await?
+        != AcceptObservation::Inserted
     {
         return Err(io::Error::other("post-restart update was not inserted").into());
     }
