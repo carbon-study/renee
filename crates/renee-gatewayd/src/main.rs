@@ -25,6 +25,7 @@ use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:4433";
 const DEFAULT_STORE_ADDRESS: &str = "127.0.0.1:4434";
+const STREAM_EOF_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct Configuration {
     bind_address: SocketAddr,
@@ -231,6 +232,7 @@ async fn relay_session(
                 let Some(body) = read_body(&mut stream).await? else {
                     continue;
                 };
+                require_request_eof(&mut stream).await?;
                 write_body(&mut session.input, &body).await?;
                 let response = read_body(&mut session.output)
                     .await?
@@ -240,6 +242,27 @@ async fn relay_session(
             }
             _closed = connection.closed() => break,
         }
+    }
+    Ok(())
+}
+
+async fn require_request_eof(stream: &mut BiStream) -> io::Result<()> {
+    let mut trailing = [0_u8; 1];
+    let bytes_read =
+        match tokio::time::timeout(STREAM_EOF_TIMEOUT, stream.read(&mut trailing)).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "request stream did not finish after its frame",
+                ));
+            }
+        };
+    if bytes_read != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request stream contains trailing bytes",
+        ));
     }
     Ok(())
 }
