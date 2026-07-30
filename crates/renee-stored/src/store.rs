@@ -14,8 +14,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use renee_types::{
-    AcceptanceSequence, Authenticator, CapabilityId, DocumentId, IDENTIFIER_LENGTH,
-    ImmutableUpdate, Operation, OperationSet, RequestId, UpdateId, UpdateMetadata,
+    AcceptanceSequence, Authenticator, CapabilityId, CreateAuthorityId, DocumentId,
+    IDENTIFIER_LENGTH, ImmutableUpdate, Operation, OperationSet, RequestId, UpdateId,
+    UpdateMetadata,
 };
 use renee_wire::{decode_update_record, metadata_encoded_length};
 use rusqlite::{
@@ -24,16 +25,36 @@ use rusqlite::{
 
 use crate::verifier;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const MAX_CAPABILITY_DEPTH: usize = 64;
+const MAX_DIRECT_CAPABILITY_CHILDREN: usize = 64;
+const MAX_CAPABILITIES_PER_DOCUMENT: usize = 1_024;
+const MAX_CONTROL_RECEIPTS_PER_DOCUMENT: usize = 4_096;
+const MAX_GLOBAL_CAPABILITIES: usize = 0x4000;
+const MAX_GLOBAL_CONTROL_RECEIPTS: usize = 0x0001_0000;
+const MAX_DOCUMENT_CONTROL_BYTES: usize = 0x0010_0000;
+const MAX_GLOBAL_CONTROL_BYTES: usize = 0x0100_0000;
+const MAX_DOCUMENTS_PER_CREATE_AUTHORITY: usize = 4_096;
+const MAX_GLOBAL_DOCUMENTS: usize = 0x4000;
+const MAX_GLOBAL_CREATE_RECEIPTS: usize = 0x0001_0000;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS schema_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    schema_version INTEGER NOT NULL CHECK (schema_version = 2)
+    schema_version INTEGER NOT NULL CHECK (schema_version = 3)
 ) STRICT;
 
-INSERT OR IGNORE INTO schema_meta(singleton, schema_version) VALUES (1, 2);
+INSERT OR IGNORE INTO schema_meta(singleton, schema_version) VALUES (1, 3);
+
+CREATE TABLE IF NOT EXISTS create_authorities (
+    create_authority_id BLOB PRIMARY KEY
+        CHECK (typeof(create_authority_id) = 'blob' AND length(create_authority_id) = 16),
+    live_verifier BLOB NOT NULL
+        CHECK (typeof(live_verifier) = 'blob' AND length(live_verifier) = 32),
+    receipt_verifier BLOB NOT NULL
+        CHECK (typeof(receipt_verifier) = 'blob' AND length(receipt_verifier) = 32),
+    state INTEGER NOT NULL CHECK (state IN (0, 1))
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS documents (
     document_id BLOB PRIMARY KEY
@@ -111,6 +132,27 @@ CREATE TABLE IF NOT EXISTS control_receipts (
         ON DELETE RESTRICT
 ) STRICT, WITHOUT ROWID;
 
+CREATE TABLE IF NOT EXISTS create_receipts (
+    create_authority_id BLOB NOT NULL,
+    request_id BLOB NOT NULL
+        CHECK (typeof(request_id) = 'blob' AND length(request_id) = 16),
+    document_id BLOB NOT NULL
+        CHECK (typeof(document_id) = 'blob' AND length(document_id) = 16),
+    root_capability_id BLOB NOT NULL
+        CHECK (typeof(root_capability_id) = 'blob' AND length(root_capability_id) = 16),
+    normalized_input BLOB NOT NULL
+        CHECK (typeof(normalized_input) = 'blob' AND length(normalized_input) > 0),
+    PRIMARY KEY (create_authority_id, request_id),
+    FOREIGN KEY (create_authority_id)
+        REFERENCES create_authorities(create_authority_id)
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+    FOREIGN KEY (document_id)
+        REFERENCES documents(document_id)
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS document_acceptance_sequences (
     document_id BLOB PRIMARY KEY
         CHECK (typeof(document_id) = 'blob' AND length(document_id) = 16),
@@ -182,8 +224,14 @@ pub enum StoreCreateOutcome {
     Inserted,
     /// The exact document/root capability was already durable.
     AlreadyPresent,
-    /// The document identifier names different root input.
+    /// Authority was unknown, invalid, or disabled for a new create.
+    AuthorizationDenied,
+    /// The document identifier names different root input after both proofs.
     IdentifierConflict,
+    /// The request identifier names different input after both proofs.
+    RequestConflict,
+    /// A finite document or create-receipt bound was reached.
+    LimitExceeded,
 }
 
 /// Durable grant or revoke result.
@@ -201,6 +249,19 @@ pub enum StoreControlOutcome {
     RequestConflict,
     /// The document control revision cannot advance.
     CounterExhausted,
+    /// A finite capability, receipt, or logical-byte bound was reached.
+    LimitExceeded,
+}
+
+/// Operator-provisioned deployment creation verifier material.
+#[derive(Clone, Copy)]
+pub struct CreateAuthorityProvision {
+    /// Deployment-scoped public identifier.
+    pub create_authority_id: CreateAuthorityId,
+    /// Domain-separated verifier used only for live create admission.
+    pub live_verifier: [u8; verifier::VERIFIER_LENGTH],
+    /// Domain-separated verifier retained only for named receipt retrieval.
+    pub receipt_verifier: [u8; verifier::VERIFIER_LENGTH],
 }
 
 /// One bounded page in Renee acceptance order.
@@ -213,14 +274,108 @@ pub struct StoredUpdatePage {
     pub updates: Vec<(AcceptanceSequence, UpdateMetadata)>,
 }
 
+/// Store-decoded finite-window start after structural cursor validation.
+#[derive(Clone, Copy)]
+pub enum StoreEnumerateStart {
+    /// Capture the current high water from origin.
+    Origin,
+    /// Continue the exact captured finite window.
+    Continue {
+        /// Exclusive position already returned.
+        position: AcceptanceSequence,
+        /// Inclusive captured high water.
+        terminal_sequence: AcceptanceSequence,
+    },
+    /// Capture a new high water after a completed prior window.
+    AfterTail(AcceptanceSequence),
+}
+
+/// Authorization-preserving read result.
+pub enum StoreReadOutcome<Value> {
+    /// Authority was effective and selection completed.
+    Authorized(Value),
+    /// Document, capability, secret, ancestry, or read operation was denied.
+    AuthorizationDenied,
+    /// Authority was valid but the supplied cursor was not.
+    InvalidCursor,
+}
+
+/// One authorized finite-window page and its captured high water.
+pub struct AuthorizedStoredUpdatePage {
+    /// Page selected under the same transaction as authorization.
+    pub page: StoredUpdatePage,
+    /// Inclusive high water for the finite window, absent for empty origin.
+    pub terminal_sequence: Option<AcceptanceSequence>,
+}
+
 /// Authoritative capability and immutable-update `SQLite` connection.
 pub struct DurableUpdateStore {
     connection: Connection,
 }
 
+fn provision_create_authority(
+    connection: &Connection,
+    provision: CreateAuthorityProvision,
+) -> Result<(), StoreError> {
+    let authority_bytes = provision.create_authority_id.into_bytes();
+    let existing = connection
+        .query_row(
+            "SELECT live_verifier, receipt_verifier
+             FROM create_authorities WHERE create_authority_id = ?1",
+            params![authority_bytes.as_slice()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?;
+    if let Some((live, receipt)) = existing {
+        if live != provision.live_verifier || receipt != provision.receipt_verifier {
+            return Err(StoreError::Corrupt(
+                "configured create authority disagrees with durable provisioning",
+            ));
+        }
+        return Ok(());
+    }
+    connection.execute(
+        "INSERT INTO create_authorities(
+            create_authority_id, live_verifier, receipt_verifier, state
+         ) VALUES (?1, ?2, ?3, 0)",
+        params![
+            authority_bytes.as_slice(),
+            provision.live_verifier.as_slice(),
+            provision.receipt_verifier.as_slice(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn create_limits_exceeded(
+    transaction: &Transaction<'_>,
+    create_authority_id: CreateAuthorityId,
+) -> Result<bool, StoreError> {
+    let authority_bytes = create_authority_id.into_bytes();
+    let authority_documents: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM create_receipts WHERE create_authority_id = ?1",
+        params![authority_bytes.as_slice()],
+        |row| row.get(0),
+    )?;
+    let global_documents: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))?;
+    let global_receipts: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM create_receipts", [], |row| row.get(0))?;
+    let global_capabilities: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM capabilities", [], |row| row.get(0))?;
+    Ok(usize::try_from(authority_documents).unwrap_or(usize::MAX)
+        >= MAX_DOCUMENTS_PER_CREATE_AUTHORITY
+        || usize::try_from(global_documents).unwrap_or(usize::MAX) >= MAX_GLOBAL_DOCUMENTS
+        || usize::try_from(global_receipts).unwrap_or(usize::MAX) >= MAX_GLOBAL_CREATE_RECEIPTS
+        || usize::try_from(global_capabilities).unwrap_or(usize::MAX) >= MAX_GLOBAL_CAPABILITIES)
+}
+
 impl DurableUpdateStore {
     /// Opens, configures, initializes, synchronizes, and validates the store.
-    pub fn open(path: &Path) -> Result<Self, StoreError> {
+    pub fn open(
+        path: &Path,
+        create_authority: CreateAuthorityProvision,
+    ) -> Result<Self, StoreError> {
         let parent = path.parent().ok_or(StoreError::InvalidDatabasePath)?;
         fs::create_dir_all(parent)?;
         let connection = Connection::open_with_flags(
@@ -235,6 +390,7 @@ impl DurableUpdateStore {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "wal_autocheckpoint", 1_000_u32)?;
         connection.execute_batch(SCHEMA)?;
+        provision_create_authority(&connection, create_authority)?;
         connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         synchronize_directory(parent)?;
 
@@ -244,17 +400,187 @@ impl DurableUpdateStore {
     }
 
     /// Creates one active document and its unique full-operation root capability.
+    #[cfg_attr(
+        all(feature = "conformance", not(test)),
+        expect(
+            dead_code,
+            reason = "the conformance daemon routes through the barrier-bearing wrapper"
+        )
+    )]
     pub fn create_document(
         &mut self,
+        create_authority_id: CreateAuthorityId,
+        create_authenticator: &Authenticator,
+        request_id: RequestId,
         document_id: DocumentId,
         root_capability_id: CapabilityId,
         root_authenticator: &Authenticator,
     ) -> Result<StoreCreateOutcome, StoreError> {
+        self.create_document_internal(
+            create_authority_id,
+            create_authenticator,
+            request_id,
+            document_id,
+            root_capability_id,
+            root_authenticator,
+            #[cfg(feature = "conformance")]
+            || Ok(()),
+            #[cfg(feature = "conformance")]
+            || Ok(()),
+            #[cfg(feature = "conformance")]
+            || Ok(()),
+        )
+    }
+
+    /// Exposes daemon-owned barriers around create authorization and commit.
+    #[cfg(feature = "conformance")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test-only callbacks expose every irreversible create seam explicitly"
+    )]
+    pub fn create_document_with_test_barriers(
+        &mut self,
+        create_authority_id: CreateAuthorityId,
+        create_authenticator: &Authenticator,
+        request_id: RequestId,
+        document_id: DocumentId,
+        root_capability_id: CapabilityId,
+        root_authenticator: &Authenticator,
+        after_authorization: impl FnOnce() -> Result<(), StoreError>,
+        before_commit: impl FnOnce() -> Result<(), StoreError>,
+        before_exact_retry: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<StoreCreateOutcome, StoreError> {
+        self.create_document_internal(
+            create_authority_id,
+            create_authenticator,
+            request_id,
+            document_id,
+            root_capability_id,
+            root_authenticator,
+            after_authorization,
+            before_commit,
+            before_exact_retry,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the create transaction keeps normalized input and conformance seams adjacent"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "create disclosure precedence is clearest as one serialized transaction"
+    )]
+    fn create_document_internal(
+        &mut self,
+        create_authority_id: CreateAuthorityId,
+        create_authenticator: &Authenticator,
+        request_id: RequestId,
+        document_id: DocumentId,
+        root_capability_id: CapabilityId,
+        root_authenticator: &Authenticator,
+        #[cfg(feature = "conformance")] after_authorization: impl FnOnce() -> Result<(), StoreError>,
+        #[cfg(feature = "conformance")] before_commit: impl FnOnce() -> Result<(), StoreError>,
+        #[cfg(feature = "conformance")] before_exact_retry: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<StoreCreateOutcome, StoreError> {
         let document_bytes = document_id.into_bytes();
         let root_bytes = root_capability_id.into_bytes();
-        let verifiers = verifier::derive(document_id, root_capability_id, root_authenticator);
+        let root_verifiers = verifier::derive(document_id, root_capability_id, root_authenticator);
+        let mut normalized_input = Vec::with_capacity(IDENTIFIER_LENGTH * 2 + 64);
+        normalized_input.extend_from_slice(&document_bytes);
+        normalized_input.extend_from_slice(&root_bytes);
+        normalized_input.extend_from_slice(&root_verifiers.live);
+        normalized_input.extend_from_slice(&root_verifiers.receipt);
         let transaction =
             self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let authority_bytes = create_authority_id.into_bytes();
+        let authority = transaction
+            .query_row(
+                "SELECT live_verifier, receipt_verifier, state
+                 FROM create_authorities WHERE create_authority_id = ?1",
+                params![authority_bytes.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((live_verifier, receipt_verifier, state)) = authority else {
+            return Ok(StoreCreateOutcome::AuthorizationDenied);
+        };
+        let live_authorized = state == 0
+            && verifier::verify_create_live(
+                &live_verifier,
+                create_authority_id,
+                create_authenticator,
+            );
+        let receipt_authorized = verifier::verify_create_receipt(
+            &receipt_verifier,
+            create_authority_id,
+            create_authenticator,
+        );
+        if !live_authorized && !receipt_authorized {
+            return Ok(StoreCreateOutcome::AuthorizationDenied);
+        }
+
+        let request_bytes = request_id.into_bytes();
+        let receipt = transaction
+            .query_row(
+                "SELECT document_id, root_capability_id, normalized_input
+                 FROM create_receipts
+                 WHERE create_authority_id = ?1 AND request_id = ?2",
+                params![authority_bytes.as_slice(), request_bytes.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((receipt_document, receipt_root, stored_input)) = receipt {
+            if !receipt_authorized {
+                return Ok(StoreCreateOutcome::AuthorizationDenied);
+            }
+            let stored_document_id = DocumentId::from_bytes(decode_identifier(&receipt_document)?);
+            let stored_root_id = CapabilityId::from_bytes(decode_identifier(&receipt_root)?);
+            let stored_root_receipt = transaction
+                .query_row(
+                    "SELECT receipt_verifier FROM capabilities
+                     WHERE document_id = ?1 AND capability_id = ?2 AND root = 1",
+                    params![receipt_document, receipt_root],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?;
+            let root_authorized = stored_root_receipt.is_some_and(|expected| {
+                verifier::verify_receipt(
+                    &expected,
+                    stored_document_id,
+                    stored_root_id,
+                    root_authenticator,
+                )
+            });
+            if !root_authorized {
+                return Ok(StoreCreateOutcome::AuthorizationDenied);
+            }
+            return Ok(if stored_input == normalized_input {
+                #[cfg(feature = "conformance")]
+                before_exact_retry()?;
+                StoreCreateOutcome::AlreadyPresent
+            } else {
+                StoreCreateOutcome::RequestConflict
+            });
+        }
+        if !live_authorized {
+            return Ok(StoreCreateOutcome::AuthorizationDenied);
+        }
+        #[cfg(feature = "conformance")]
+        after_authorization()?;
+
         let existing = transaction
             .query_row(
                 "SELECT root_capability_id FROM documents WHERE document_id = ?1",
@@ -263,25 +589,31 @@ impl DurableUpdateStore {
             )
             .optional()?;
         if let Some(existing_root) = existing {
-            if existing_root != root_bytes {
-                return Ok(StoreCreateOutcome::IdentifierConflict);
-            }
-            let existing_verifier = transaction.query_row(
-                "SELECT live_verifier FROM capabilities
-                 WHERE document_id = ?1 AND capability_id = ?2 AND root = 1",
-                params![document_bytes.as_slice(), root_bytes.as_slice()],
-                |row| row.get::<_, Vec<u8>>(0),
-            )?;
-            return if verifier::verify_live(
-                &existing_verifier,
-                document_id,
-                root_capability_id,
-                root_authenticator,
-            ) {
-                Ok(StoreCreateOutcome::AlreadyPresent)
+            let existing_root_id = CapabilityId::from_bytes(decode_identifier(&existing_root)?);
+            let existing_verifier = transaction
+                .query_row(
+                    "SELECT receipt_verifier FROM capabilities
+                     WHERE document_id = ?1 AND capability_id = ?2 AND root = 1",
+                    params![document_bytes.as_slice(), existing_root],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?;
+            let root_authorized = existing_verifier.is_some_and(|expected| {
+                verifier::verify_receipt(
+                    &expected,
+                    document_id,
+                    existing_root_id,
+                    root_authenticator,
+                )
+            });
+            return Ok(if root_authorized {
+                StoreCreateOutcome::IdentifierConflict
             } else {
-                Ok(StoreCreateOutcome::IdentifierConflict)
-            };
+                StoreCreateOutcome::AuthorizationDenied
+            });
+        }
+        if create_limits_exceeded(&transaction, create_authority_id)? {
+            return Ok(StoreCreateOutcome::LimitExceeded);
         }
 
         let revision = 1_u64.to_be_bytes();
@@ -299,12 +631,26 @@ impl DurableUpdateStore {
             params![
                 document_bytes.as_slice(),
                 root_bytes.as_slice(),
-                verifiers.live.as_slice(),
-                verifiers.receipt.as_slice(),
+                root_verifiers.live.as_slice(),
+                root_verifiers.receipt.as_slice(),
                 revision.as_slice(),
             ],
         )?;
         insert_operations(&transaction, document_id, root_capability_id, OperationSet::FULL)?;
+        transaction.execute(
+            "INSERT INTO create_receipts(
+                create_authority_id, request_id, document_id, root_capability_id, normalized_input
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                authority_bytes.as_slice(),
+                request_bytes.as_slice(),
+                document_bytes.as_slice(),
+                root_bytes.as_slice(),
+                normalized_input,
+            ],
+        )?;
+        #[cfg(feature = "conformance")]
+        before_commit()?;
         transaction.commit()?;
         Ok(StoreCreateOutcome::Inserted)
     }
@@ -385,6 +731,10 @@ impl DurableUpdateStore {
         clippy::too_many_arguments,
         reason = "the grant transaction keeps normalized input and conformance seams adjacent"
     )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "grant authorization, limits, mutation, and receipt are one transaction"
+    )]
     fn grant_capability_internal(
         &mut self,
         document_id: DocumentId,
@@ -442,8 +792,19 @@ impl DurableUpdateStore {
         if !issuer_operations.allows(operations) {
             return Ok(StoreControlOutcome::AuthorizationDenied);
         }
-        if !issuer_has_descendant_capacity(&transaction, document_id, issuer_capability_id)? {
-            return Ok(StoreControlOutcome::AuthorizationDenied);
+        if !issuer_has_descendant_capacity(&transaction, document_id, issuer_capability_id)?
+            || control_limits_exceeded(
+                &transaction,
+                document_id,
+                Some(issuer_capability_id),
+                true,
+                usize::try_from(operations.bits().count_ones()).map_err(|_error| {
+                    StoreError::Corrupt("operation count cannot be represented")
+                })?,
+                normalized_input.len(),
+            )?
+        {
+            return Ok(StoreControlOutcome::LimitExceeded);
         }
         let Some(revision) = next_control_revision(&transaction, document_id)? else {
             return Ok(StoreControlOutcome::CounterExhausted);
@@ -602,6 +963,16 @@ impl DurableUpdateStore {
         }
         #[cfg(feature = "conformance")]
         after_authorization()?;
+        if control_limits_exceeded(
+            &transaction,
+            document_id,
+            None,
+            false,
+            0,
+            normalized_input.len(),
+        )? {
+            return Ok(StoreControlOutcome::LimitExceeded);
+        }
         let Some(revision) = next_control_revision(&transaction, document_id)? else {
             return Ok(StoreControlOutcome::CounterExhausted);
         };
@@ -778,129 +1149,82 @@ impl DurableUpdateStore {
         Ok(StoreAcceptOutcome::Inserted)
     }
 
-    /// Returns the current inclusive document high-water sequence.
-    pub fn high_water_sequence(
-        &self,
+    /// Authorizes and selects one finite metadata page in a single snapshot.
+    pub fn enumerate_authorized(
+        &mut self,
         document_id: DocumentId,
-    ) -> Result<Option<AcceptanceSequence>, StoreError> {
-        let document_bytes = document_id.into_bytes();
-        self.connection
-            .query_row(
-                "SELECT acceptance_sequence
-                 FROM updates
-                 WHERE document_id = ?1
-                 ORDER BY acceptance_sequence DESC
-                 LIMIT 1",
-                params![document_bytes.as_slice()],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
-            .map(|encoded| decode_sequence(&encoded))
-            .transpose()
-    }
-
-    /// Enumerates one byte-bounded page inside a captured finite-read window.
-    pub fn enumerate(
-        &self,
-        document_id: DocumentId,
-        position: AcceptanceSequence,
-        terminal_sequence: AcceptanceSequence,
+        capability_id: CapabilityId,
+        authenticator: &Authenticator,
+        start: StoreEnumerateStart,
         metadata_byte_limit: usize,
-    ) -> Result<StoredUpdatePage, StoreError> {
-        let document_bytes = document_id.into_bytes();
-        if terminal_sequence == AcceptanceSequence::ORIGIN || position > terminal_sequence {
-            return Err(StoreError::InvalidCursor);
+    ) -> Result<StoreReadOutcome<AuthorizedStoredUpdatePage>, StoreError> {
+        let transaction =
+            self.connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        if !authorize(&transaction, document_id, capability_id, authenticator, Operation::Read)? {
+            return Ok(StoreReadOutcome::AuthorizationDenied);
         }
-        for sequence in [position, terminal_sequence] {
-            if sequence == AcceptanceSequence::ORIGIN {
-                continue;
+        let high_water = high_water_sequence_in(&transaction, document_id)?;
+        let Some((position, terminal_sequence)) = (match start {
+            StoreEnumerateStart::Origin => {
+                high_water.map(|terminal| (AcceptanceSequence::ORIGIN, terminal))
             }
-            let exists = self
-                .connection
-                .query_row(
-                    "SELECT 1 FROM updates
-                     WHERE document_id = ?1 AND acceptance_sequence = ?2",
-                    params![document_bytes.as_slice(), sequence.to_be_bytes().as_slice()],
-                    |_row| Ok(()),
-                )
-                .optional()?
-                .is_some();
-            if !exists {
-                return Err(StoreError::InvalidCursor);
+            StoreEnumerateStart::Continue { position, terminal_sequence } => {
+                Some((position, terminal_sequence))
             }
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT acceptance_sequence, encoded_record
-             FROM updates
-             WHERE document_id = ?1
-               AND acceptance_sequence > ?2
-               AND acceptance_sequence <= ?3
-             ORDER BY acceptance_sequence",
-        )?;
-        let mut rows = statement.query(params![
-            document_bytes.as_slice(),
-            position.to_be_bytes().as_slice(),
-            terminal_sequence.to_be_bytes().as_slice(),
-        ])?;
-        let mut used = 0_usize;
-        let mut updates = Vec::new();
-        let mut last_sequence = None;
-        let mut has_more = false;
-
-        while let Some(row) = rows.next()? {
-            let sequence = decode_sequence(&row.get::<_, Vec<u8>>(0)?)?;
-            let record = row.get::<_, Vec<u8>>(1)?;
-            let update = decode_update_record(&record)
-                .map_err(|_error| StoreError::Corrupt("stored update record is invalid"))?;
-            if update.document_id() != document_id {
-                return Err(StoreError::Corrupt("stored update document disagrees with index"));
+            StoreEnumerateStart::AfterTail(position) => {
+                let Some(terminal) = high_water else {
+                    return Ok(StoreReadOutcome::InvalidCursor);
+                };
+                if terminal < position {
+                    return Ok(StoreReadOutcome::InvalidCursor);
+                }
+                Some((position, terminal))
             }
-            let metadata = metadata(&update)?;
-            let encoded_length = metadata_encoded_length(&metadata)
-                .map_err(|_error| StoreError::Corrupt("stored metadata cannot be encoded"))?;
-            let Some(next_used) = used.checked_add(encoded_length) else {
-                has_more = true;
-                break;
-            };
-            if next_used > metadata_byte_limit {
-                has_more = true;
-                break;
-            }
-            used = next_used;
-            last_sequence = Some(sequence);
-            updates.push((sequence, metadata));
-        }
-
-        Ok(StoredUpdatePage { has_more, last_sequence, updates })
+        }) else {
+            transaction.commit()?;
+            return Ok(StoreReadOutcome::Authorized(AuthorizedStoredUpdatePage {
+                page: StoredUpdatePage {
+                    has_more: false,
+                    last_sequence: None,
+                    updates: Vec::new(),
+                },
+                terminal_sequence: None,
+            }));
+        };
+        let page = match enumerate_in(
+            &transaction,
+            document_id,
+            position,
+            terminal_sequence,
+            metadata_byte_limit,
+        ) {
+            Ok(page) => page,
+            Err(StoreError::InvalidCursor) => return Ok(StoreReadOutcome::InvalidCursor),
+            Err(error) => return Err(error),
+        };
+        transaction.commit()?;
+        Ok(StoreReadOutcome::Authorized(AuthorizedStoredUpdatePage {
+            page,
+            terminal_sequence: Some(terminal_sequence),
+        }))
     }
 
-    /// Fetches one opaque encrypted payload from durable canonical bytes.
-    pub fn fetch(
-        &self,
+    /// Authorizes and selects one opaque payload in a single snapshot.
+    pub fn fetch_authorized(
+        &mut self,
         document_id: DocumentId,
         update_id: UpdateId,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
-        let document_bytes = document_id.into_bytes();
-        let update_bytes = update_id.into_bytes();
-        let record = self
-            .connection
-            .query_row(
-                "SELECT encoded_record FROM updates
-                 WHERE document_id = ?1 AND update_id = ?2",
-                params![document_bytes.as_slice(), update_bytes.as_slice()],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?;
-        record
-            .map(|record| {
-                let update = decode_update_record(&record)
-                    .map_err(|_error| StoreError::Corrupt("stored update record is invalid"))?;
-                if update.document_id() != document_id || update.update_id() != update_id {
-                    return Err(StoreError::Corrupt("stored update identity disagrees with index"));
-                }
-                Ok(update.encrypted_payload().to_vec())
-            })
-            .transpose()
+        capability_id: CapabilityId,
+        authenticator: &Authenticator,
+    ) -> Result<StoreReadOutcome<Option<Vec<u8>>>, StoreError> {
+        let transaction =
+            self.connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        if !authorize(&transaction, document_id, capability_id, authenticator, Operation::Read)? {
+            return Ok(StoreReadOutcome::AuthorizationDenied);
+        }
+        let payload = fetch_in(&transaction, document_id, update_id)?;
+        transaction.commit()?;
+        Ok(StoreReadOutcome::Authorized(payload))
     }
 
     fn validate(&mut self) -> Result<(), StoreError> {
@@ -920,6 +1244,7 @@ impl DurableUpdateStore {
 
         let transaction =
             self.connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        validate_create_state(&transaction)?;
         validate_capability_state(&transaction)?;
         let mut maxima = BTreeMap::<DocumentId, AcceptanceSequence>::new();
         {
@@ -968,6 +1293,124 @@ impl DurableUpdateStore {
     }
 }
 
+fn high_water_sequence_in(
+    connection: &Connection,
+    document_id: DocumentId,
+) -> Result<Option<AcceptanceSequence>, StoreError> {
+    let document_bytes = document_id.into_bytes();
+    connection
+        .query_row(
+            "SELECT acceptance_sequence
+             FROM updates
+             WHERE document_id = ?1
+             ORDER BY acceptance_sequence DESC
+             LIMIT 1",
+            params![document_bytes.as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .map(|encoded| decode_sequence(&encoded))
+        .transpose()
+}
+
+fn enumerate_in(
+    connection: &Connection,
+    document_id: DocumentId,
+    position: AcceptanceSequence,
+    terminal_sequence: AcceptanceSequence,
+    metadata_byte_limit: usize,
+) -> Result<StoredUpdatePage, StoreError> {
+    let document_bytes = document_id.into_bytes();
+    if terminal_sequence == AcceptanceSequence::ORIGIN || position > terminal_sequence {
+        return Err(StoreError::InvalidCursor);
+    }
+    for sequence in [position, terminal_sequence] {
+        if sequence == AcceptanceSequence::ORIGIN {
+            continue;
+        }
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM updates
+                 WHERE document_id = ?1 AND acceptance_sequence = ?2",
+                params![document_bytes.as_slice(), sequence.to_be_bytes().as_slice()],
+                |_row| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Err(StoreError::InvalidCursor);
+        }
+    }
+    let mut statement = connection.prepare(
+        "SELECT acceptance_sequence, encoded_record
+         FROM updates
+         WHERE document_id = ?1
+           AND acceptance_sequence > ?2
+           AND acceptance_sequence <= ?3
+         ORDER BY acceptance_sequence",
+    )?;
+    let mut rows = statement.query(params![
+        document_bytes.as_slice(),
+        position.to_be_bytes().as_slice(),
+        terminal_sequence.to_be_bytes().as_slice(),
+    ])?;
+    let mut used = 0_usize;
+    let mut updates = Vec::new();
+    let mut last_sequence = None;
+    let mut has_more = false;
+    while let Some(row) = rows.next()? {
+        let sequence = decode_sequence(&row.get::<_, Vec<u8>>(0)?)?;
+        let record = row.get::<_, Vec<u8>>(1)?;
+        let update = decode_update_record(&record)
+            .map_err(|_error| StoreError::Corrupt("stored update record is invalid"))?;
+        if update.document_id() != document_id {
+            return Err(StoreError::Corrupt("stored update document disagrees with index"));
+        }
+        let metadata = metadata(&update)?;
+        let encoded_length = metadata_encoded_length(&metadata)
+            .map_err(|_error| StoreError::Corrupt("stored metadata cannot be encoded"))?;
+        let Some(next_used) = used.checked_add(encoded_length) else {
+            has_more = true;
+            break;
+        };
+        if next_used > metadata_byte_limit {
+            has_more = true;
+            break;
+        }
+        used = next_used;
+        last_sequence = Some(sequence);
+        updates.push((sequence, metadata));
+    }
+    Ok(StoredUpdatePage { has_more, last_sequence, updates })
+}
+
+fn fetch_in(
+    connection: &Connection,
+    document_id: DocumentId,
+    update_id: UpdateId,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    let document_bytes = document_id.into_bytes();
+    let update_bytes = update_id.into_bytes();
+    let record = connection
+        .query_row(
+            "SELECT encoded_record FROM updates
+             WHERE document_id = ?1 AND update_id = ?2",
+            params![document_bytes.as_slice(), update_bytes.as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?;
+    record
+        .map(|record| {
+            let update = decode_update_record(&record)
+                .map_err(|_error| StoreError::Corrupt("stored update record is invalid"))?;
+            if update.document_id() != document_id || update.update_id() != update_id {
+                return Err(StoreError::Corrupt("stored update identity disagrees with index"));
+            }
+            Ok(update.encrypted_payload().to_vec())
+        })
+        .transpose()
+}
+
 #[derive(Clone)]
 struct ValidatedCapability {
     capability_id: CapabilityId,
@@ -998,6 +1441,25 @@ fn validate_capability_state(transaction: &Transaction<'_>) -> Result<(), StoreE
         }
 
         let capabilities = load_capabilities(transaction, document_id)?;
+        if capabilities.len() > MAX_CAPABILITIES_PER_DOCUMENT {
+            return Err(StoreError::Corrupt(
+                "document capability count exceeds the configured limit",
+            ));
+        }
+        let mut direct_children = BTreeMap::<CapabilityId, usize>::new();
+        for capability in capabilities.values() {
+            if let Some(parent) = capability.parent_capability_id {
+                let count = direct_children.entry(parent).or_default();
+                *count = count
+                    .checked_add(1)
+                    .ok_or(StoreError::Corrupt("capability fan-out cannot advance"))?;
+                if *count > MAX_DIRECT_CAPABILITY_CHILDREN {
+                    return Err(StoreError::Corrupt(
+                        "capability fan-out exceeds the configured limit",
+                    ));
+                }
+            }
+        }
         let Some(root) = capabilities.get(&root_capability_id) else {
             return Err(StoreError::Corrupt("document root capability is absent"));
         };
@@ -1021,12 +1483,110 @@ fn validate_capability_state(transaction: &Transaction<'_>) -> Result<(), StoreE
             )?;
         }
         let receipt_count = validate_control_receipts(transaction, document_id, &capabilities)?;
+        if receipt_count
+            > u64::try_from(MAX_CONTROL_RECEIPTS_PER_DOCUMENT)
+                .map_err(|_error| StoreError::Corrupt("receipt limit cannot be represented"))?
+        {
+            return Err(StoreError::Corrupt("document receipt count exceeds the configured limit"));
+        }
         let expected_revision = receipt_count
             .checked_add(1)
             .ok_or(StoreError::Corrupt("control receipt count cannot advance"))?;
         if control_revision != expected_revision {
             return Err(StoreError::Corrupt(
                 "document control revision disagrees with retained receipts",
+            ));
+        }
+        let (document_bytes, _global_bytes) = control_logical_bytes(transaction, document_id)?;
+        if document_bytes > MAX_DOCUMENT_CONTROL_BYTES {
+            return Err(StoreError::Corrupt(
+                "document control state exceeds the configured logical-byte limit",
+            ));
+        }
+    }
+    let capability_count: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM capabilities", [], |row| row.get(0))?;
+    let receipt_count: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM control_receipts", [], |row| row.get(0))?;
+    if usize::try_from(capability_count).unwrap_or(usize::MAX) > MAX_GLOBAL_CAPABILITIES
+        || usize::try_from(receipt_count).unwrap_or(usize::MAX) > MAX_GLOBAL_CONTROL_RECEIPTS
+    {
+        return Err(StoreError::Corrupt("global capability state exceeds configured limits"));
+    }
+    let global_bytes = transaction
+        .query_row(GLOBAL_CONTROL_LOGICAL_BYTES_QUERY, [], |row| row.get::<_, i64>(0))?;
+    if usize::try_from(global_bytes).unwrap_or(usize::MAX) > MAX_GLOBAL_CONTROL_BYTES {
+        return Err(StoreError::Corrupt(
+            "global control state exceeds the configured logical-byte limit",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_create_state(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    const CREATE_INPUT_LENGTH: usize = IDENTIFIER_LENGTH * 2 + verifier::VERIFIER_LENGTH * 2;
+    let document_count: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))?;
+    let receipt_count: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM create_receipts", [], |row| row.get(0))?;
+    if document_count != receipt_count {
+        return Err(StoreError::Corrupt("documents and retained create receipts disagree"));
+    }
+    if usize::try_from(document_count).unwrap_or(usize::MAX) > MAX_GLOBAL_DOCUMENTS
+        || usize::try_from(receipt_count).unwrap_or(usize::MAX) > MAX_GLOBAL_CREATE_RECEIPTS
+    {
+        return Err(StoreError::Corrupt("global creation state exceeds configured limits"));
+    }
+    let mut statement = transaction.prepare(
+        "SELECT create_authority_id, document_id, root_capability_id, normalized_input
+         FROM create_receipts
+         ORDER BY create_authority_id, request_id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut authority_counts = BTreeMap::<CreateAuthorityId, usize>::new();
+    while let Some(row) = rows.next()? {
+        let create_authority_id =
+            CreateAuthorityId::from_bytes(decode_identifier(&row.get::<_, Vec<u8>>(0)?)?);
+        let document_id = DocumentId::from_bytes(decode_identifier(&row.get::<_, Vec<u8>>(1)?)?);
+        let root_capability_id =
+            CapabilityId::from_bytes(decode_identifier(&row.get::<_, Vec<u8>>(2)?)?);
+        let normalized_input = row.get::<_, Vec<u8>>(3)?;
+        if normalized_input.len() != CREATE_INPUT_LENGTH {
+            return Err(StoreError::Corrupt("create receipt input has invalid length"));
+        }
+        let root = transaction
+            .query_row(
+                "SELECT live_verifier, receipt_verifier
+                 FROM capabilities
+                 WHERE document_id = ?1 AND capability_id = ?2 AND root = 1",
+                params![
+                    document_id.into_bytes().as_slice(),
+                    root_capability_id.into_bytes().as_slice(),
+                ],
+                |root_row| Ok((root_row.get::<_, Vec<u8>>(0)?, root_row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        let Some((live, receipt)) = root else {
+            return Err(StoreError::Corrupt("create receipt root is absent"));
+        };
+        if normalized_input.get(..IDENTIFIER_LENGTH) != Some(document_id.into_bytes().as_slice())
+            || normalized_input.get(IDENTIFIER_LENGTH..IDENTIFIER_LENGTH * 2)
+                != Some(root_capability_id.into_bytes().as_slice())
+            || normalized_input
+                .get(IDENTIFIER_LENGTH * 2..IDENTIFIER_LENGTH * 2 + verifier::VERIFIER_LENGTH)
+                != Some(live.as_slice())
+            || normalized_input.get(IDENTIFIER_LENGTH * 2 + verifier::VERIFIER_LENGTH..)
+                != Some(receipt.as_slice())
+        {
+            return Err(StoreError::Corrupt("create receipt disagrees with its root"));
+        }
+        let count = authority_counts.entry(create_authority_id).or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or(StoreError::Corrupt("create authority count cannot advance"))?;
+        if *count > MAX_DOCUMENTS_PER_CREATE_AUTHORITY {
+            return Err(StoreError::Corrupt(
+                "create authority document count exceeds configured limit",
             ));
         }
     }
@@ -1387,6 +1947,132 @@ fn issuer_has_descendant_capacity(
     Ok(false)
 }
 
+fn control_limits_exceeded(
+    transaction: &Transaction<'_>,
+    document_id: DocumentId,
+    parent_capability_id: Option<CapabilityId>,
+    adds_capability: bool,
+    operation_count: usize,
+    normalized_input_length: usize,
+) -> Result<bool, StoreError> {
+    let document_bytes = document_id.into_bytes();
+    if let Some(parent_capability_id) = parent_capability_id {
+        let parent_bytes = parent_capability_id.into_bytes();
+        let direct_children: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM capabilities
+             WHERE document_id = ?1 AND parent_capability_id = ?2",
+            params![document_bytes.as_slice(), parent_bytes.as_slice()],
+            |row| row.get(0),
+        )?;
+        if usize::try_from(direct_children).unwrap_or(usize::MAX) >= MAX_DIRECT_CAPABILITY_CHILDREN
+        {
+            return Ok(true);
+        }
+    }
+    let document_capabilities: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM capabilities WHERE document_id = ?1",
+        params![document_bytes.as_slice()],
+        |row| row.get(0),
+    )?;
+    let global_capabilities: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM capabilities", [], |row| row.get(0))?;
+    let document_receipts: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM control_receipts WHERE document_id = ?1",
+        params![document_bytes.as_slice()],
+        |row| row.get(0),
+    )?;
+    let global_receipts: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM control_receipts", [], |row| row.get(0))?;
+    if (adds_capability
+        && (usize::try_from(document_capabilities).unwrap_or(usize::MAX)
+            >= MAX_CAPABILITIES_PER_DOCUMENT
+            || usize::try_from(global_capabilities).unwrap_or(usize::MAX)
+                >= MAX_GLOBAL_CAPABILITIES))
+        || usize::try_from(document_receipts).unwrap_or(usize::MAX)
+            >= MAX_CONTROL_RECEIPTS_PER_DOCUMENT
+        || usize::try_from(global_receipts).unwrap_or(usize::MAX) >= MAX_GLOBAL_CONTROL_RECEIPTS
+    {
+        return Ok(true);
+    }
+
+    let (document_bytes_used, global_bytes_used) = control_logical_bytes(transaction, document_id)?;
+    let capability_bytes = if adds_capability {
+        IDENTIFIER_LENGTH * 2
+            + verifier::VERIFIER_LENGTH * 2
+            + 8
+            + 2
+            + operation_count.saturating_mul(IDENTIFIER_LENGTH * 2 + 1)
+    } else {
+        0
+    };
+    let additional_bytes = capability_bytes
+        .checked_add(IDENTIFIER_LENGTH * 2 + 1)
+        .and_then(|bytes| bytes.checked_add(normalized_input_length))
+        .unwrap_or(usize::MAX);
+    Ok(document_bytes_used.saturating_add(additional_bytes) > MAX_DOCUMENT_CONTROL_BYTES
+        || global_bytes_used.saturating_add(additional_bytes) > MAX_GLOBAL_CONTROL_BYTES)
+}
+
+const DOCUMENT_CONTROL_LOGICAL_BYTES_QUERY: &str = "
+SELECT
+    COALESCE((
+        SELECT SUM(
+            length(capability_id) + COALESCE(length(parent_capability_id), 0)
+            + length(live_verifier) + length(receipt_verifier)
+            + length(created_revision) + 2
+        ) FROM capabilities WHERE document_id = ?1
+    ), 0)
+    + COALESCE((
+        SELECT SUM(
+            length(document_id) + length(capability_id) + 1
+        ) FROM capability_operations WHERE document_id = ?1
+    ), 0)
+    + COALESCE((
+        SELECT SUM(
+            length(issuer_capability_id) + length(request_id)
+            + length(normalized_input) + 1
+        ) FROM control_receipts WHERE document_id = ?1
+    ), 0)";
+
+const GLOBAL_CONTROL_LOGICAL_BYTES_QUERY: &str = "
+SELECT
+    COALESCE((
+        SELECT SUM(
+            length(capability_id) + COALESCE(length(parent_capability_id), 0)
+            + length(live_verifier) + length(receipt_verifier)
+            + length(created_revision) + 2
+        ) FROM capabilities
+    ), 0)
+    + COALESCE((
+        SELECT SUM(
+            length(document_id) + length(capability_id) + 1
+        ) FROM capability_operations
+    ), 0)
+    + COALESCE((
+        SELECT SUM(
+            length(issuer_capability_id) + length(request_id)
+            + length(normalized_input) + 1
+        ) FROM control_receipts
+    ), 0)";
+
+fn control_logical_bytes(
+    transaction: &Transaction<'_>,
+    document_id: DocumentId,
+) -> Result<(usize, usize), StoreError> {
+    let document_id = document_id.into_bytes();
+    let document_bytes = transaction.query_row(
+        DOCUMENT_CONTROL_LOGICAL_BYTES_QUERY,
+        params![document_id.as_slice()],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let global_bytes = transaction
+        .query_row(GLOBAL_CONTROL_LOGICAL_BYTES_QUERY, [], |row| row.get::<_, i64>(0))?;
+    Ok((
+        usize::try_from(document_bytes).unwrap_or(usize::MAX),
+        usize::try_from(global_bytes).unwrap_or(usize::MAX),
+    ))
+}
+
 fn is_active_descendant(
     transaction: &Transaction<'_>,
     document_id: DocumentId,
@@ -1672,10 +2358,17 @@ mod tests {
         let capability = CapabilityId::from_bytes([0x51; IDENTIFIER_LENGTH]);
         let authenticator = Authenticator::from_bytes([0x61; 32]);
 
-        let mut store = DurableUpdateStore::open(&database).expect("store must open");
+        let mut store = open_store(&database);
         assert_eq!(
             store
-                .create_document(update.document_id(), capability, &authenticator)
+                .create_document(
+                    create_authority_id(),
+                    &create_authenticator(),
+                    RequestId::from_bytes([0x11; IDENTIFIER_LENGTH]),
+                    update.document_id(),
+                    capability,
+                    &authenticator,
+                )
                 .expect("document creation must commit"),
             StoreCreateOutcome::Inserted
         );
@@ -1687,26 +2380,33 @@ mod tests {
         );
         drop(store);
 
-        let mut recovered = DurableUpdateStore::open(&database).expect("store must reopen");
+        let mut recovered = open_store(&database);
         assert_eq!(
             recovered
                 .accept(capability, &authenticator, &update, &encoded)
                 .expect("retry must resolve"),
             StoreAcceptOutcome::AlreadyPresent
         );
-        let page = recovered
-            .enumerate(
+        let read = recovered
+            .enumerate_authorized(
                 update.document_id(),
-                AcceptanceSequence::ORIGIN,
-                AcceptanceSequence::FIRST,
+                capability,
+                &authenticator,
+                StoreEnumerateStart::Origin,
                 usize::MAX,
             )
             .expect("recovered row must enumerate");
-        assert_eq!(page.updates.len(), 1);
-        assert_eq!(
-            recovered.fetch(update.document_id(), update.update_id()).expect("fetch must succeed"),
-            Some(update.encrypted_payload().to_vec())
-        );
+        let StoreReadOutcome::Authorized(page) = read else {
+            panic!("root read authority must succeed");
+        };
+        assert_eq!(page.page.updates.len(), 1);
+        let fetched = recovered
+            .fetch_authorized(update.document_id(), update.update_id(), capability, &authenticator)
+            .expect("fetch must succeed");
+        let StoreReadOutcome::Authorized(fetched) = fetched else {
+            panic!("root fetch authority must succeed");
+        };
+        assert_eq!(fetched, Some(update.encrypted_payload().to_vec()));
     }
 
     #[test]
@@ -1715,7 +2415,7 @@ mod tests {
         let database = directory.path.join("renee.sqlite3");
         fs::write(&database, b"not a SQLite database").expect("fixture file must be written");
 
-        assert!(DurableUpdateStore::open(&database).is_err());
+        assert!(DurableUpdateStore::open(&database, create_authority_provision()).is_err());
     }
 
     #[test]
@@ -1723,12 +2423,19 @@ mod tests {
         let directory = TestDirectory::create();
         let database = directory.path.join("renee.sqlite3");
         let document_id = DocumentId::from_bytes([0xc1; IDENTIFIER_LENGTH]);
-        let mut store = DurableUpdateStore::open(&database).expect("store must open");
+        let mut store = open_store(&database);
         let mut issuer_id = CapabilityId::from_bytes([1; IDENTIFIER_LENGTH]);
         let mut issuer_authenticator = Authenticator::from_bytes([1; 32]);
         assert_eq!(
             store
-                .create_document(document_id, issuer_id, &issuer_authenticator)
+                .create_document(
+                    create_authority_id(),
+                    &create_authenticator(),
+                    RequestId::from_bytes([0x10; IDENTIFIER_LENGTH]),
+                    document_id,
+                    issuer_id,
+                    &issuer_authenticator,
+                )
                 .expect("root creation must commit"),
             StoreCreateOutcome::Inserted
         );
@@ -1766,10 +2473,86 @@ mod tests {
                     OperationSet::one(Operation::Grant),
                 )
                 .expect("over-depth grant must resolve"),
-            StoreControlOutcome::AuthorizationDenied
+            StoreControlOutcome::LimitExceeded
         );
         drop(store);
-        DurableUpdateStore::open(&database).expect("bounded graph must reopen");
+        open_store(&database);
+    }
+
+    #[test]
+    fn grant_rejects_direct_fanout_without_partial_state() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let document_id = DocumentId::from_bytes([0xd1; IDENTIFIER_LENGTH]);
+        let root_id = CapabilityId::from_bytes([0xd2; IDENTIFIER_LENGTH]);
+        let root_authenticator = Authenticator::from_bytes([0xd3; 32]);
+        let mut store = open_store(&database);
+        assert_eq!(
+            store
+                .create_document(
+                    create_authority_id(),
+                    &create_authenticator(),
+                    RequestId::from_bytes([0xd4; IDENTIFIER_LENGTH]),
+                    document_id,
+                    root_id,
+                    &root_authenticator,
+                )
+                .expect("root creation must commit"),
+            StoreCreateOutcome::Inserted
+        );
+        for child in 0_u8..64 {
+            assert_eq!(
+                store
+                    .grant_capability(
+                        document_id,
+                        root_id,
+                        &root_authenticator,
+                        RequestId::from_bytes([child; IDENTIFIER_LENGTH]),
+                        CapabilityId::from_bytes([child; IDENTIFIER_LENGTH]),
+                        &Authenticator::from_bytes([child; 32]),
+                        OperationSet::one(Operation::Read),
+                    )
+                    .expect("bounded direct grant must resolve"),
+                StoreControlOutcome::Inserted
+            );
+        }
+        assert_eq!(
+            store
+                .grant_capability(
+                    document_id,
+                    root_id,
+                    &root_authenticator,
+                    RequestId::from_bytes([0xf1; IDENTIFIER_LENGTH]),
+                    CapabilityId::from_bytes([0xf2; IDENTIFIER_LENGTH]),
+                    &Authenticator::from_bytes([0xf3; 32]),
+                    OperationSet::one(Operation::Read),
+                )
+                .expect("over-fanout grant must resolve"),
+            StoreControlOutcome::LimitExceeded
+        );
+        drop(store);
+        open_store(&database);
+    }
+
+    fn open_store(path: &Path) -> DurableUpdateStore {
+        DurableUpdateStore::open(path, create_authority_provision()).expect("store must open")
+    }
+
+    fn create_authority_id() -> CreateAuthorityId {
+        CreateAuthorityId::from_bytes([0xa1; IDENTIFIER_LENGTH])
+    }
+
+    fn create_authenticator() -> Authenticator {
+        Authenticator::from_bytes([0xb2; 32])
+    }
+
+    fn create_authority_provision() -> CreateAuthorityProvision {
+        let pair = verifier::derive_create(create_authority_id(), &create_authenticator());
+        CreateAuthorityProvision {
+            create_authority_id: create_authority_id(),
+            live_verifier: pair.live,
+            receipt_verifier: pair.receipt,
+        }
     }
 
     fn fixture_update() -> ImmutableUpdate {

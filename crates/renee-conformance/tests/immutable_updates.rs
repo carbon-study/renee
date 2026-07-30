@@ -10,16 +10,16 @@ use std::io;
 
 use renee_model::{AcceptOutcome, UpdateModel};
 use renee_subject::{
-    AcceptObservation, CreateDocumentObservation, EnumerateObservation, FetchObservation,
-    HarnessResult, PermanentDaemon, ServerHarness,
+    AcceptObservation, CONFORMANCE_CREATE_AUTHENTICATOR, CreateDocumentObservation,
+    EnumerateObservation, FetchObservation, HarnessResult, PermanentDaemon, ServerHarness,
 };
 use renee_types::{
-    AcceptanceSequence, Authenticator, CapabilityId, DocumentId, ImmutableUpdate, LoroRange,
-    PublicLoroRanges, UpdateId, UpdateMetadata,
+    AcceptanceSequence, Authenticator, CapabilityId, CreateAuthorityId, DocumentId,
+    ImmutableUpdate, LoroRange, PublicLoroRanges, RequestId, UpdateId, UpdateMetadata,
 };
 use renee_wire::{
-    AcceptanceCursor, CapabilityAuthority, CreateDocumentRequest, decode_acceptance_cursor,
-    encode_acceptance_cursor, encode_update_record,
+    AcceptanceCursor, CapabilityAuthority, CreateAuthority, CreateDocumentRequest,
+    decode_acceptance_cursor, encode_acceptance_cursor, encode_update_record,
 };
 
 fn update(document: u8, update: u8, payload: &[u8]) -> ImmutableUpdate {
@@ -47,6 +47,11 @@ fn expected_metadata(update: &ImmutableUpdate) -> UpdateMetadata {
 
 fn root(document: u8) -> CreateDocumentRequest {
     CreateDocumentRequest {
+        create_authority: CreateAuthority {
+            create_authority_id: CreateAuthorityId::from_bytes([0xa1; 16]),
+            authenticator: Authenticator::from_bytes(CONFORMANCE_CREATE_AUTHENTICATOR),
+        },
+        request_id: RequestId::from_bytes([document; 16]),
         document_id: DocumentId::from_bytes([document; 16]),
         root: CapabilityAuthority {
             capability_id: CapabilityId::from_bytes([document.wrapping_add(0x40); 16]),
@@ -114,7 +119,8 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
 
     // Capture the cursor before accepting a lexically lower update ID. This
     // is the case update-ID pagination skipped permanently.
-    let first_page = connection.enumerate_updates(first.document_id(), None).await?;
+    let first_page =
+        connection.enumerate_updates(&first_root.root, first.document_id(), None).await?;
     if first_page.updates != vec![expected_metadata(&first)] {
         return Err(io::Error::other("first acceptance page was incorrect").into());
     }
@@ -146,7 +152,8 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
         .enumerate(first.document_id(), None, terminal_sequence)
         .map(|(_sequence, metadata)| metadata)
         .collect::<Vec<_>>();
-    let observed_page = connection.enumerate_updates(first.document_id(), None).await?;
+    let observed_page =
+        connection.enumerate_updates(&first_root.root, first.document_id(), None).await?;
     if observed_page.has_more || observed_page.updates != expected_page {
         return Err(io::Error::other("model and subject disagreed on enumeration").into());
     }
@@ -158,7 +165,7 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
         .map(|(_sequence, metadata)| metadata)
         .collect::<Vec<_>>();
     let observed_after = connection
-        .enumerate_updates(first.document_id(), observed_page.next_cursor.clone())
+        .enumerate_updates(&first_root.root, first.document_id(), observed_page.next_cursor.clone())
         .await?;
     if observed_after.has_more || observed_after.updates != expected_after {
         return Err(io::Error::other("enumeration cursor was not exclusive").into());
@@ -177,16 +184,18 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
     {
         return Err(io::Error::other("retry or conflict consumed an acceptance sequence").into());
     }
-    let captured_window =
-        connection.enumerate_updates(first.document_id(), Some(first_cursor.clone())).await?;
+    let captured_window = connection
+        .enumerate_updates(&first_root.root, first.document_id(), Some(first_cursor.clone()))
+        .await?;
     if captured_window.has_more || !captured_window.updates.is_empty() {
         return Err(io::Error::other(
             "acceptance after the captured terminal extended a finite read",
         )
         .into());
     }
-    let tail_page =
-        connection.enumerate_updates_after_tail(first.document_id(), first_cursor.clone()).await?;
+    let tail_page = connection
+        .enumerate_updates_after_tail(&first_root.root, first.document_id(), first_cursor.clone())
+        .await?;
     if tail_page.has_more || tail_page.updates != vec![expected_metadata(&later)] {
         return Err(io::Error::other(
             "new high-water read after a stable tail did not return only later acceptances",
@@ -195,13 +204,21 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
     }
 
     let wrong_document = DocumentId::from_bytes([0x77; 16]);
-    if connection.enumerate_updates_observation(wrong_document, Some(later_cursor.clone())).await?
+    if connection
+        .enumerate_updates_observation(&first_root.root, wrong_document, Some(later_cursor.clone()))
+        .await?
         != EnumerateObservation::InvalidCursor
     {
         return Err(io::Error::other("cross-document cursor was accepted").into());
     }
     let malformed_cursor = vec![0_u8; later_cursor.len()];
-    if connection.enumerate_updates_observation(first.document_id(), Some(malformed_cursor)).await?
+    if connection
+        .enumerate_updates_observation(
+            &first_root.root,
+            first.document_id(),
+            Some(malformed_cursor),
+        )
+        .await?
         != EnumerateObservation::InvalidCursor
     {
         return Err(io::Error::other("malformed cursor was accepted").into());
@@ -214,7 +231,11 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
         },
     )?;
     if connection
-        .enumerate_updates_observation(first.document_id(), Some(impossible_cursor))
+        .enumerate_updates_observation(
+            &first_root.root,
+            first.document_id(),
+            Some(impossible_cursor),
+        )
         .await?
         != EnumerateObservation::InvalidCursor
     {
@@ -224,14 +245,15 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
     let expected_payload = model
         .fetch(first.document_id(), first.update_id())
         .ok_or_else(|| io::Error::other("model lost inserted update"))?;
-    let observed_payload = connection.fetch_update(first.document_id(), first.update_id()).await?;
+    let observed_payload =
+        connection.fetch_update(&first_root.root, first.document_id(), first.update_id()).await?;
     if observed_payload != FetchObservation::Found(expected_payload.to_vec()) {
         return Err(io::Error::other("fetch did not preserve opaque payload bytes").into());
     }
 
     let missing_id = UpdateId::from_bytes([0xff; 16]);
     if model.fetch(first.document_id(), missing_id).is_some()
-        || connection.fetch_update(first.document_id(), missing_id).await?
+        || connection.fetch_update(&first_root.root, first.document_id(), missing_id).await?
             != FetchObservation::NotFound
     {
         return Err(io::Error::other("model and subject disagreed on missing fetch").into());
@@ -263,7 +285,8 @@ async fn acknowledged_update_survives_store_restart() -> HarnessResult<()> {
     {
         return Err(io::Error::other("durable fixture was not inserted").into());
     }
-    let before_restart = connection.enumerate_updates(accepted.document_id(), None).await?;
+    let before_restart =
+        connection.enumerate_updates(&accepted_root.root, accepted.document_id(), None).await?;
     let durable_cursor = before_restart
         .next_cursor
         .ok_or_else(|| io::Error::other("accepted update omitted durable cursor"))?;
@@ -288,11 +311,14 @@ async fn acknowledged_update_survives_store_restart() -> HarnessResult<()> {
     {
         return Err(io::Error::other("conflicting retry changed after store restart").into());
     }
-    let page = recovered.enumerate_updates(accepted.document_id(), None).await?;
+    let page =
+        recovered.enumerate_updates(&accepted_root.root, accepted.document_id(), None).await?;
     if page.updates != vec![expected_metadata(&accepted)] {
         return Err(io::Error::other("acknowledged metadata was lost across restart").into());
     }
-    if recovered.fetch_update(accepted.document_id(), accepted.update_id()).await?
+    if recovered
+        .fetch_update(&accepted_root.root, accepted.document_id(), accepted.update_id())
+        .await?
         != FetchObservation::Found(accepted.encrypted_payload().to_vec())
     {
         return Err(io::Error::other("acknowledged payload was lost across restart").into());
@@ -303,13 +329,19 @@ async fn acknowledged_update_survives_store_restart() -> HarnessResult<()> {
     {
         return Err(io::Error::other("post-restart update was not inserted").into());
     }
-    let resumed =
-        recovered.enumerate_updates(accepted.document_id(), Some(durable_cursor.clone())).await?;
+    let resumed = recovered
+        .enumerate_updates(
+            &accepted_root.root,
+            accepted.document_id(),
+            Some(durable_cursor.clone()),
+        )
+        .await?;
     if resumed.has_more || !resumed.updates.is_empty() {
         return Err(io::Error::other("pre-restart finite cursor changed its terminal").into());
     }
-    let refreshed =
-        recovered.enumerate_updates_after_tail(accepted.document_id(), durable_cursor).await?;
+    let refreshed = recovered
+        .enumerate_updates_after_tail(&accepted_root.root, accepted.document_id(), durable_cursor)
+        .await?;
     if refreshed.updates != vec![expected_metadata(&later)] {
         return Err(io::Error::other("tail read repeated history or omitted a new update").into());
     }

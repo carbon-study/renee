@@ -9,16 +9,17 @@ use renee_model::{
     CreateDocumentOutcome as ModelCreateOutcome,
 };
 use renee_subject::{
-    AcceptObservation, ControlMutationObservation, CreateDocumentObservation, HarnessResult,
+    AcceptObservation, CONFORMANCE_CREATE_AUTHENTICATOR, ControlMutationObservation,
+    CreateDocumentObservation, EnumerateObservation, FetchObservation, HarnessResult,
     PermanentDaemon, ServerHarness, WebTransportConnection,
 };
 use renee_types::{
-    Authenticator, CapabilityId, DocumentId, ImmutableUpdate, LoroRange, Operation, OperationSet,
-    PublicLoroRanges, RequestId, UpdateId,
+    Authenticator, CapabilityId, CreateAuthorityId, DocumentId, ImmutableUpdate, LoroRange,
+    Operation, OperationSet, PublicLoroRanges, RequestId, UpdateId,
 };
 use renee_wire::{
-    CapabilityAuthority, CreateDocumentRequest, GrantCapabilityRequest, RevokeCapabilityRequest,
-    encode_update_record,
+    CapabilityAuthority, CreateAuthority, CreateDocumentRequest, GrantCapabilityRequest,
+    RevokeCapabilityRequest, encode_update_record,
 };
 
 #[tokio::test]
@@ -34,7 +35,7 @@ async fn root_grant_and_subtree_revoke_enforce_indistinguishable_update_denial()
 
     let document_id = DocumentId::from_bytes([0x10; 16]);
     let root = authority(0x20, 0x30);
-    let create = CreateDocumentRequest { document_id, root: root.clone() };
+    let create = create_request(document_id, root.clone(), 0x01);
     let mut model = CapabilityModel::default();
     if model.create_document(document_id, root.capability_id, &root.authenticator)
         != ModelCreateOutcome::Inserted
@@ -204,6 +205,174 @@ async fn root_grant_and_subtree_revoke_enforce_indistinguishable_update_denial()
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one history compares creation disclosure and every read-authority denial class"
+)]
+async fn create_receipts_and_reads_preserve_authorization_disclosure() -> HarnessResult<()> {
+    let server = ServerHarness::start().await?;
+    let connection = server.connect_webtransport().await?;
+    negotiate(&connection).await?;
+    let document_id = DocumentId::from_bytes([0x31; 16]);
+    let root = authority(0x32, 0x33);
+    let create = create_request(document_id, root.clone(), 0x34);
+
+    let mut denied_create = create.clone();
+    denied_create.create_authority.authenticator = Authenticator::from_bytes([0xff; 32]);
+    if connection.create_document(&denied_create).await?
+        != CreateDocumentObservation::AuthorizationDenied
+        || connection.create_document(&create).await? != CreateDocumentObservation::Inserted
+        || connection.create_document(&create).await? != CreateDocumentObservation::AlreadyPresent
+    {
+        return Err(io::Error::other("create authority or exact retry semantics changed").into());
+    }
+
+    let mut conflicting_request = create.clone();
+    conflicting_request.document_id = DocumentId::from_bytes([0x35; 16]);
+    if connection.create_document(&conflicting_request).await?
+        != CreateDocumentObservation::RequestConflict
+    {
+        return Err(io::Error::other("authorized changed create retry was not disclosed").into());
+    }
+    let mut colliding_document = create_request(document_id, root.clone(), 0x36);
+    if connection.create_document(&colliding_document).await?
+        != CreateDocumentObservation::IdentifierConflict
+    {
+        return Err(io::Error::other("authorized document collision was not disclosed").into());
+    }
+    colliding_document.root.authenticator = Authenticator::from_bytes([0xfe; 32]);
+    if connection.create_document(&colliding_document).await?
+        != CreateDocumentObservation::AuthorizationDenied
+    {
+        return Err(io::Error::other("document collision leaked without root proof").into());
+    }
+
+    let stored_update = update(document_id, 0x37, b"read-authorized");
+    if connection.accept_update(&root, &encode_update_record(&stored_update)?).await?
+        != AcceptObservation::Inserted
+    {
+        return Err(io::Error::other("read fixture was not accepted").into());
+    }
+    let bad_root = CapabilityAuthority {
+        capability_id: root.capability_id,
+        authenticator: Authenticator::from_bytes([0xfd; 32]),
+    };
+    let unknown_document = DocumentId::from_bytes([0xfc; 16]);
+    if !matches!(
+        connection.enumerate_updates_observation(&root, document_id, None).await?,
+        EnumerateObservation::Page(_)
+    ) || connection.enumerate_updates_observation(&bad_root, document_id, None).await?
+        != EnumerateObservation::AuthorizationDenied
+        || connection.enumerate_updates_observation(&root, unknown_document, None).await?
+            != EnumerateObservation::AuthorizationDenied
+        || !matches!(
+            connection.fetch_update(&root, document_id, stored_update.update_id()).await?,
+            FetchObservation::Found(_)
+        )
+        || connection.fetch_update(&bad_root, document_id, stored_update.update_id()).await?
+            != FetchObservation::AuthorizationDenied
+    {
+        return Err(io::Error::other("read authorization disclosure changed").into());
+    }
+
+    let writer = authority(0x38, 0x39);
+    if connection
+        .grant_capability(&GrantCapabilityRequest {
+            document_id,
+            issuer: root.clone(),
+            request_id: RequestId::from_bytes([0x3a; 16]),
+            descendant: writer.clone(),
+            operations: OperationSet::one(Operation::Update),
+        })
+        .await?
+        != ControlMutationObservation::Inserted
+        || connection.enumerate_updates_observation(&writer, document_id, None).await?
+            != EnumerateObservation::AuthorizationDenied
+    {
+        return Err(io::Error::other("update authority unexpectedly implied read authority").into());
+    }
+
+    let reader = authority(0x3b, 0x3c);
+    if connection
+        .grant_capability(&GrantCapabilityRequest {
+            document_id,
+            issuer: root.clone(),
+            request_id: RequestId::from_bytes([0x3d; 16]),
+            descendant: reader.clone(),
+            operations: OperationSet::one(Operation::Read),
+        })
+        .await?
+        != ControlMutationObservation::Inserted
+        || !matches!(
+            connection.enumerate_updates_observation(&reader, document_id, None).await?,
+            EnumerateObservation::Page(_)
+        )
+        || connection
+            .revoke_capability(&RevokeCapabilityRequest {
+                document_id,
+                issuer: root,
+                request_id: RequestId::from_bytes([0x3e; 16]),
+                target_capability_id: reader.capability_id,
+            })
+            .await?
+            != ControlMutationObservation::Inserted
+        || connection.enumerate_updates_observation(&reader, document_id, None).await?
+            != EnumerateObservation::AuthorizationDenied
+        || connection.fetch_update(&reader, document_id, stored_update.update_id()).await?
+            != FetchObservation::AuthorizationDenied
+    {
+        return Err(io::Error::other("revoked read authority remained effective").into());
+    }
+    connection.close();
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn document_creation_crashes_cleanly_at_every_durable_seam() -> HarnessResult<()> {
+    for (index, seam, precreated, committed) in [
+        (0_u8, "store-create-after-authorization", false, false),
+        (1_u8, "store-create-before-commit", false, false),
+        (2_u8, "store-create-after-commit-before-response", false, true),
+        (3_u8, "store-create-exact-retry", true, true),
+    ] {
+        let mut server = ServerHarness::start().await?;
+        let connection = server.connect_webtransport().await?;
+        negotiate(&connection).await?;
+        let request = create_request(
+            DocumentId::from_bytes([0x40_u8.wrapping_add(index); 16]),
+            authority(0x50_u8.wrapping_add(index), 0x60_u8.wrapping_add(index)),
+            0x70_u8.wrapping_add(index),
+        );
+        if precreated
+            && connection.create_document(&request).await? != CreateDocumentObservation::Inserted
+        {
+            return Err(io::Error::other("exact-retry crash fixture was not created").into());
+        }
+        server.arm_store_barrier(seam)?;
+        let (request_outcome, crash_outcome) = tokio::join!(
+            connection.create_document(&request),
+            server.crash_store_at_barrier(seam),
+        );
+        drop(request_outcome);
+        crash_outcome.map_err(|error| io::Error::other(format!("{seam}: {error}")))?;
+        connection.close();
+        let recovered = server.connect_webtransport().await?;
+        negotiate(&recovered).await?;
+        let expected = if committed {
+            CreateDocumentObservation::AlreadyPresent
+        } else {
+            CreateDocumentObservation::Inserted
+        };
+        if recovered.create_document(&request).await? != expected {
+            return Err(io::Error::other("create crash produced partial durable state").into());
+        }
+        recovered.close();
+        server.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn update_and_revoke_admit_only_their_two_serial_orders() -> HarnessResult<()> {
     let server = ServerHarness::start().await?;
     let setup = server.connect_webtransport().await?;
@@ -216,7 +385,13 @@ async fn update_and_revoke_admit_only_their_two_serial_orders() -> HarnessResult
     for iteration in 0_u8..8 {
         let document_id = DocumentId::from_bytes([0x80_u8.wrapping_add(iteration); 16]);
         let root = authority(0x90_u8.wrapping_add(iteration), 0xa0_u8.wrapping_add(iteration));
-        if setup.create_document(&CreateDocumentRequest { document_id, root: root.clone() }).await?
+        if setup
+            .create_document(&create_request(
+                document_id,
+                root.clone(),
+                0x02_u8.wrapping_add(iteration),
+            ))
+            .await?
             != CreateDocumentObservation::Inserted
         {
             return Err(io::Error::other("race document was not created").into());
@@ -280,9 +455,7 @@ async fn store_crashes_at_every_authorization_and_commit_seam() -> HarnessResult
     negotiate(&connection).await?;
     let document_id = DocumentId::from_bytes([0x21; 16]);
     let root = authority(0x22, 0x23);
-    if connection
-        .create_document(&CreateDocumentRequest { document_id, root: root.clone() })
-        .await?
+    if connection.create_document(&create_request(document_id, root.clone(), 0x03)).await?
         != CreateDocumentObservation::Inserted
     {
         return Err(io::Error::other("crash fixture document was not created").into());
@@ -418,7 +591,7 @@ async fn crash_grant_case(
         descendant: authority(0xa0_u8.wrapping_add(index), 0xb0_u8.wrapping_add(index)),
         operations: OperationSet::one(Operation::Update),
     };
-    if connection.create_document(&CreateDocumentRequest { document_id, root }).await?
+    if connection.create_document(&create_request(document_id, root, 0x04)).await?
         != CreateDocumentObservation::Inserted
     {
         return Err(io::Error::other("grant crash document was not created").into());
@@ -462,9 +635,7 @@ async fn crash_revoke_case(
     let document_id = DocumentId::from_bytes([0xc0_u8.wrapping_add(index); 16]);
     let root = authority(0xd0_u8.wrapping_add(index), 0xe0_u8.wrapping_add(index));
     let descendant = authority(0x20_u8.wrapping_add(index), 0x30_u8.wrapping_add(index));
-    if connection
-        .create_document(&CreateDocumentRequest { document_id, root: root.clone() })
-        .await?
+    if connection.create_document(&create_request(document_id, root.clone(), 0x05)).await?
         != CreateDocumentObservation::Inserted
     {
         return Err(io::Error::other("revoke crash document was not created").into());
@@ -527,6 +698,22 @@ fn authority(capability: u8, secret: u8) -> CapabilityAuthority {
     CapabilityAuthority {
         capability_id: CapabilityId::from_bytes([capability; 16]),
         authenticator: Authenticator::from_bytes([secret; 32]),
+    }
+}
+
+fn create_request(
+    document_id: DocumentId,
+    root: CapabilityAuthority,
+    request: u8,
+) -> CreateDocumentRequest {
+    CreateDocumentRequest {
+        create_authority: CreateAuthority {
+            create_authority_id: CreateAuthorityId::from_bytes([0xa1; 16]),
+            authenticator: Authenticator::from_bytes(CONFORMANCE_CREATE_AUTHENTICATOR),
+        },
+        request_id: RequestId::from_bytes([request; 16]),
+        document_id,
+        root,
     }
 }
 

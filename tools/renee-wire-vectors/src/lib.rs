@@ -9,21 +9,22 @@
 use core::fmt;
 
 use renee_types::{
-    AcceptanceSequence, Authenticator, CapabilityId, DocumentId, ImmutableUpdate, LoroRange,
-    Operation, OperationSet, PublicLoroRanges, RequestId, UpdateId, UpdateMetadata,
+    AcceptanceSequence, Authenticator, CapabilityId, CreateAuthorityId, DocumentId,
+    ImmutableUpdate, LoroRange, Operation, OperationSet, PublicLoroRanges, RequestId, UpdateId,
+    UpdateMetadata,
 };
 use renee_wire::{
     ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor,
     AuthorizedUpdateRequest, CAPABILITY_ERROR, CERTIFICATE_MANIFEST, CERTIFICATE_MANIFEST_RESPONSE,
     CLIENT_HELLO, CREATE_DOCUMENT, CREATE_DOCUMENT_RESPONSE, CapabilityAuthority,
-    CapabilityErrorCode, ControlMutationOutcome, CreateDocumentOutcome, CreateDocumentRequest,
-    ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, ERROR_ALREADY_NEGOTIATED, ERROR_EXPECTED_HELLO,
-    ERROR_MALFORMED_HELLO, ERROR_UNSUPPORTED_PROFILE, ERROR_UNSUPPORTED_VERSION, EnumerateRequest,
-    EnumerateResponse, EnumerateStart, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE,
-    GRANT_CAPABILITY, GRANT_CAPABILITY_RESPONSE, GrantCapabilityRequest,
-    MAX_APPLICATION_PAYLOAD_LENGTH, PROFILE, PROTOCOL_ERROR, REVOKE_CAPABILITY,
-    REVOKE_CAPABILITY_RESPONSE, RevokeCapabilityRequest, SERVER_HELLO, UPDATE_ERROR,
-    UpdateErrorCode, VERSION, encode_accept_response, encode_acceptance_cursor,
+    CapabilityErrorCode, ControlMutationOutcome, CreateAuthority, CreateDocumentOutcome,
+    CreateDocumentRequest, ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, ERROR_ALREADY_NEGOTIATED,
+    ERROR_EXPECTED_HELLO, ERROR_MALFORMED_HELLO, ERROR_UNSUPPORTED_PROFILE,
+    ERROR_UNSUPPORTED_VERSION, EnumerateRequest, EnumerateResponse, EnumerateStart, Envelope,
+    FETCH_UPDATE, FETCH_UPDATE_RESPONSE, FetchRequest, GRANT_CAPABILITY, GRANT_CAPABILITY_RESPONSE,
+    GrantCapabilityRequest, MAX_APPLICATION_PAYLOAD_LENGTH, PROFILE, PROTOCOL_ERROR,
+    REVOKE_CAPABILITY, REVOKE_CAPABILITY_RESPONSE, RevokeCapabilityRequest, SERVER_HELLO,
+    UPDATE_ERROR, UpdateErrorCode, VERSION, encode_accept_response, encode_acceptance_cursor,
     encode_authorized_update_request, encode_capability_error, encode_control_mutation_response,
     encode_create_document_request, encode_create_document_response, encode_enumerate_request,
     encode_enumerate_response, encode_fetch_request, encode_fetch_response, encode_frame,
@@ -73,6 +74,10 @@ pub fn generate() -> Result<String, GenerateError> {
     let editor = CapabilityAuthority {
         capability_id: CapabilityId::from_bytes([0x57; 16]),
         authenticator: Authenticator::from_bytes([0x58; 32]),
+    };
+    let create_authority = CreateAuthority {
+        create_authority_id: CreateAuthorityId::from_bytes([0x53; 16]),
+        authenticator: Authenticator::from_bytes([0x54; 32]),
     };
     let cursor = encode_acceptance_cursor(
         document_id,
@@ -124,6 +129,8 @@ pub fn generate() -> Result<String, GenerateError> {
             CREATE_DOCUMENT,
             0x20,
             encode_create_document_request(&CreateDocumentRequest {
+                create_authority,
+                request_id: RequestId::from_bytes([0x52; 16]),
                 document_id,
                 root: root.clone(),
             }),
@@ -225,6 +232,7 @@ pub fn generate() -> Result<String, GenerateError> {
             ENUMERATE_UPDATES,
             0x31,
             encode_enumerate_request(&EnumerateRequest {
+                authority: root.clone(),
                 document_id,
                 start: EnumerateStart::Origin,
             })?,
@@ -235,6 +243,7 @@ pub fn generate() -> Result<String, GenerateError> {
             ENUMERATE_UPDATES,
             0x32,
             encode_enumerate_request(&EnumerateRequest {
+                authority: root.clone(),
                 document_id,
                 start: EnumerateStart::Continue(cursor.clone()),
             })?,
@@ -245,6 +254,7 @@ pub fn generate() -> Result<String, GenerateError> {
             ENUMERATE_UPDATES,
             0x33,
             encode_enumerate_request(&EnumerateRequest {
+                authority: root.clone(),
                 document_id,
                 start: EnumerateStart::AfterTail(cursor.clone()),
             })?,
@@ -276,7 +286,7 @@ pub fn generate() -> Result<String, GenerateError> {
             "fetch",
             FETCH_UPDATE,
             0x41,
-            encode_fetch_request(document_id, update_id),
+            encode_fetch_request(&FetchRequest { authority: root.clone(), document_id, update_id }),
         )?,
         frame(
             "fetch.response",
@@ -313,6 +323,7 @@ pub fn generate() -> Result<String, GenerateError> {
         ("error.capability.identifier-conflict", CapabilityErrorCode::IdentifierConflict),
         ("error.capability.request-conflict", CapabilityErrorCode::RequestConflict),
         ("error.capability.counter-exhausted", CapabilityErrorCode::CounterExhausted),
+        ("error.capability.limit-exceeded", CapabilityErrorCode::LimitExceeded),
     ] {
         frames.push(frame(name, "errors", CAPABILITY_ERROR, 0x52, encode_capability_error(error))?);
     }

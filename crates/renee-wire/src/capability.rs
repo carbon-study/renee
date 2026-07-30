@@ -3,7 +3,8 @@
 use core::fmt;
 
 use renee_types::{
-    Authenticator, CapabilityId, DocumentId, IDENTIFIER_LENGTH, OperationSet, RequestId,
+    Authenticator, CapabilityId, CreateAuthorityId, DocumentId, IDENTIFIER_LENGTH, OperationSet,
+    RequestId,
 };
 
 use crate::{
@@ -36,9 +37,22 @@ pub struct CapabilityAuthority {
     pub authenticator: Authenticator,
 }
 
+/// Deployment-scoped authority that permits document creation only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateAuthority {
+    /// Service-wide create-authority identifier.
+    pub create_authority_id: CreateAuthorityId,
+    /// Secret bearer authenticator.
+    pub authenticator: Authenticator,
+}
+
 /// Minimal document/root creation request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateDocumentRequest {
+    /// Deployment-scoped authority admitting this create.
+    pub create_authority: CreateAuthority,
+    /// Create-authority-scoped idempotency request identifier.
+    pub request_id: RequestId,
     /// Client-selected document identifier.
     pub document_id: DocumentId,
     /// Client-selected unique root capability identifier.
@@ -113,6 +127,8 @@ pub enum CapabilityErrorCode {
     RequestConflict,
     /// The document control revision cannot advance.
     CounterExhausted,
+    /// A finite capability or receipt bound was reached.
+    LimitExceeded,
 }
 
 /// Capability payload codec failure.
@@ -145,7 +161,9 @@ impl std::error::Error for CapabilityCodecError {}
 
 /// Encodes one document/root creation request.
 pub fn encode_create_document_request(request: &CreateDocumentRequest) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(IDENTIFIER_LENGTH + AUTHORITY_LENGTH);
+    let mut encoded = Vec::with_capacity(AUTHORITY_LENGTH * 2 + IDENTIFIER_LENGTH * 2);
+    encode_create_authority(&mut encoded, &request.create_authority);
+    encoded.extend_from_slice(&request.request_id.into_bytes());
     encoded.extend_from_slice(&request.document_id.into_bytes());
     encode_authority(&mut encoded, &request.root);
     encoded
@@ -156,10 +174,12 @@ pub fn decode_create_document_request(
     encoded: &[u8],
 ) -> Result<CreateDocumentRequest, CapabilityCodecError> {
     let mut decoder = Decoder::new(encoded);
+    let create_authority = decoder.take_create_authority()?;
+    let request_id = RequestId::from_bytes(decoder.take_array()?);
     let document_id = DocumentId::from_bytes(decoder.take_array()?);
     let root = decoder.take_authority()?;
     decoder.finish()?;
-    Ok(CreateDocumentRequest { document_id, root })
+    Ok(CreateDocumentRequest { create_authority, request_id, document_id, root })
 }
 
 /// Encodes authority followed by one exact immutable-update record.
@@ -297,6 +317,7 @@ pub fn encode_capability_error(error: CapabilityErrorCode) -> Vec<u8> {
         CapabilityErrorCode::IdentifierConflict => 2,
         CapabilityErrorCode::RequestConflict => 3,
         CapabilityErrorCode::CounterExhausted => 4,
+        CapabilityErrorCode::LimitExceeded => 5,
     }]
 }
 
@@ -310,6 +331,7 @@ pub fn decode_capability_error(
         [2] => Ok(CapabilityErrorCode::IdentifierConflict),
         [3] => Ok(CapabilityErrorCode::RequestConflict),
         [4] => Ok(CapabilityErrorCode::CounterExhausted),
+        [5] => Ok(CapabilityErrorCode::LimitExceeded),
         [_unknown] => Err(CapabilityCodecError::InvalidDiscriminant),
         _ => Err(CapabilityCodecError::TrailingBytes),
     }
@@ -317,6 +339,11 @@ pub fn decode_capability_error(
 
 fn encode_authority(encoded: &mut Vec<u8>, authority: &CapabilityAuthority) {
     encoded.extend_from_slice(&authority.capability_id.into_bytes());
+    encoded.extend_from_slice(authority.authenticator.as_bytes());
+}
+
+fn encode_create_authority(encoded: &mut Vec<u8>, authority: &CreateAuthority) {
+    encoded.extend_from_slice(&authority.create_authority_id.into_bytes());
     encoded.extend_from_slice(authority.authenticator.as_bytes());
 }
 
@@ -351,6 +378,13 @@ impl<'encoded> Decoder<'encoded> {
             authenticator: Authenticator::from_bytes(self.take_array()?),
         })
     }
+
+    fn take_create_authority(&mut self) -> Result<CreateAuthority, CapabilityCodecError> {
+        Ok(CreateAuthority {
+            create_authority_id: CreateAuthorityId::from_bytes(self.take_array()?),
+            authenticator: Authenticator::from_bytes(self.take_array()?),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -362,6 +396,8 @@ mod tests {
     #[test]
     fn document_creation_round_trips_and_rejects_noncanonical_lengths() {
         let request = CreateDocumentRequest {
+            create_authority: create_authority(0x01, 0x02),
+            request_id: RequestId::from_bytes([0x03; IDENTIFIER_LENGTH]),
             document_id: DocumentId::from_bytes([0x11; IDENTIFIER_LENGTH]),
             root: authority(0x21, 0x31),
         };
@@ -481,10 +517,11 @@ mod tests {
             CapabilityErrorCode::IdentifierConflict,
             CapabilityErrorCode::RequestConflict,
             CapabilityErrorCode::CounterExhausted,
+            CapabilityErrorCode::LimitExceeded,
         ] {
             assert_eq!(decode_capability_error(&encode_capability_error(error)), Ok(error));
         }
-        assert_eq!(decode_capability_error(&[5]), Err(CapabilityCodecError::InvalidDiscriminant));
+        assert_eq!(decode_capability_error(&[6]), Err(CapabilityCodecError::InvalidDiscriminant));
         assert_eq!(decode_capability_error(&[]), Err(CapabilityCodecError::TrailingBytes));
         assert_eq!(decode_capability_error(&[0, 0]), Err(CapabilityCodecError::TrailingBytes));
     }
@@ -492,6 +529,13 @@ mod tests {
     fn authority(capability_byte: u8, authenticator_byte: u8) -> CapabilityAuthority {
         CapabilityAuthority {
             capability_id: CapabilityId::from_bytes([capability_byte; IDENTIFIER_LENGTH]),
+            authenticator: Authenticator::from_bytes([authenticator_byte; 32]),
+        }
+    }
+
+    fn create_authority(authority_byte: u8, authenticator_byte: u8) -> CreateAuthority {
+        CreateAuthority {
+            create_authority_id: CreateAuthorityId::from_bytes([authority_byte; IDENTIFIER_LENGTH]),
             authenticator: Authenticator::from_bytes([authenticator_byte; 32]),
         }
     }

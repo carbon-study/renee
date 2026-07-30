@@ -23,7 +23,7 @@ use renee_wire::{
     CapabilityErrorCode, ControlMutationOutcome, CreateDocumentOutcome, CreateDocumentRequest,
     ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, ERROR_ALREADY_NEGOTIATED, ERROR_EXPECTED_HELLO,
     ERROR_UNSUPPORTED_PROFILE, ERROR_UNSUPPORTED_VERSION, EnumerateRequest, EnumerateResponse,
-    EnumerateStart, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE, GRANT_CAPABILITY,
+    EnumerateStart, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE, FetchRequest, GRANT_CAPABILITY,
     GRANT_CAPABILITY_RESPONSE, GrantCapabilityRequest, PROFILE, PROTOCOL_ERROR, REVOKE_CAPABILITY,
     REVOKE_CAPABILITY_RESPONSE, RevokeCapabilityRequest, SERVER_HELLO, UPDATE_ERROR,
     UpdateErrorCode, VERSION, decode_accept_response, decode_body, decode_capability_error,
@@ -42,6 +42,16 @@ use wtransport::{ClientConfig, Connection, Endpoint};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 /// The greeting sent by the Carbon client represented by this subject harness.
 pub const CARBON_BANNER: &str = "I couldn't stay away";
+/// Conformance-only deployment create authority identifier.
+pub const CONFORMANCE_CREATE_AUTHORITY_ID_HEX: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+/// Conformance-only deployment create authenticator.
+pub const CONFORMANCE_CREATE_AUTHENTICATOR: [u8; 32] = [0xb2; 32];
+/// Live verifier corresponding to the conformance create authenticator.
+pub const CONFORMANCE_CREATE_LIVE_VERIFIER_HEX: &str =
+    "c5be9d6de0958b9fc7bafe78f393076fd87ff68f8cf73bfee757b03c88b69acd";
+/// Receipt verifier corresponding to the conformance create authenticator.
+pub const CONFORMANCE_CREATE_RECEIPT_VERIFIER_HEX: &str =
+    "3995aaaf7e44c4ab7e757ce77f6cd7c4a7ae52c56d2e785da05ff0f17f36e7d7";
 
 /// A result produced by the Renee black-box test harness.
 pub type HarnessResult<T> = Result<T, Box<dyn Error>>;
@@ -114,6 +124,12 @@ pub enum CreateDocumentObservation {
     AlreadyPresent,
     /// The document identifier named different root input.
     IdentifierConflict,
+    /// Deployment create authority was denied without state disclosure.
+    AuthorizationDenied,
+    /// The create-authority-scoped request ID named different input.
+    RequestConflict,
+    /// A finite create admission bound was reached.
+    LimitExceeded,
     /// Renee rejected malformed creation input.
     Malformed,
 }
@@ -133,6 +149,8 @@ pub enum ControlMutationObservation {
     RequestConflict,
     /// The control revision cannot advance.
     CounterExhausted,
+    /// A finite capability or receipt bound was reached.
+    LimitExceeded,
     /// Renee rejected malformed control input.
     Malformed,
 }
@@ -144,6 +162,8 @@ pub enum FetchObservation {
     Found(Vec<u8>),
     /// No update exists under the complete idempotency key.
     NotFound,
+    /// Read authority was denied without document disclosure.
+    AuthorizationDenied,
 }
 
 /// Subject observation for one finite metadata read.
@@ -153,6 +173,8 @@ pub enum EnumerateObservation {
     Page(EnumerateResponse),
     /// The cursor was malformed or bound to another document.
     InvalidCursor,
+    /// Read authority was denied without document disclosure.
+    AuthorizationDenied,
 }
 
 struct TemporaryDirectory {
@@ -185,6 +207,14 @@ impl ServerHarness {
         fs::create_dir_all(&barrier_directory)?;
         let mut supervisor = Command::new(supervisor_path)
             .args(["--bind", "127.0.0.1:0", "--shutdown-on-stdin-eof"])
+            .args([
+                "--create-authority-id",
+                CONFORMANCE_CREATE_AUTHORITY_ID_HEX,
+                "--create-live-verifier",
+                CONFORMANCE_CREATE_LIVE_VERIFIER_HEX,
+                "--create-receipt-verifier",
+                CONFORMANCE_CREATE_RECEIPT_VERIFIER_HEX,
+            ])
             .arg("--store-database")
             .arg(store_database)
             .env("RENEE_TEST_BARRIER_DIRECTORY", &barrier_directory)
@@ -495,10 +525,14 @@ impl WebTransportConnection {
                 }
                 CapabilityErrorCode::Malformed => Ok(CreateDocumentObservation::Malformed),
                 CapabilityErrorCode::AuthorizationDenied => {
-                    Err(io::Error::other("unexpected create authorization denial").into())
+                    Ok(CreateDocumentObservation::AuthorizationDenied)
                 }
-                CapabilityErrorCode::RequestConflict | CapabilityErrorCode::CounterExhausted => {
-                    Err(io::Error::other("unexpected create control rejection").into())
+                CapabilityErrorCode::RequestConflict => {
+                    Ok(CreateDocumentObservation::RequestConflict)
+                }
+                CapabilityErrorCode::LimitExceeded => Ok(CreateDocumentObservation::LimitExceeded),
+                CapabilityErrorCode::CounterExhausted => {
+                    Err(io::Error::other("unexpected create counter exhaustion").into())
                 }
             },
             _unexpected => Err(io::Error::other("unexpected create response").into()),
@@ -563,13 +597,17 @@ impl WebTransportConnection {
     /// Enumerates one bounded page of public update metadata.
     pub async fn enumerate_updates(
         &self,
+        authority: &CapabilityAuthority,
         document_id: DocumentId,
         cursor: Option<Vec<u8>>,
     ) -> HarnessResult<EnumerateResponse> {
-        match self.enumerate_updates_observation(document_id, cursor).await? {
+        match self.enumerate_updates_observation(authority, document_id, cursor).await? {
             EnumerateObservation::Page(page) => Ok(page),
             EnumerateObservation::InvalidCursor => {
                 Err(io::Error::other("valid enumerate request received invalid-cursor").into())
+            }
+            EnumerateObservation::AuthorizationDenied => {
+                Err(io::Error::other("valid enumerate request was denied").into())
             }
         }
     }
@@ -577,39 +615,53 @@ impl WebTransportConnection {
     /// Enumerates while preserving an invalid-cursor protocol observation.
     pub async fn enumerate_updates_observation(
         &self,
+        authority: &CapabilityAuthority,
         document_id: DocumentId,
         cursor: Option<Vec<u8>>,
     ) -> HarnessResult<EnumerateObservation> {
         let start = cursor.map_or(EnumerateStart::Origin, EnumerateStart::Continue);
-        self.enumerate_updates_start_observation(document_id, start).await
+        self.enumerate_updates_start_observation(authority, document_id, start).await
     }
 
     /// Captures a new finite read strictly after one completed tail cursor.
     pub async fn enumerate_updates_after_tail(
         &self,
+        authority: &CapabilityAuthority,
         document_id: DocumentId,
         cursor: Vec<u8>,
     ) -> HarnessResult<EnumerateResponse> {
         match self
-            .enumerate_updates_start_observation(document_id, EnumerateStart::AfterTail(cursor))
+            .enumerate_updates_start_observation(
+                authority,
+                document_id,
+                EnumerateStart::AfterTail(cursor),
+            )
             .await?
         {
             EnumerateObservation::Page(page) => Ok(page),
             EnumerateObservation::InvalidCursor => {
                 Err(io::Error::other("valid tail cursor received invalid-cursor").into())
             }
+            EnumerateObservation::AuthorizationDenied => {
+                Err(io::Error::other("valid tail request was denied").into())
+            }
         }
     }
 
     async fn enumerate_updates_start_observation(
         &self,
+        authority: &CapabilityAuthority,
         document_id: DocumentId,
         start: EnumerateStart,
     ) -> HarnessResult<EnumerateObservation> {
         let response = self
             .exchange(
                 ENUMERATE_UPDATES,
-                encode_enumerate_request(&EnumerateRequest { document_id, start })?,
+                encode_enumerate_request(&EnumerateRequest {
+                    authority: authority.clone(),
+                    document_id,
+                    start,
+                })?,
             )
             .await?;
         match response.message_type {
@@ -621,6 +673,12 @@ impl WebTransportConnection {
             {
                 Ok(EnumerateObservation::InvalidCursor)
             }
+            UPDATE_ERROR
+                if decode_update_error(&response.payload)?
+                    == UpdateErrorCode::AuthorizationDenied =>
+            {
+                Ok(EnumerateObservation::AuthorizationDenied)
+            }
             _unexpected => Err(io::Error::other("unexpected enumerate response").into()),
         }
     }
@@ -628,11 +686,20 @@ impl WebTransportConnection {
     /// Fetches one exact opaque encrypted payload.
     pub async fn fetch_update(
         &self,
+        authority: &CapabilityAuthority,
         document_id: DocumentId,
         update_id: UpdateId,
     ) -> HarnessResult<FetchObservation> {
-        let response =
-            self.exchange(FETCH_UPDATE, encode_fetch_request(document_id, update_id)).await?;
+        let response = self
+            .exchange(
+                FETCH_UPDATE,
+                encode_fetch_request(&FetchRequest {
+                    authority: authority.clone(),
+                    document_id,
+                    update_id,
+                }),
+            )
+            .await?;
         match response.message_type {
             FETCH_UPDATE_RESPONSE => {
                 Ok(FetchObservation::Found(decode_fetch_response(&response.payload)?.to_vec()))
@@ -641,6 +708,12 @@ impl WebTransportConnection {
                 if decode_update_error(&response.payload)? == UpdateErrorCode::NotFound =>
             {
                 Ok(FetchObservation::NotFound)
+            }
+            UPDATE_ERROR
+                if decode_update_error(&response.payload)?
+                    == UpdateErrorCode::AuthorizationDenied =>
+            {
+                Ok(FetchObservation::AuthorizationDenied)
             }
             _unexpected => Err(io::Error::other("unexpected fetch response").into()),
         }
@@ -690,6 +763,7 @@ fn control_observation(
             }
             CapabilityErrorCode::RequestConflict => ControlMutationObservation::RequestConflict,
             CapabilityErrorCode::CounterExhausted => ControlMutationObservation::CounterExhausted,
+            CapabilityErrorCode::LimitExceeded => ControlMutationObservation::LimitExceeded,
         });
     }
     Err(io::Error::other("unexpected control mutation response").into())

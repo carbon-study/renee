@@ -74,6 +74,9 @@ struct ChildSpec {
 struct Configuration {
     bind_address: String,
     certificate: Option<PathBuf>,
+    create_authority_id: OsString,
+    create_live_verifier: OsString,
+    create_receipt_verifier: OsString,
     gatewayd: PathBuf,
     local_identity: PathBuf,
     private_key: Option<PathBuf>,
@@ -203,6 +206,10 @@ impl Configuration {
         let bind_address = take_required_utf8_or_default(&mut values, "--bind", "127.0.0.1:4433")?;
         let certificate = take_optional_path(&mut values, "--certificate");
         let private_key = take_optional_path(&mut values, "--private-key");
+        let create_authority_id = take_required_value(&mut values, "--create-authority-id")?;
+        let create_live_verifier = take_required_value(&mut values, "--create-live-verifier")?;
+        let create_receipt_verifier =
+            take_required_value(&mut values, "--create-receipt-verifier")?;
         let store_database = take_required_path(&mut values, "--store-database")?;
         let mut local_identity = store_database.as_os_str().to_owned();
         local_identity.push(".gateway-local-identity");
@@ -217,6 +224,9 @@ impl Configuration {
         Ok(Self {
             bind_address,
             certificate,
+            create_authority_id,
+            create_live_verifier,
+            create_receipt_verifier,
             gatewayd,
             local_identity: PathBuf::from(local_identity),
             private_key,
@@ -259,6 +269,12 @@ impl Configuration {
                     OsString::from("127.0.0.1:0"),
                     OsString::from("--database"),
                     self.store_database.as_os_str().to_owned(),
+                    OsString::from("--create-authority-id"),
+                    self.create_authority_id.clone(),
+                    OsString::from("--create-live-verifier"),
+                    self.create_live_verifier.clone(),
+                    OsString::from("--create-receipt-verifier"),
+                    self.create_receipt_verifier.clone(),
                 ],
                 executable: self.stored.clone(),
                 role: "stored",
@@ -287,6 +303,9 @@ impl Configuration {
         validate_executable("gatewayd", &self.gatewayd)?;
         validate_executable("sessiond", &self.sessiond)?;
         validate_executable("stored", &self.stored)?;
+        validate_hex_argument("--create-authority-id", &self.create_authority_id, 16)?;
+        validate_hex_argument("--create-live-verifier", &self.create_live_verifier, 32)?;
+        validate_hex_argument("--create-receipt-verifier", &self.create_receipt_verifier, 32)?;
         match (&self.certificate, &self.private_key) {
             (Some(certificate), Some(private_key)) => {
                 validate_file("gateway certificate", certificate)?;
@@ -322,6 +341,25 @@ impl Configuration {
             )),
         }
     }
+}
+
+fn validate_hex_argument(name: &str, value: &OsString, byte_length: usize) -> io::Result<()> {
+    let value = value.to_str().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("{name} value is not UTF-8"))
+    })?;
+    let encoded_length = byte_length.checked_mul(2).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} byte length cannot be represented"),
+        )
+    })?;
+    if value.len() != encoded_length || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be exactly {byte_length} hexadecimal bytes"),
+        ));
+    }
+    Ok(())
 }
 
 impl ManagedChild {
@@ -720,6 +758,15 @@ fn take_required_path(
     name: &'static str,
 ) -> io::Result<PathBuf> {
     values.remove(name).map(PathBuf::from).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("{name} requires a value"))
+    })
+}
+
+fn take_required_value(
+    values: &mut BTreeMap<String, OsString>,
+    name: &'static str,
+) -> io::Result<OsString> {
+    values.remove(name).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, format!("{name} requires a value"))
     })
 }

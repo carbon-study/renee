@@ -45,6 +45,10 @@ macro_rules! identifier {
 
 identifier!(DocumentId, "An opaque service-wide document identifier.");
 identifier!(CapabilityId, "An opaque capability identifier scoped to one document.");
+identifier!(
+    CreateAuthorityId,
+    "An opaque deployment-scoped document-creation authority identifier."
+);
 identifier!(RequestId, "An opaque idempotency request identifier.");
 identifier!(UpdateId, "An opaque immutable-update identifier scoped to one document.");
 identifier!(CheckpointId, "An opaque checkpoint identifier scoped to one document.");

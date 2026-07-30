@@ -10,7 +10,10 @@ use renee_types::{
     PublicLoroRanges, UpdateId, UpdateMetadata,
 };
 
-use crate::{MAX_APPLICATION_PAYLOAD_LENGTH, MAX_UPDATE_RECORD_LENGTH};
+use crate::{
+    CAPABILITY_AUTHORITY_LENGTH, CapabilityAuthority, MAX_APPLICATION_PAYLOAD_LENGTH,
+    MAX_UPDATE_RECORD_LENGTH,
+};
 
 /// Accept one exact encoded immutable-update record.
 pub const ACCEPT_UPDATE: u16 = 10;
@@ -70,10 +73,23 @@ pub enum UpdateErrorCode {
 /// One metadata enumeration cursor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnumerateRequest {
+    /// Capability claiming read authority.
+    pub authority: CapabilityAuthority,
     /// Return updates from this document.
     pub document_id: DocumentId,
     /// How this request establishes or resumes its finite read window.
     pub start: EnumerateStart,
+}
+
+/// One authorized opaque-update fetch request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FetchRequest {
+    /// Capability claiming read authority.
+    pub authority: CapabilityAuthority,
+    /// Document containing the immutable update.
+    pub document_id: DocumentId,
+    /// Document-scoped immutable update identifier.
+    pub update_id: UpdateId,
 }
 
 /// Starting point for one finite metadata enumeration window.
@@ -265,7 +281,9 @@ pub fn encode_enumerate_request(request: &EnumerateRequest) -> Result<Vec<u8>, U
         EnumerateStart::AfterTail(cursor) => (2, Some(cursor.as_slice())),
     };
     let cursor_length = cursor_length(cursor)?;
-    let mut payload = Vec::with_capacity(IDENTIFIER_LENGTH + 1 + 2 + cursor_length);
+    let mut payload =
+        Vec::with_capacity(CAPABILITY_AUTHORITY_LENGTH + IDENTIFIER_LENGTH + 1 + 2 + cursor_length);
+    encode_authority(&mut payload, &request.authority);
     payload.extend_from_slice(&request.document_id.into_bytes());
     payload.push(mode);
     let cursor_length =
@@ -280,6 +298,7 @@ pub fn encode_enumerate_request(request: &EnumerateRequest) -> Result<Vec<u8>, U
 /// Decodes a metadata enumeration request.
 pub fn decode_enumerate_request(payload: &[u8]) -> Result<EnumerateRequest, UpdateCodecError> {
     let mut decoder = Decoder::new(payload);
+    let authority = decoder.take_authority()?;
     let document_id = DocumentId::from_bytes(decoder.take_array()?);
     let mode = decoder.take_byte()?;
     let cursor_length = usize::from(u16::from_be_bytes(decoder.take_array()?));
@@ -290,7 +309,7 @@ pub fn decode_enumerate_request(payload: &[u8]) -> Result<EnumerateRequest, Upda
         _invalid => return Err(UpdateCodecError::InvalidCursor),
     };
     decoder.finish()?;
-    Ok(EnumerateRequest { document_id, start: cursor })
+    Ok(EnumerateRequest { authority, document_id, start: cursor })
 }
 
 /// Encodes an opaque cursor after one accepted update.
@@ -456,21 +475,28 @@ pub fn enumerate_response_base_length(cursor: Option<&[u8]>) -> Result<usize, Up
         .ok_or(UpdateCodecError::IntegerOutOfRange)
 }
 
-/// Encodes a fetch request under the full idempotency key.
-pub fn encode_fetch_request(document_id: DocumentId, update_id: UpdateId) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(IDENTIFIER_LENGTH * 2);
-    payload.extend_from_slice(&document_id.into_bytes());
-    payload.extend_from_slice(&update_id.into_bytes());
+/// Encodes one authorized fetch request under the full idempotency key.
+pub fn encode_fetch_request(request: &FetchRequest) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(CAPABILITY_AUTHORITY_LENGTH + IDENTIFIER_LENGTH * 2);
+    encode_authority(&mut payload, &request.authority);
+    payload.extend_from_slice(&request.document_id.into_bytes());
+    payload.extend_from_slice(&request.update_id.into_bytes());
     payload
 }
 
-/// Decodes a fetch request under the full idempotency key.
-pub fn decode_fetch_request(payload: &[u8]) -> Result<(DocumentId, UpdateId), UpdateCodecError> {
+/// Decodes one authorized fetch request under the full idempotency key.
+pub fn decode_fetch_request(payload: &[u8]) -> Result<FetchRequest, UpdateCodecError> {
     let mut decoder = Decoder::new(payload);
+    let authority = decoder.take_authority()?;
     let document_id = DocumentId::from_bytes(decoder.take_array()?);
     let update_id = UpdateId::from_bytes(decoder.take_array()?);
     decoder.finish()?;
-    Ok((document_id, update_id))
+    Ok(FetchRequest { authority, document_id, update_id })
+}
+
+fn encode_authority(encoded: &mut Vec<u8>, authority: &CapabilityAuthority) {
+    encoded.extend_from_slice(&authority.capability_id.into_bytes());
+    encoded.extend_from_slice(authority.authenticator.as_bytes());
 }
 
 /// Encodes the opaque encrypted payload without inspecting it.
@@ -559,6 +585,13 @@ impl<'bytes> Decoder<'bytes> {
 
     fn take_array<const LENGTH: usize>(&mut self) -> Result<[u8; LENGTH], UpdateCodecError> {
         self.take(LENGTH)?.try_into().map_err(|_error| UpdateCodecError::Truncated)
+    }
+
+    fn take_authority(&mut self) -> Result<CapabilityAuthority, UpdateCodecError> {
+        Ok(CapabilityAuthority {
+            capability_id: renee_types::CapabilityId::from_bytes(self.take_array()?),
+            authenticator: renee_types::Authenticator::from_bytes(self.take_array()?),
+        })
     }
 
     fn take_byte(&mut self) -> Result<u8, UpdateCodecError> {
@@ -761,7 +794,14 @@ mod tests {
             EnumerateStart::Continue(cursor.clone()),
             EnumerateStart::AfterTail(cursor.clone()),
         ] {
-            let request = EnumerateRequest { document_id: record.document_id(), start };
+            let request = EnumerateRequest {
+                authority: CapabilityAuthority {
+                    capability_id: renee_types::CapabilityId::from_bytes([0x71; 16]),
+                    authenticator: renee_types::Authenticator::from_bytes([0x72; 32]),
+                },
+                document_id: record.document_id(),
+                start,
+            };
             assert_eq!(
                 decode_enumerate_request(
                     &encode_enumerate_request(&request).expect("request must encode")
