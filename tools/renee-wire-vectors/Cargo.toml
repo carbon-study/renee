@@ -1,0 +1,20 @@
+[package]
+name = "renee-wire-vectors"
+description = "Golden wire-vector generator for Renee clients"
+keywords = ["protocol", "serialization", "testing"]
+categories = ["development-tools::testing", "encoding"]
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+renee-types = { path = "../../crates/renee-types" }
+renee-wire = { path = "../../crates/renee-wire" }
+
+[lints]
+workspace = true

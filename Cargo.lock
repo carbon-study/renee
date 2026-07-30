@@ -826,6 +826,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "renee-wire-vectors"
+version = "0.0.0"
+dependencies = [
+ "renee-types",
+ "renee-wire",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

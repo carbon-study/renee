@@ -9,6 +9,7 @@ members = [
   "crates/renee-supervisord",
   "crates/renee-types",
   "crates/renee-wire",
+  "tools/renee-wire-vectors",
 ]
 resolver = "3"
 
