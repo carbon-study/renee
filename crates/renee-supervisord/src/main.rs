@@ -75,6 +75,7 @@ struct Configuration {
     bind_address: String,
     certificate: Option<PathBuf>,
     gatewayd: PathBuf,
+    local_identity: PathBuf,
     private_key: Option<PathBuf>,
     sessiond: PathBuf,
     shutdown_on_stdin_eof: bool,
@@ -120,7 +121,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 async fn run() -> Result<(), Box<dyn Error>> {
     let configuration = Configuration::from_args()?;
     configuration.validate()?;
-    let specifications = configuration.child_specs();
+    let mut specifications = configuration.child_specs();
     let shutdown = wait_for_shutdown(configuration.shutdown_on_stdin_eof);
     tokio::pin!(shutdown);
     let mut first_start = true;
@@ -132,7 +133,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             shutdown_result = &mut shutdown => {
                 return shutdown_result.map_err(Into::into);
             }
-            group = start_group(&specifications) => group,
+            group = start_group(&mut specifications) => group,
         };
         emit_group_readiness(&group, first_start);
         first_start = false;
@@ -203,6 +204,8 @@ impl Configuration {
         let certificate = take_optional_path(&mut values, "--certificate");
         let private_key = take_optional_path(&mut values, "--private-key");
         let store_database = take_required_path(&mut values, "--store-database")?;
+        let mut local_identity = store_database.as_os_str().to_owned();
+        local_identity.push(".gateway-local-identity.pem");
         if let Some((unknown, _value)) = values.first_key_value() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -215,6 +218,7 @@ impl Configuration {
             bind_address,
             certificate,
             gatewayd,
+            local_identity: PathBuf::from(local_identity),
             private_key,
             sessiond,
             shutdown_on_stdin_eof,
@@ -232,6 +236,11 @@ impl Configuration {
                 certificate.as_os_str().to_owned(),
                 OsString::from("--private-key"),
                 private_key.as_os_str().to_owned(),
+            ]);
+        } else {
+            gateway_arguments.extend([
+                OsString::from("--local-identity"),
+                self.local_identity.as_os_str().to_owned(),
             ]);
         }
         gateway_arguments
@@ -380,7 +389,7 @@ impl RestartBudget {
     }
 }
 
-async fn start_group(specifications: &[ChildSpec]) -> RunningGroup {
+async fn start_group(specifications: &mut [ChildSpec]) -> RunningGroup {
     // Startup dependency failure is recoverable after configuration paths have
     // been validated. A role receives its normal retry budget; exhaustion
     // drains any already-started earlier roles and retries the complete group.
@@ -390,7 +399,7 @@ async fn start_group(specifications: &[ChildSpec]) -> RunningGroup {
         let mut group_failed = false;
         let mut store_address = None;
 
-        for specification in specifications {
+        for specification in specifications.iter_mut() {
             let mut active_spec = specification.clone();
             if active_spec.role == "gatewayd" {
                 let Some(address) = store_address.as_ref() else {
@@ -408,13 +417,18 @@ async fn start_group(specifications: &[ChildSpec]) -> RunningGroup {
             loop {
                 match spawn_ready_child(&active_spec).await {
                     Ok((child, record)) => {
-                        if active_spec.role == "stored" {
-                            let Some(address) = readiness_field(&record, "address") else {
+                        match stabilize_ready_child(&record, &mut active_spec, specification) {
+                            Ok(address) => {
+                                if address.is_some() {
+                                    store_address = address;
+                                }
+                            }
+                            Err(error) => {
                                 drop(child);
                                 write_diagnostic(
                                     active_spec.role,
-                                    "readiness-address-missing",
-                                    io::ErrorKind::InvalidData,
+                                    "readiness-normalization-failed",
+                                    error.kind(),
                                 );
                                 if !budget.record_failure() {
                                     group_failed = true;
@@ -422,25 +436,7 @@ async fn start_group(specifications: &[ChildSpec]) -> RunningGroup {
                                 }
                                 tokio::time::sleep(RESTART_DELAY).await;
                                 continue;
-                            };
-                            // Port zero is resolved exactly once per group.
-                            // The concrete address becomes both stored's stable
-                            // restart bind and gateway/sessiond's dependency.
-                            if !replace_argument_value(
-                                &mut active_spec.arguments,
-                                "--bind",
-                                OsString::from(address),
-                            ) {
-                                drop(child);
-                                write_diagnostic(
-                                    active_spec.role,
-                                    "restart-bind-argument-missing",
-                                    io::ErrorKind::InvalidData,
-                                );
-                                group_failed = true;
-                                break;
                             }
-                            store_address = Some(address.to_owned());
                         }
                         let role = active_spec.role;
                         let managed = ManagedChild::from_started(active_spec, child, budget);
@@ -470,6 +466,39 @@ async fn start_group(specifications: &[ChildSpec]) -> RunningGroup {
         shutdown_children(&mut children).await;
         emit_event("RESTARTING supervisord-child-group");
         tokio::time::sleep(GROUP_RESTART_DELAY).await;
+    }
+}
+
+fn stabilize_ready_child(
+    readiness: &str,
+    active: &mut ChildSpec,
+    original: &mut ChildSpec,
+) -> io::Result<Option<String>> {
+    let address = readiness_field(readiness, "address")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "readiness omitted address"))?
+        .to_owned();
+    let address_argument = OsString::from(&address);
+    if !replace_argument_value(&mut active.arguments, "--bind", address_argument.clone()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "child specification omitted its bind argument",
+        ));
+    }
+    match active.role {
+        "stored" => Ok(Some(address)),
+        "gatewayd" => {
+            // Resolve port zero only once for the supervisor lifetime. The
+            // active specification stabilizes single-child replacement; the
+            // original stabilizes every later whole-group generation.
+            if !replace_argument_value(&mut original.arguments, "--bind", address_argument) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "gateway specification omitted its bind argument",
+                ));
+            }
+            Ok(None)
+        }
+        _role => Ok(None),
     }
 }
 

@@ -245,7 +245,7 @@ impl ServerHarness {
         let replacement_pid = parse_pid(&fields, &format!("{role}-pid"))?;
         self.permanent_child_pids.insert(role, replacement_pid);
         if daemon == PermanentDaemon::Gateway {
-            self.update_gateway(&fields)?;
+            self.verify_gateway(&fields)?;
         }
         self.ensure_process_tree_is_running()?;
         Ok(())
@@ -274,7 +274,7 @@ impl ServerHarness {
         let fields = parse_group_restart(&event)?;
         self.permanent_child_pids.insert("gatewayd", parse_pid(&fields, "gatewayd-pid")?);
         self.permanent_child_pids.insert("stored", parse_pid(&fields, "stored-pid")?);
-        self.update_gateway(&fields)?;
+        self.verify_gateway(&fields)?;
         self.ensure_process_tree_is_running()?;
         Ok(())
     }
@@ -313,17 +313,23 @@ impl ServerHarness {
         Ok(())
     }
 
-    fn update_gateway(&mut self, fields: &BTreeMap<&str, &str>) -> HarnessResult<()> {
-        self.address = fields
+    fn verify_gateway(&self, fields: &BTreeMap<&str, &str>) -> HarnessResult<()> {
+        let address = fields
             .get("address")
             .ok_or_else(|| io::Error::other("gateway event omitted address"))?
             .to_string();
-        self.certificate_hash = Sha256Digest::from_str_fmt(
+        let certificate_hash = Sha256Digest::from_str_fmt(
             fields
                 .get("certificate-sha256")
                 .ok_or_else(|| io::Error::other("gateway event omitted certificate hash"))?,
             Sha256DigestFmt::DottedHex,
         )?;
+        if address != self.address || certificate_hash != self.certificate_hash {
+            return Err(io::Error::other(
+                "gateway restart changed its public endpoint or TLS identity",
+            )
+            .into());
+        }
         Ok(())
     }
 }

@@ -30,6 +30,7 @@ const STREAM_EOF_TIMEOUT: Duration = Duration::from_secs(2);
 struct Configuration {
     bind_address: SocketAddr,
     certificate: Option<PathBuf>,
+    local_identity: Option<PathBuf>,
     private_key: Option<PathBuf>,
     sessiond: PathBuf,
     store_address: SocketAddr,
@@ -89,6 +90,7 @@ impl Configuration {
         let mut arguments = env::args_os().skip(1);
         let mut bind_address = OsString::from(DEFAULT_BIND_ADDRESS);
         let mut certificate = None;
+        let mut local_identity = None;
         let mut private_key = None;
         let mut sessiond = None;
         let mut store_address = OsString::from(DEFAULT_STORE_ADDRESS);
@@ -103,6 +105,7 @@ impl Configuration {
             match argument.as_str() {
                 "--bind" => bind_address = value,
                 "--certificate" => certificate = Some(PathBuf::from(value)),
+                "--local-identity" => local_identity = Some(PathBuf::from(value)),
                 "--private-key" => private_key = Some(PathBuf::from(value)),
                 "--sessiond" => sessiond = Some(PathBuf::from(value)),
                 "--store" => store_address = value,
@@ -122,12 +125,12 @@ impl Configuration {
                 io::Error::new(io::ErrorKind::InvalidInput, "--bind value is not UTF-8")
             })?
             .parse()?;
-        match (&certificate, &private_key) {
-            (Some(_), Some(_)) | (None, None) => {}
+        match (&certificate, &private_key, &local_identity) {
+            (Some(_), Some(_), None) | (None, None, Some(_) | None) => {}
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "--certificate and --private-key must be provided together",
+                    "use either --certificate with --private-key or --local-identity",
                 )
                 .into());
             }
@@ -145,7 +148,7 @@ impl Configuration {
                 io::Error::new(io::ErrorKind::InvalidInput, "--store value is not UTF-8")
             })?
             .parse()?;
-        Ok(Self { bind_address, certificate, private_key, sessiond, store_address })
+        Ok(Self { bind_address, certificate, local_identity, private_key, sessiond, store_address })
     }
 
     fn validate(&self) -> io::Result<()> {
@@ -159,19 +162,65 @@ impl Configuration {
     }
 
     async fn identity(&self) -> Result<Identity, Box<dyn Error>> {
-        match (&self.certificate, &self.private_key) {
+        match (&self.certificate, &self.private_key, &self.local_identity) {
             // Production-like runs supply a stable identity so a gateway
             // restart does not change the certificate clients pin.
-            (Some(certificate), Some(private_key)) => {
+            (Some(certificate), Some(private_key), None) => {
                 Ok(Identity::load_pemfiles(certificate, private_key).await?)
+            }
+            // Supervisord supplies one durable path for its local self-signed
+            // identity. The complete PEM bundle is atomically published before
+            // readiness, so every replacement loads the exact same keypair.
+            (None, None, Some(local_identity)) => {
+                load_or_create_local_identity(local_identity).await
             }
             // The generated identity is a local-development fallback. Its hash
             // is reported in readiness so the harness can pin it explicitly;
             // it is expected to change when this process restarts.
-            (None, None) => Ok(Identity::self_signed(["localhost", "127.0.0.1", "::1"])?),
+            (None, None, None) => Ok(Identity::self_signed(["localhost", "127.0.0.1", "::1"])?),
             _ => Err(io::Error::other("gateway identity configuration is inconsistent").into()),
         }
     }
+}
+
+async fn load_or_create_local_identity(path: &Path) -> Result<Identity, Box<dyn Error>> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.is_file() => {
+            return Ok(Identity::load_pemfiles(path, path).await?);
+        }
+        Ok(_metadata) => {
+            return Err(io::Error::other("gateway local identity is not a file").into());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let identity = Identity::self_signed(["localhost", "127.0.0.1", "::1"])?;
+    let mut bundle = String::new();
+    for certificate in identity.certificate_chain().as_slice() {
+        bundle.push_str(&certificate.to_pem());
+    }
+    bundle.push_str(&identity.private_key().to_secret_pem());
+
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(format!(".{}.tmp", std::process::id()));
+    let temporary = PathBuf::from(temporary);
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temporary).await?;
+    file.write_all(bundle.as_bytes()).await?;
+    file.sync_all().await?;
+    drop(file);
+    if let Err(error) = tokio::fs::rename(&temporary, path).await {
+        drop(tokio::fs::remove_file(&temporary).await);
+        return Err(error.into());
+    }
+    Ok(identity)
 }
 
 fn validate_executable(role: &'static str, executable: &Path) -> io::Result<()> {
