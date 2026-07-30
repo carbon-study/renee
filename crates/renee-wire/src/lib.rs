@@ -43,6 +43,10 @@ pub const CLIENT_HELLO: u16 = 1;
 pub const SERVER_HELLO: u16 = 2;
 /// Explicit protocol rejection.
 pub const PROTOCOL_ERROR: u16 = 3;
+/// Fetches the signed current/next WebTransport certificate manifest.
+pub const CERTIFICATE_MANIFEST: u16 = 4;
+/// Returns the signed current/next WebTransport certificate manifest.
+pub const CERTIFICATE_MANIFEST_RESPONSE: u16 = 5;
 /// Negotiation rejection payload for an unknown envelope version.
 pub const ERROR_UNSUPPORTED_VERSION: &[u8] = b"unsupported-version";
 /// Negotiation rejection payload for an unknown profile.

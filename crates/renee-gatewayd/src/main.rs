@@ -5,6 +5,11 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(debug_assertions)]
+mod identity;
+#[cfg(debug_assertions)]
+mod test_barrier;
+
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
@@ -15,12 +20,20 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+#[cfg(debug_assertions)]
+use renee_wire::{
+    CERTIFICATE_MANIFEST, CERTIFICATE_MANIFEST_RESPONSE, Envelope, VERSION, decode_body,
+    encode_body,
+};
 use renee_wire::{read_body, write_body};
+#[cfg(debug_assertions)]
+use std::sync::Arc;
+#[cfg(debug_assertions)]
+use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use wtransport::endpoint::IncomingSession;
 use wtransport::stream::BiStream;
-use wtransport::tls::Sha256DigestFmt;
 use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:4433";
@@ -36,29 +49,44 @@ struct Configuration {
     store_address: SocketAddr,
 }
 
+struct GatewayIdentity {
+    transport: Identity,
+    rotation_delay: Option<Duration>,
+    #[cfg(debug_assertions)]
+    control_public_key: [u8; 32],
+    #[cfg(debug_assertions)]
+    manifest: Vec<u8>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let configuration = Configuration::from_args()?;
     configuration.validate()?;
-    let identity = configuration.identity().await?;
-    let certificate_hash = identity
-        .certificate_chain()
-        .as_slice()
-        .first()
-        .ok_or_else(|| io::Error::other("generated identity has no certificate"))?
-        .hash()
-        .fmt(Sha256DigestFmt::DottedHex);
+    let prepared = configuration.identity().await?;
+    #[cfg(debug_assertions)]
+    let debug_readiness = format!(
+        " certificate-sha256={} control-public-key={} certificate-manifest={}",
+        identity::certificate_hash(&prepared.transport)?,
+        identity::encode_hex(&prepared.control_public_key),
+        identity::encode_hex(&prepared.manifest),
+    );
+    #[cfg(debug_assertions)]
+    let manifest = Arc::<[u8]>::from(prepared.manifest);
+    let rotation_delay = prepared.rotation_delay;
     let config = ServerConfig::builder()
         .with_bind_address(configuration.bind_address)
-        .with_identity(identity)
+        .with_identity(prepared.transport)
         .build();
     let endpoint = Endpoint::server(config)?;
     let local_address = endpoint.local_addr()?;
 
-    emit_readiness(&format!(
-        "READY gatewayd address={local_address} certificate-sha256={certificate_hash}"
-    ))?;
+    #[cfg(debug_assertions)]
+    emit_readiness(&format!("READY gatewayd address={local_address}{debug_readiness}"))?;
+    #[cfg(not(debug_assertions))]
+    emit_readiness(&format!("READY gatewayd address={local_address}"))?;
 
+    let rotation = wait_for_rotation(rotation_delay);
+    tokio::pin!(rotation);
     let mut stdin = tokio::io::stdin();
     let mut parent_byte = [0_u8; 1];
 
@@ -67,8 +95,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             incoming = endpoint.accept() => {
                 let sessiond = configuration.sessiond.clone();
                 let store_address = configuration.store_address;
+                #[cfg(debug_assertions)]
+                let manifest = Arc::clone(&manifest);
                 tokio::spawn(async move {
-                    let _session_result = hold_session(incoming, sessiond, store_address).await;
+                    let _session_result =
+                        hold_session(
+                            incoming,
+                            sessiond,
+                            store_address,
+                            #[cfg(debug_assertions)]
+                            manifest,
+                        ).await;
                 });
             }
             read = stdin.read(&mut parent_byte) => {
@@ -77,6 +114,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             signal = tokio::signal::ctrl_c() => {
                 signal?;
+                break;
+            }
+            () = &mut rotation => {
+                // The replacement process loads the already-advertised next
+                // leaf and publishes a newly signed successor manifest.
                 break;
             }
         }
@@ -161,66 +203,43 @@ impl Configuration {
         validate_executable("sessiond", &self.sessiond)
     }
 
-    async fn identity(&self) -> Result<Identity, Box<dyn Error>> {
+    async fn identity(&self) -> Result<GatewayIdentity, Box<dyn Error>> {
         match (&self.certificate, &self.private_key, &self.local_identity) {
-            // Production-like runs supply a stable identity so a gateway
-            // restart does not change the certificate clients pin.
-            (Some(certificate), Some(private_key), None) => {
-                Ok(Identity::load_pemfiles(certificate, private_key).await?)
-            }
-            // Supervisord supplies one durable path for its local self-signed
-            // identity. The complete PEM bundle is atomically published before
-            // readiness, so every replacement loads the exact same keypair.
+            #[cfg(debug_assertions)]
+            (Some(_), Some(_), None) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "debug gateways use --local-identity certificate advertising",
+            )
+            .into()),
+            #[cfg(not(debug_assertions))]
+            (Some(certificate), Some(private_key), None) => Ok(GatewayIdentity {
+                rotation_delay: None,
+                transport: Identity::load_pemfiles(certificate, private_key).await?,
+            }),
+            #[cfg(debug_assertions)]
             (None, None, Some(local_identity)) => {
-                load_or_create_local_identity(local_identity).await
+                let prepared = identity::prepare(local_identity, OffsetDateTime::now_utc()).await?;
+                Ok(GatewayIdentity {
+                    control_public_key: prepared.control_public_key,
+                    manifest: prepared.manifest,
+                    rotation_delay: Some(prepared.rotation_delay),
+                    transport: prepared.transport,
+                })
             }
-            // The generated identity is a local-development fallback. Its hash
-            // is reported in readiness so the harness can pin it explicitly;
-            // it is expected to change when this process restarts.
-            (None, None, None) => Ok(Identity::self_signed(["localhost", "127.0.0.1", "::1"])?),
+            #[cfg(not(debug_assertions))]
+            (None, None, Some(_)) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "--local-identity is available only in debug builds",
+            )
+            .into()),
+            (None, None, None) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "gateway requires a configured TLS identity",
+            )
+            .into()),
             _ => Err(io::Error::other("gateway identity configuration is inconsistent").into()),
         }
     }
-}
-
-async fn load_or_create_local_identity(path: &Path) -> Result<Identity, Box<dyn Error>> {
-    match tokio::fs::metadata(path).await {
-        Ok(metadata) if metadata.is_file() => {
-            return Ok(Identity::load_pemfiles(path, path).await?);
-        }
-        Ok(_metadata) => {
-            return Err(io::Error::other("gateway local identity is not a file").into());
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let identity = Identity::self_signed(["localhost", "127.0.0.1", "::1"])?;
-    let mut bundle = String::new();
-    for certificate in identity.certificate_chain().as_slice() {
-        bundle.push_str(&certificate.to_pem());
-    }
-    bundle.push_str(&identity.private_key().to_secret_pem());
-
-    let mut temporary = path.as_os_str().to_owned();
-    temporary.push(format!(".{}.tmp", std::process::id()));
-    let temporary = PathBuf::from(temporary);
-    let mut options = tokio::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(&temporary).await?;
-    file.write_all(bundle.as_bytes()).await?;
-    file.sync_all().await?;
-    drop(file);
-    if let Err(error) = tokio::fs::rename(&temporary, path).await {
-        drop(tokio::fs::remove_file(&temporary).await);
-        return Err(error.into());
-    }
-    Ok(identity)
 }
 
 fn validate_executable(role: &'static str, executable: &Path) -> io::Result<()> {
@@ -251,12 +270,19 @@ async fn hold_session(
     incoming: IncomingSession,
     sessiond: PathBuf,
     store_address: SocketAddr,
+    #[cfg(debug_assertions)] manifest: Arc<[u8]>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let request = incoming.await?;
     let connection = request.accept().await?;
     let mut session = spawn_session(sessiond, store_address).await?;
 
-    let relay_result = relay_session(&connection, &mut session).await;
+    let relay_result = relay_session(
+        &connection,
+        &mut session,
+        #[cfg(debug_assertions)]
+        &manifest,
+    )
+    .await;
     let shutdown_result = shutdown_session(session).await;
     // Teardown was already attempted above. Preserve the relay failure as the
     // primary cause when both the session and its cleanup fail.
@@ -267,6 +293,7 @@ async fn hold_session(
 async fn relay_session(
     connection: &Connection,
     session: &mut SessionProcess,
+    #[cfg(debug_assertions)] manifest: &[u8],
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     loop {
         tokio::select! {
@@ -282,6 +309,13 @@ async fn relay_session(
                     continue;
                 };
                 require_request_eof(&mut stream).await?;
+                #[cfg(debug_assertions)]
+                test_barrier::checkpoint("gateway-request-admitted").await?;
+                #[cfg(debug_assertions)]
+                if let Some(response) = certificate_manifest_response(&body, manifest)? {
+                    write_body(&mut stream, &response).await?;
+                    continue;
+                }
                 write_body(&mut session.input, &body).await?;
                 let response = read_body(&mut session.output)
                     .await?
@@ -293,6 +327,30 @@ async fn relay_session(
         }
     }
     Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn certificate_manifest_response(body: &[u8], manifest: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    let Ok(request) = decode_body(body) else {
+        return Ok(None);
+    };
+    if request.version != VERSION || request.message_type != CERTIFICATE_MANIFEST {
+        return Ok(None);
+    }
+    encode_body(&Envelope {
+        correlation_id: request.correlation_id,
+        message_type: CERTIFICATE_MANIFEST_RESPONSE,
+        payload: manifest.to_vec(),
+        version: VERSION,
+    })
+    .map(Some)
+}
+
+async fn wait_for_rotation(delay: Option<Duration>) {
+    match delay {
+        Some(delay) => tokio::time::sleep(delay).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 async fn require_request_eof(stream: &mut BiStream) -> io::Result<()> {

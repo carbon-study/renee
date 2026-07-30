@@ -767,6 +767,8 @@ name = "renee-gatewayd"
 version = "0.0.0"
 dependencies = [
  "renee-wire",
+ "ring",
+ "time",
  "tokio",
  "wtransport",
 ]
@@ -831,6 +833,7 @@ version = "0.0.0"
 dependencies = [
  "renee-types",
  "renee-wire",
+ "ring",
 ]
 
 [[package]]

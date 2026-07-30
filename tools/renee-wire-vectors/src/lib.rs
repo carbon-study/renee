@@ -13,8 +13,9 @@ use renee_types::{
     UpdateMetadata,
 };
 use renee_wire::{
-    ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor, CLIENT_HELLO,
-    ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, ERROR_ALREADY_NEGOTIATED, ERROR_EXPECTED_HELLO,
+    ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor,
+    CERTIFICATE_MANIFEST, CERTIFICATE_MANIFEST_RESPONSE, CLIENT_HELLO, ENUMERATE_UPDATES,
+    ENUMERATE_UPDATES_RESPONSE, ERROR_ALREADY_NEGOTIATED, ERROR_EXPECTED_HELLO,
     ERROR_MALFORMED_HELLO, ERROR_UNSUPPORTED_PROFILE, ERROR_UNSUPPORTED_VERSION, EnumerateRequest,
     EnumerateResponse, EnumerateStart, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE,
     MAX_APPLICATION_PAYLOAD_LENGTH, PROFILE, PROTOCOL_ERROR, SERVER_HELLO, UPDATE_ERROR,
@@ -23,6 +24,7 @@ use renee_wire::{
     encode_fetch_response, encode_frame, encode_greeting, encode_update_error,
     encode_update_record,
 };
+use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
 const CARBON_BANNER: &str = "I couldn't stay away";
 const RENEE_BANNER: &str = "I've been expecting you";
@@ -71,6 +73,7 @@ pub fn generate() -> Result<String, GenerateError> {
         public_loro_ranges: update.public_loro_ranges().clone(),
         update_id,
     };
+    let (certificate_manifest, control_public_key) = certificate_manifest_fixture()?;
 
     let mut frames = vec![
         frame(
@@ -86,6 +89,20 @@ pub fn generate() -> Result<String, GenerateError> {
             SERVER_HELLO,
             0x11,
             encode_greeting(PROFILE, RENEE_BANNER)?,
+        )?,
+        frame(
+            "certificate-manifest.request",
+            "credentials",
+            CERTIFICATE_MANIFEST,
+            0x18,
+            Vec::new(),
+        )?,
+        frame(
+            "certificate-manifest.response",
+            "credentials",
+            CERTIFICATE_MANIFEST_RESPONSE,
+            0x18,
+            certificate_manifest.clone(),
         )?,
         frame("accept.request", "accept", ACCEPT_UPDATE, 0x22, record)?,
         frame(
@@ -222,7 +239,36 @@ pub fn generate() -> Result<String, GenerateError> {
         GenerateError::new("golden frame corpus unexpectedly has no first vector")
     })?)?;
 
-    Ok(render(&frames, &invalid_payloads, &invalid_frames))
+    Ok(render(
+        &frames,
+        &invalid_payloads,
+        &invalid_frames,
+        &control_public_key,
+        &certificate_manifest,
+    ))
+}
+
+fn certificate_manifest_fixture() -> Result<(Vec<u8>, [u8; 32]), GenerateError> {
+    let control = Ed25519KeyPair::from_seed_unchecked(&[0x7a; 32])
+        .map_err(|_error| GenerateError::new("fixed Ed25519 control key is invalid"))?;
+    let control_public_key =
+        control.public_key().as_ref().try_into().map_err(|_error| {
+            GenerateError::new("fixed Ed25519 public key has an invalid length")
+        })?;
+    let mut manifest = Vec::with_capacity(178);
+    manifest.extend_from_slice(b"RNECERT\0");
+    manifest.extend_from_slice(&1_u16.to_be_bytes());
+    encode_certificate_epoch(&mut manifest, 1, 2_000_000_000, 0x11);
+    encode_certificate_epoch(&mut manifest, 2, 2_000_604_800, 0x22);
+    manifest.extend_from_slice(control.sign(&manifest).as_ref());
+    Ok((manifest, control_public_key))
+}
+
+fn encode_certificate_epoch(encoded: &mut Vec<u8>, epoch: u32, not_before: i64, hash_byte: u8) {
+    encoded.extend_from_slice(&epoch.to_be_bytes());
+    encoded.extend_from_slice(&not_before.to_be_bytes());
+    encoded.extend_from_slice(&(not_before + 1_209_600).to_be_bytes());
+    encoded.extend(core::iter::repeat_n(hash_byte, 32));
 }
 
 fn fixture_update(
@@ -338,12 +384,19 @@ fn render(
     frames: &[FrameVector],
     invalid_payloads: &[InvalidPayloadVector],
     invalid_frames: &[InvalidFrameVector],
+    control_public_key: &[u8],
+    certificate_manifest: &[u8],
 ) -> String {
     let mut output = String::new();
     output.push_str("{\n  \"schema\": \"");
     output.push_str(SCHEMA);
     output.push_str("\",\n  \"max_body_length\": 4096,\n");
     output.push_str("  \"max_application_payload_length\": 4072,\n");
+    output.push_str("  \"certificate_control_public_key_hex\": \"");
+    output.push_str(&hex(control_public_key));
+    output.push_str("\",\n  \"certificate_manifest_hex\": \"");
+    output.push_str(&hex(certificate_manifest));
+    output.push_str("\",\n");
     output.push_str("  \"frames\": [\n");
     for (index, vector) in frames.iter().enumerate() {
         render_frame(&mut output, vector, "    ");

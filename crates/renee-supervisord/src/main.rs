@@ -205,7 +205,7 @@ impl Configuration {
         let private_key = take_optional_path(&mut values, "--private-key");
         let store_database = take_required_path(&mut values, "--store-database")?;
         let mut local_identity = store_database.as_os_str().to_owned();
-        local_identity.push(".gateway-local-identity.pem");
+        local_identity.push(".gateway-local-identity");
         if let Some((unknown, _value)) = values.first_key_value() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -290,9 +290,32 @@ impl Configuration {
         match (&self.certificate, &self.private_key) {
             (Some(certificate), Some(private_key)) => {
                 validate_file("gateway certificate", certificate)?;
-                validate_file("gateway private key", private_key)
+                validate_file("gateway private key", private_key)?;
+                #[cfg(debug_assertions)]
+                {
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "debug gateways use local certificate advertising",
+                    ))
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    Ok(())
+                }
             }
-            (None, None) => Ok(()),
+            (None, None) => {
+                #[cfg(debug_assertions)]
+                {
+                    Ok(())
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "release gateways require --certificate and --private-key",
+                    ))
+                }
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "--certificate and --private-key must be provided together",

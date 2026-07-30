@@ -15,6 +15,7 @@ version.workspace = true
 [dependencies]
 renee-types = { path = "../../crates/renee-types" }
 renee-wire = { path = "../../crates/renee-wire" }
+ring.workspace = true
 
 [lints]
 workspace = true

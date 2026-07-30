@@ -123,10 +123,22 @@ impl DurableUpdateStore {
     }
 
     /// Commits a first acceptance or resolves an exact/conflicting retry.
+    #[cfg(test)]
     pub fn accept(
         &mut self,
         update: &ImmutableUpdate,
         encoded_record: &[u8],
+    ) -> Result<StoreAcceptOutcome, StoreError> {
+        self.accept_with_test_barriers(update, encoded_record, || Ok(()), || Ok(()))
+    }
+
+    /// Exposes daemon-owned barriers around commit and exact retry resolution.
+    pub fn accept_with_test_barriers(
+        &mut self,
+        update: &ImmutableUpdate,
+        encoded_record: &[u8],
+        before_commit: impl FnOnce() -> Result<(), StoreError>,
+        before_exact_retry: impl FnOnce() -> Result<(), StoreError>,
     ) -> Result<StoreAcceptOutcome, StoreError> {
         let document_id = update.document_id().into_bytes();
         let update_id = update.update_id().into_bytes();
@@ -143,6 +155,7 @@ impl DurableUpdateStore {
             .optional()?;
         if let Some(existing) = existing {
             return if existing == encoded_record {
+                before_exact_retry()?;
                 Ok(StoreAcceptOutcome::AlreadyPresent)
             } else {
                 Ok(StoreAcceptOutcome::IdentifierConflict)
@@ -184,6 +197,7 @@ impl DurableUpdateStore {
                 encoded_record,
             ],
         )?;
+        before_commit()?;
         transaction.commit()?;
         Ok(StoreAcceptOutcome::Inserted)
     }

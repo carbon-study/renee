@@ -14,6 +14,8 @@ version.workspace = true
 
 [dependencies]
 renee-wire = { path = "../renee-wire" }
+ring.workspace = true
+time.workspace = true
 tokio.workspace = true
 wtransport.workspace = true
 
