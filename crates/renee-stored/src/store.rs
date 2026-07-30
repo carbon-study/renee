@@ -787,10 +787,27 @@ impl DurableUpdateStore {
         }
         #[cfg(feature = "conformance")]
         after_authorization()?;
+        let Some(revision) = next_control_revision(&transaction, document_id)? else {
+            return Ok(StoreControlOutcome::CounterExhausted);
+        };
         let issuer_operations =
             load_operation_set(&transaction, document_id, issuer_capability_id)?;
         if !issuer_operations.allows(operations) {
             return Ok(StoreControlOutcome::AuthorizationDenied);
+        }
+        let document_bytes = document_id.into_bytes();
+        let descendant_bytes = descendant_capability_id.into_bytes();
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM capabilities
+                 WHERE document_id = ?1 AND capability_id = ?2",
+                params![document_bytes.as_slice(), descendant_bytes.as_slice()],
+                |_row| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if exists {
+            return Ok(StoreControlOutcome::IdentifierConflict);
         }
         if !issuer_has_descendant_capacity(&transaction, document_id, issuer_capability_id)?
             || control_limits_exceeded(
@@ -805,23 +822,6 @@ impl DurableUpdateStore {
             )?
         {
             return Ok(StoreControlOutcome::LimitExceeded);
-        }
-        let Some(revision) = next_control_revision(&transaction, document_id)? else {
-            return Ok(StoreControlOutcome::CounterExhausted);
-        };
-        let document_bytes = document_id.into_bytes();
-        let descendant_bytes = descendant_capability_id.into_bytes();
-        let exists = transaction
-            .query_row(
-                "SELECT 1 FROM capabilities
-                 WHERE document_id = ?1 AND capability_id = ?2",
-                params![document_bytes.as_slice(), descendant_bytes.as_slice()],
-                |_row| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if exists {
-            return Ok(StoreControlOutcome::IdentifierConflict);
         }
         let issuer_bytes = issuer_capability_id.into_bytes();
         transaction.execute(
@@ -856,7 +856,7 @@ impl DurableUpdateStore {
 
     /// Revokes an issuer capability or one transitive descendant subtree.
     #[cfg_attr(
-        feature = "conformance",
+        all(feature = "conformance", not(test)),
         expect(
             dead_code,
             reason = "the conformance daemon routes through the barrier-bearing wrapper"
@@ -953,7 +953,15 @@ impl DurableUpdateStore {
             issuer_capability_id,
             issuer_authenticator,
             Operation::Revoke,
-        )? || !is_active_descendant(
+        )? {
+            return Ok(StoreControlOutcome::AuthorizationDenied);
+        }
+        #[cfg(feature = "conformance")]
+        after_authorization()?;
+        let Some(revision) = next_control_revision(&transaction, document_id)? else {
+            return Ok(StoreControlOutcome::CounterExhausted);
+        };
+        if !is_active_descendant(
             &transaction,
             document_id,
             issuer_capability_id,
@@ -961,8 +969,6 @@ impl DurableUpdateStore {
         )? {
             return Ok(StoreControlOutcome::AuthorizationDenied);
         }
-        #[cfg(feature = "conformance")]
-        after_authorization()?;
         if control_limits_exceeded(
             &transaction,
             document_id,
@@ -973,9 +979,6 @@ impl DurableUpdateStore {
         )? {
             return Ok(StoreControlOutcome::LimitExceeded);
         }
-        let Some(revision) = next_control_revision(&transaction, document_id)? else {
-            return Ok(StoreControlOutcome::CounterExhausted);
-        };
         let document_bytes = document_id.into_bytes();
         let target_bytes = target_capability_id.into_bytes();
         transaction.execute(
@@ -2522,6 +2525,20 @@ mod tests {
                     document_id,
                     root_id,
                     &root_authenticator,
+                    RequestId::from_bytes([0xe1; IDENTIFIER_LENGTH]),
+                    CapabilityId::from_bytes([0; IDENTIFIER_LENGTH]),
+                    &Authenticator::from_bytes([0; 32]),
+                    OperationSet::one(Operation::Read),
+                )
+                .expect("collision at the fan-out limit must resolve"),
+            StoreControlOutcome::IdentifierConflict
+        );
+        assert_eq!(
+            store
+                .grant_capability(
+                    document_id,
+                    root_id,
+                    &root_authenticator,
                     RequestId::from_bytes([0xf1; IDENTIFIER_LENGTH]),
                     CapabilityId::from_bytes([0xf2; IDENTIFIER_LENGTH]),
                     &Authenticator::from_bytes([0xf3; 32]),
@@ -2532,6 +2549,131 @@ mod tests {
         );
         drop(store);
         open_store(&database);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one saturated fixture proves counter precedence for both control mutations"
+    )]
+    fn control_counter_exhaustion_precedes_hard_limits() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let document_id = DocumentId::from_bytes([0xe1; IDENTIFIER_LENGTH]);
+        let root_id = CapabilityId::from_bytes([0xe2; IDENTIFIER_LENGTH]);
+        let root_authenticator = Authenticator::from_bytes([0xe3; 32]);
+        let mut store = open_store(&database);
+        assert_eq!(
+            store
+                .create_document(
+                    create_authority_id(),
+                    &create_authenticator(),
+                    RequestId::from_bytes([0xe4; IDENTIFIER_LENGTH]),
+                    document_id,
+                    root_id,
+                    &root_authenticator,
+                )
+                .expect("root creation must commit"),
+            StoreCreateOutcome::Inserted
+        );
+        for child in 0_u8..64 {
+            assert_eq!(
+                store
+                    .grant_capability(
+                        document_id,
+                        root_id,
+                        &root_authenticator,
+                        RequestId::from_bytes([child; IDENTIFIER_LENGTH]),
+                        CapabilityId::from_bytes([child; IDENTIFIER_LENGTH]),
+                        &Authenticator::from_bytes([child; 32]),
+                        OperationSet::one(Operation::Read),
+                    )
+                    .expect("bounded direct grant must resolve"),
+                StoreControlOutcome::Inserted
+            );
+        }
+
+        let document_bytes = document_id.into_bytes();
+        store
+            .connection
+            .execute(
+                "UPDATE documents SET control_revision = ?2 WHERE document_id = ?1",
+                rusqlite::params![document_bytes.as_slice(), u64::MAX.to_be_bytes().as_slice(),],
+            )
+            .expect("fixture counter must be exhausted");
+        assert_eq!(
+            store
+                .grant_capability(
+                    document_id,
+                    root_id,
+                    &root_authenticator,
+                    RequestId::from_bytes([0xf1; IDENTIFIER_LENGTH]),
+                    CapabilityId::from_bytes([0xf2; IDENTIFIER_LENGTH]),
+                    &Authenticator::from_bytes([0xf3; 32]),
+                    OperationSet::one(Operation::Read),
+                )
+                .expect("exhausted grant must resolve"),
+            StoreControlOutcome::CounterExhausted
+        );
+
+        store
+            .connection
+            .execute(
+                "UPDATE documents SET control_revision = ?2 WHERE document_id = ?1",
+                rusqlite::params![document_bytes.as_slice(), 65_u64.to_be_bytes().as_slice(),],
+            )
+            .expect("fixture counter must be restored");
+        let root_bytes = root_id.into_bytes();
+        let transaction =
+            store.connection.transaction().expect("receipt saturation transaction must begin");
+        for sequence in 1_u128..=4_032 {
+            transaction
+                .execute(
+                    "INSERT INTO control_receipts(
+                        document_id, issuer_capability_id, request_id, operation, normalized_input
+                     ) VALUES (?1, ?2, ?3, 0, X'01')",
+                    rusqlite::params![
+                        document_bytes.as_slice(),
+                        root_bytes.as_slice(),
+                        sequence.to_be_bytes().as_slice(),
+                    ],
+                )
+                .expect("synthetic bounded receipt must insert");
+        }
+        transaction.commit().expect("receipt saturation transaction must commit");
+        let target = CapabilityId::from_bytes([0; IDENTIFIER_LENGTH]);
+        assert_eq!(
+            store
+                .revoke_capability(
+                    document_id,
+                    root_id,
+                    &root_authenticator,
+                    RequestId::from_bytes([0xf4; IDENTIFIER_LENGTH]),
+                    target,
+                )
+                .expect("receipt-limited revoke must resolve"),
+            StoreControlOutcome::LimitExceeded
+        );
+
+        store
+            .connection
+            .execute(
+                "UPDATE documents SET control_revision = ?2 WHERE document_id = ?1",
+                rusqlite::params![document_bytes.as_slice(), u64::MAX.to_be_bytes().as_slice(),],
+            )
+            .expect("fixture counter must be exhausted again");
+        assert_eq!(
+            store
+                .revoke_capability(
+                    document_id,
+                    root_id,
+                    &root_authenticator,
+                    RequestId::from_bytes([0xf5; IDENTIFIER_LENGTH]),
+                    target,
+                )
+                .expect("counter-exhausted revoke must resolve"),
+            StoreControlOutcome::CounterExhausted
+        );
     }
 
     fn open_store(path: &Path) -> DurableUpdateStore {
