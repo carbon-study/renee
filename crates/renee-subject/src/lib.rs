@@ -16,7 +16,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use renee_types::{DocumentId, UpdateId};
+use renee_types::{DocumentId, LoroOplogVersion, UpdateId};
 use renee_wire::{
     ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AuthorizedUpdateRequest,
     CANCEL_UPDATE_SUBSCRIPTION, CANCEL_UPDATE_SUBSCRIPTION_RESPONSE, CAPABILITY_ERROR,
@@ -29,15 +29,17 @@ use renee_wire::{
     REVOKE_CAPABILITY_RESPONSE, RevokeCapabilityRequest, SERVER_HELLO, SUBSCRIBE_UPDATES,
     SUBSCRIBE_UPDATES_ACK, SubscribeUpdatesRequest, UPDATE_ERROR, UPDATE_NOTIFICATION,
     UPDATE_SUBSCRIPTION_INVALIDATED, UPDATE_SUBSCRIPTION_OVERFLOW, UpdateErrorCode,
-    UpdateSubscriptionId, VERSION, decode_accept_response, decode_body,
-    decode_cancel_update_subscription, decode_capability_error, decode_control_mutation_response,
-    decode_create_document_response, decode_enumerate_response, decode_fetch_response,
-    decode_greeting, decode_subscribe_updates_ack, decode_update_error, decode_update_notification,
-    decode_update_subscription_invalidated, decode_update_subscription_overflow,
+    UpdateSubscriptionId, VECTOR_BACKFILL, VECTOR_BACKFILL_RESPONSE, VERSION,
+    VectorBackfillRequest, VectorBackfillResponse, VectorBackfillStart, decode_accept_response,
+    decode_body, decode_cancel_update_subscription, decode_capability_error,
+    decode_control_mutation_response, decode_create_document_response, decode_enumerate_response,
+    decode_fetch_response, decode_greeting, decode_subscribe_updates_ack, decode_update_error,
+    decode_update_notification, decode_update_subscription_invalidated,
+    decode_update_subscription_overflow, decode_vector_backfill_response,
     encode_authorized_update_request, encode_body, encode_cancel_update_subscription,
     encode_create_document_request, encode_enumerate_request, encode_fetch_request,
     encode_grant_capability_request, encode_greeting, encode_revoke_capability_request,
-    encode_subscribe_updates_request, read_body, write_body,
+    encode_subscribe_updates_request, encode_vector_backfill_request, read_body, write_body,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
@@ -181,6 +183,21 @@ pub enum EnumerateObservation {
     InvalidCursor,
     /// Read authority was denied without document disclosure.
     AuthorizationDenied,
+}
+
+/// Subject observation for one authenticated vector-backfill page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VectorBackfillObservation {
+    /// Renee returned a bounded stable-snapshot page.
+    Page(VectorBackfillResponse),
+    /// The opaque continuation was invalid, expired, or context-mismatched.
+    InvalidContinuation,
+    /// The supplied canonical Loro metadata was rejected.
+    InvalidLoroMetadata,
+    /// Read authority was denied without document disclosure.
+    AuthorizationDenied,
+    /// The bounded continuation registry could not admit another page.
+    Backpressure,
 }
 
 /// One acknowledged experimental update subscription.
@@ -638,7 +655,9 @@ impl WebTransportConnection {
                 | UpdateErrorCode::NotNegotiated
                 | UpdateErrorCode::InvalidCursor
                 | UpdateErrorCode::CounterExhausted
-                | UpdateErrorCode::Backpressure => {
+                | UpdateErrorCode::Backpressure
+                | UpdateErrorCode::InvalidLoroMetadata
+                | UpdateErrorCode::InvalidOrExpiredContinuation => {
                     Err(io::Error::other("unexpected accept rejection").into())
                 }
             },
@@ -737,6 +756,69 @@ impl WebTransportConnection {
             }
             _unexpected => Err(io::Error::other("unexpected enumerate response").into()),
         }
+    }
+
+    /// Selects one stable vector-backfill page from the supplied durable version.
+    pub async fn vector_backfill(
+        &self,
+        authority: &CapabilityAuthority,
+        document_id: DocumentId,
+        oplog_version: &LoroOplogVersion,
+        cursor: Option<Vec<u8>>,
+    ) -> HarnessResult<VectorBackfillObservation> {
+        let start = cursor.map_or(VectorBackfillStart::Origin, VectorBackfillStart::Continue);
+        let response = self
+            .exchange(
+                VECTOR_BACKFILL,
+                encode_vector_backfill_request(&VectorBackfillRequest {
+                    authority: authority.clone(),
+                    document_id,
+                    oplog_version: oplog_version.clone(),
+                    start,
+                })?,
+            )
+            .await?;
+        match response.message_type {
+            VECTOR_BACKFILL_RESPONSE => Ok(VectorBackfillObservation::Page(
+                decode_vector_backfill_response(&response.payload)?,
+            )),
+            UPDATE_ERROR => match decode_update_error(&response.payload)? {
+                UpdateErrorCode::InvalidOrExpiredContinuation => {
+                    Ok(VectorBackfillObservation::InvalidContinuation)
+                }
+                UpdateErrorCode::InvalidLoroMetadata => {
+                    Ok(VectorBackfillObservation::InvalidLoroMetadata)
+                }
+                UpdateErrorCode::AuthorizationDenied => {
+                    Ok(VectorBackfillObservation::AuthorizationDenied)
+                }
+                UpdateErrorCode::Backpressure => Ok(VectorBackfillObservation::Backpressure),
+                unexpected @ (UpdateErrorCode::Malformed
+                | UpdateErrorCode::IdentifierConflict
+                | UpdateErrorCode::NotFound
+                | UpdateErrorCode::NotNegotiated
+                | UpdateErrorCode::InvalidCursor
+                | UpdateErrorCode::CounterExhausted) => Err(io::Error::other(format!(
+                    "unexpected vector-backfill error: {unexpected:?}"
+                ))
+                .into()),
+            },
+            _unexpected => Err(io::Error::other("unexpected vector-backfill response").into()),
+        }
+    }
+
+    /// Sends raw vector-backfill bytes and returns their stable update error.
+    pub async fn malformed_vector_backfill(
+        &self,
+        payload: Vec<u8>,
+    ) -> HarnessResult<UpdateErrorCode> {
+        let response = self.exchange(VECTOR_BACKFILL, payload).await?;
+        if response.message_type != UPDATE_ERROR {
+            return Err(
+                io::Error::other("malformed vector backfill received a success response").into()
+            );
+        }
+        Ok(decode_update_error(&response.payload)?)
     }
 
     /// Fetches one exact opaque encrypted payload.

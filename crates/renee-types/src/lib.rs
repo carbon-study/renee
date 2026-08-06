@@ -182,6 +182,69 @@ impl PublicLoroRanges {
     }
 }
 
+/// One non-zero peer prefix in a canonical Loro oplog version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoroOplogVersionEntry {
+    end_counter: u32,
+    peer_id: u64,
+}
+
+impl LoroOplogVersionEntry {
+    /// Creates one bounded non-empty peer prefix.
+    pub const fn new(peer_id: u64, end_counter: u32) -> Result<Self, LoroMetadataError> {
+        if end_counter == 0 {
+            return Err(LoroMetadataError::ZeroVersionCounter);
+        }
+        if end_counter > MAX_LORO_COUNTER {
+            return Err(LoroMetadataError::CounterOutOfRange);
+        }
+        Ok(Self { end_counter, peer_id })
+    }
+
+    /// Returns the exclusive peer-prefix end.
+    pub const fn end_counter(self) -> u32 {
+        self.end_counter
+    }
+
+    /// Returns the Loro replica peer.
+    pub const fn peer_id(self) -> u64 {
+        self.peer_id
+    }
+}
+
+/// Canonical bounded public representation of Loro `oplogVersion()`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LoroOplogVersion(Vec<LoroOplogVersionEntry>);
+
+impl LoroOplogVersion {
+    /// Validates strict peer ordering, uniqueness, and the frozen peer bound.
+    pub fn new(entries: Vec<LoroOplogVersionEntry>) -> Result<Self, LoroMetadataError> {
+        if entries.len() > MAX_LORO_PEERS {
+            return Err(LoroMetadataError::TooManyPeers);
+        }
+        let mut previous_peer = None;
+        for entry in &entries {
+            if previous_peer.is_some_and(|peer| peer >= entry.peer_id) {
+                return Err(LoroMetadataError::NonCanonicalPeerOrder);
+            }
+            previous_peer = Some(entry.peer_id);
+        }
+        Ok(Self(entries))
+    }
+
+    /// Returns the canonical ordered entries.
+    pub fn as_slice(&self) -> &[LoroOplogVersionEntry] {
+        &self.0
+    }
+
+    /// Returns the covered prefix end for one peer, or zero when absent.
+    pub fn end_counter_for(&self, peer_id: u64) -> u32 {
+        self.0
+            .binary_search_by_key(&peer_id, |entry| entry.peer_id)
+            .map_or(0, |index| self.0[index].end_counter)
+    }
+}
+
 /// Structural failure in public Loro metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoroMetadataError {
@@ -197,6 +260,8 @@ pub enum LoroMetadataError {
     TooManyOperations,
     /// Peers were not strictly ascending and unique.
     NonCanonicalPeerOrder,
+    /// A canonical version omits empty peer prefixes.
+    ZeroVersionCounter,
 }
 
 impl fmt::Display for LoroMetadataError {
@@ -209,6 +274,9 @@ impl fmt::Display for LoroMetadataError {
             Self::TooManyOperations => f.write_str("public Loro operation limit exceeded"),
             Self::NonCanonicalPeerOrder => {
                 f.write_str("public Loro peers are not strictly ascending")
+            }
+            Self::ZeroVersionCounter => {
+                f.write_str("public Loro version contains an empty peer prefix")
             }
         }
     }

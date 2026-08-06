@@ -5,22 +5,24 @@
     reason = "control revisions use canonical network-order BLOB storage"
 )]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs;
 use std::fs::File;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use renee_types::{
     AcceptanceSequence, Authenticator, CapabilityId, CreateAuthorityId, DocumentId,
-    IDENTIFIER_LENGTH, ImmutableUpdate, Operation, OperationSet, RequestId, UpdateId,
-    UpdateMetadata,
+    IDENTIFIER_LENGTH, ImmutableUpdate, LoroOplogVersion, Operation, OperationSet, RequestId,
+    UpdateId, UpdateMetadata,
 };
 use renee_wire::{decode_update_record, metadata_encoded_length};
+use ring::rand::{SecureRandom as _, SystemRandom};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior, params,
+    params_from_iter, types::Value,
 };
 
 pub use crate::subscription::{BrokerChannel, UpdateSubscription, UpdateSubscriptionEnd};
@@ -39,6 +41,9 @@ const MAX_GLOBAL_CONTROL_BYTES: usize = 0x0100_0000;
 const MAX_DOCUMENTS_PER_CREATE_AUTHORITY: usize = 4_096;
 const MAX_GLOBAL_DOCUMENTS: usize = 0x4000;
 const MAX_GLOBAL_CREATE_RECEIPTS: usize = 0x0001_0000;
+const MAX_VECTOR_CONTINUATIONS: usize = 1_024;
+const VECTOR_CONTINUATION_LENGTH: usize = 32;
+const VECTOR_CONTINUATION_TTL: Duration = Duration::from_secs(300);
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -191,6 +196,36 @@ CREATE TABLE IF NOT EXISTS updates (
         ON DELETE RESTRICT
 ) STRICT, WITHOUT ROWID;
 
+CREATE TABLE IF NOT EXISTS update_loro_ranges (
+    document_id BLOB NOT NULL
+        CHECK (typeof(document_id) = 'blob' AND length(document_id) = 16),
+    update_id BLOB NOT NULL
+        CHECK (typeof(update_id) = 'blob' AND length(update_id) = 16),
+    peer_id BLOB NOT NULL
+        CHECK (typeof(peer_id) = 'blob' AND length(peer_id) = 8),
+    start_counter BLOB NOT NULL
+        CHECK (typeof(start_counter) = 'blob' AND length(start_counter) = 4),
+    end_counter BLOB NOT NULL
+        CHECK (typeof(end_counter) = 'blob' AND length(end_counter) = 4),
+    PRIMARY KEY (document_id, update_id, peer_id),
+    FOREIGN KEY (document_id, update_id)
+        REFERENCES updates(document_id, update_id)
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER IF NOT EXISTS update_loro_ranges_are_immutable
+BEFORE UPDATE ON update_loro_ranges
+BEGIN
+    SELECT RAISE(ABORT, 'update Loro ranges are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS update_loro_ranges_are_retained
+BEFORE DELETE ON update_loro_ranges
+BEGIN
+    SELECT RAISE(ABORT, 'update Loro ranges are retained');
+END;
+
 CREATE TRIGGER IF NOT EXISTS updates_are_immutable
 BEFORE UPDATE ON updates
 BEGIN
@@ -292,6 +327,14 @@ pub enum StoreEnumerateStart {
     AfterTail(AcceptanceSequence),
 }
 
+/// Store-decoded start for one stable vector-backfill pass.
+pub enum StoreVectorBackfillStart {
+    /// Capture the current immutable-update high water.
+    Origin,
+    /// Resume one opaque, bounded, broker-owned continuation.
+    Continue(Vec<u8>),
+}
+
 /// Authorization-preserving read result.
 pub enum StoreReadOutcome<Value> {
     /// Authority was effective and selection completed.
@@ -300,6 +343,18 @@ pub enum StoreReadOutcome<Value> {
     AuthorizationDenied,
     /// Authority was valid but the supplied cursor was not.
     InvalidCursor,
+}
+
+/// Authorization-preserving vector-backfill result.
+pub enum StoreVectorBackfillOutcome<Value> {
+    /// Authority was effective and selection completed.
+    Authorized(Value),
+    /// Document, capability, secret, ancestry, or read operation was denied.
+    AuthorizationDenied,
+    /// Authority was valid but the stable-pass continuation was unusable.
+    InvalidContinuation,
+    /// The bounded continuation registry could not admit another page.
+    Backpressure,
 }
 
 /// Authorization-preserving result of creating a broker-local update subscription.
@@ -320,10 +375,110 @@ pub struct AuthorizedStoredUpdatePage {
     pub terminal_sequence: Option<AcceptanceSequence>,
 }
 
+/// One authorized vector-selected page and its opaque continuation.
+pub struct AuthorizedVectorBackfillPage {
+    /// Page selected from the fixed pass snapshot.
+    pub page: StoredUpdatePage,
+    /// Opaque next-page continuation, present exactly when `has_more` is true.
+    pub next_cursor: Option<Vec<u8>>,
+}
+
+struct VectorContinuation {
+    capability_id: CapabilityId,
+    document_id: DocumentId,
+    expires_at: Instant,
+    next_cursor: Option<[u8; VECTOR_CONTINUATION_LENGTH]>,
+    oplog_version: LoroOplogVersion,
+    position: AcceptanceSequence,
+    terminal_sequence: AcceptanceSequence,
+}
+
 /// Authoritative capability and immutable-update `SQLite` connection.
 pub struct DurableUpdateStore {
     connection: Connection,
+    random: SystemRandom,
     subscriptions: UpdateSubscriptionRegistry,
+    vector_continuations: HashMap<[u8; VECTOR_CONTINUATION_LENGTH], VectorContinuation>,
+}
+
+fn install_missing_range_index(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    {
+        let mut select = transaction.prepare("SELECT encoded_record FROM updates")?;
+        let mut rows = select.query([])?;
+        while let Some(row) = rows.next()? {
+            let record = row.get::<_, Vec<u8>>(0)?;
+            let update = decode_update_record(&record)
+                .map_err(|_error| StoreError::Corrupt("stored update record is invalid"))?;
+            insert_update_ranges(&transaction, &update)?;
+            validate_indexed_ranges(&transaction, &update)?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn validate_indexed_ranges(
+    transaction: &Transaction<'_>,
+    update: &ImmutableUpdate,
+) -> Result<(), StoreError> {
+    let document_id = update.document_id().into_bytes();
+    let update_id = update.update_id().into_bytes();
+    let count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM update_loro_ranges
+         WHERE document_id = ?1 AND update_id = ?2",
+        params![document_id.as_slice(), update_id.as_slice()],
+        |row| row.get(0),
+    )?;
+    if usize::try_from(count).ok() != Some(update.public_loro_ranges().as_slice().len()) {
+        return Err(StoreError::Corrupt("stored update range index has the wrong count"));
+    }
+    for range in update.public_loro_ranges().as_slice() {
+        let indexed = transaction
+            .query_row(
+                "SELECT start_counter, end_counter FROM update_loro_ranges
+                 WHERE document_id = ?1 AND update_id = ?2 AND peer_id = ?3",
+                params![
+                    document_id.as_slice(),
+                    update_id.as_slice(),
+                    range.peer_id().to_be_bytes().as_slice(),
+                ],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        let Some((start, end)) = indexed else {
+            return Err(StoreError::Corrupt("stored update range index omitted a peer"));
+        };
+        if start.as_slice() != range.start_counter().to_be_bytes()
+            || end.as_slice() != range.end_counter().to_be_bytes()
+        {
+            return Err(StoreError::Corrupt("stored update range index disagrees with record"));
+        }
+    }
+    Ok(())
+}
+
+fn insert_update_ranges(
+    transaction: &Transaction<'_>,
+    update: &ImmutableUpdate,
+) -> Result<(), StoreError> {
+    let document_id = update.document_id().into_bytes();
+    let update_id = update.update_id().into_bytes();
+    for range in update.public_loro_ranges().as_slice() {
+        transaction.execute(
+            "INSERT OR IGNORE INTO update_loro_ranges(
+                document_id, update_id, peer_id, start_counter, end_counter
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                document_id.as_slice(),
+                update_id.as_slice(),
+                range.peer_id().to_be_bytes().as_slice(),
+                range.start_counter().to_be_bytes().as_slice(),
+                range.end_counter().to_be_bytes().as_slice(),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn provision_create_authority(
@@ -391,7 +546,7 @@ impl DurableUpdateStore {
     ) -> Result<Self, StoreError> {
         let parent = path.parent().ok_or(StoreError::InvalidDatabasePath)?;
         fs::create_dir_all(parent)?;
-        let connection = Connection::open_with_flags(
+        let mut connection = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -403,11 +558,17 @@ impl DurableUpdateStore {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "wal_autocheckpoint", 1_000_u32)?;
         connection.execute_batch(SCHEMA)?;
+        install_missing_range_index(&mut connection)?;
         provision_create_authority(&connection, create_authority)?;
         connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         synchronize_directory(parent)?;
 
-        let mut store = Self { connection, subscriptions: UpdateSubscriptionRegistry::new() };
+        let mut store = Self {
+            connection,
+            random: SystemRandom::new(),
+            subscriptions: UpdateSubscriptionRegistry::new(),
+            vector_continuations: HashMap::new(),
+        };
         store.validate()?;
         Ok(store)
     }
@@ -1265,6 +1426,7 @@ impl DurableUpdateStore {
                 encoded_record,
             ],
         )?;
+        insert_update_ranges(&transaction, update)?;
         #[cfg(feature = "conformance")]
         before_commit()?;
         transaction.commit()?;
@@ -1329,6 +1491,143 @@ impl DurableUpdateStore {
         Ok(StoreReadOutcome::Authorized(AuthorizedStoredUpdatePage {
             page,
             terminal_sequence: Some(terminal_sequence),
+        }))
+    }
+
+    /// Authorizes and selects one page from a stable vector-backfill pass.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "authorization, stable-pass recovery, selection, and token chaining form one read operation"
+    )]
+    pub fn vector_backfill_authorized(
+        &mut self,
+        document_id: DocumentId,
+        capability_id: CapabilityId,
+        authenticator: &Authenticator,
+        oplog_version: &LoroOplogVersion,
+        start: StoreVectorBackfillStart,
+        metadata_byte_limit: usize,
+    ) -> Result<StoreVectorBackfillOutcome<AuthorizedVectorBackfillPage>, StoreError> {
+        let transaction =
+            self.connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        if !authorize(&transaction, document_id, capability_id, authenticator, Operation::Read)? {
+            return Ok(StoreVectorBackfillOutcome::AuthorizationDenied);
+        }
+
+        let now = Instant::now();
+        self.vector_continuations.retain(|_token, continuation| continuation.expires_at > now);
+        let (position, terminal_sequence, current_token) = match start {
+            StoreVectorBackfillStart::Origin => {
+                let Some(terminal_sequence) = high_water_sequence_in(&transaction, document_id)?
+                else {
+                    transaction.commit()?;
+                    return Ok(StoreVectorBackfillOutcome::Authorized(
+                        AuthorizedVectorBackfillPage {
+                            next_cursor: None,
+                            page: StoredUpdatePage {
+                                has_more: false,
+                                last_sequence: None,
+                                updates: Vec::new(),
+                            },
+                        },
+                    ));
+                };
+                (AcceptanceSequence::ORIGIN, terminal_sequence, None)
+            }
+            StoreVectorBackfillStart::Continue(encoded) => {
+                let Ok(token) = <[u8; VECTOR_CONTINUATION_LENGTH]>::try_from(encoded.as_slice())
+                else {
+                    return Ok(StoreVectorBackfillOutcome::InvalidContinuation);
+                };
+                let Some(continuation) = self.vector_continuations.get(&token) else {
+                    return Ok(StoreVectorBackfillOutcome::InvalidContinuation);
+                };
+                if continuation.document_id != document_id
+                    || continuation.capability_id != capability_id
+                    || continuation.oplog_version != *oplog_version
+                    || continuation.expires_at <= now
+                {
+                    return Ok(StoreVectorBackfillOutcome::InvalidContinuation);
+                }
+                (continuation.position, continuation.terminal_sequence, Some(token))
+            }
+        };
+
+        let page = match vector_backfill_in(
+            &transaction,
+            document_id,
+            position,
+            terminal_sequence,
+            oplog_version,
+            metadata_byte_limit,
+        ) {
+            Ok(page) => page,
+            Err(StoreError::InvalidCursor) => {
+                return Ok(StoreVectorBackfillOutcome::InvalidContinuation);
+            }
+            Err(error) => return Err(error),
+        };
+        let next_cursor = if page.has_more {
+            let Some(next_position) = page.last_sequence else {
+                return Err(StoreError::Corrupt(
+                    "continuable vector page omitted its last position",
+                ));
+            };
+            if let Some(token) = current_token {
+                if let Some(next) = self
+                    .vector_continuations
+                    .get(&token)
+                    .and_then(|continuation| continuation.next_cursor)
+                {
+                    Some(next.to_vec())
+                } else {
+                    let Some(next) = issue_vector_continuation(
+                        &self.random,
+                        &mut self.vector_continuations,
+                        VectorContinuation {
+                            capability_id,
+                            document_id,
+                            expires_at: now + VECTOR_CONTINUATION_TTL,
+                            next_cursor: None,
+                            oplog_version: oplog_version.clone(),
+                            position: next_position,
+                            terminal_sequence,
+                        },
+                    )?
+                    else {
+                        return Ok(StoreVectorBackfillOutcome::Backpressure);
+                    };
+                    if let Some(continuation) = self.vector_continuations.get_mut(&token) {
+                        continuation.next_cursor = Some(next);
+                    }
+                    Some(next.to_vec())
+                }
+            } else {
+                let Some(next) = issue_vector_continuation(
+                    &self.random,
+                    &mut self.vector_continuations,
+                    VectorContinuation {
+                        capability_id,
+                        document_id,
+                        expires_at: now + VECTOR_CONTINUATION_TTL,
+                        next_cursor: None,
+                        oplog_version: oplog_version.clone(),
+                        position: next_position,
+                        terminal_sequence,
+                    },
+                )?
+                else {
+                    return Ok(StoreVectorBackfillOutcome::Backpressure);
+                };
+                Some(next.to_vec())
+            }
+        } else {
+            None
+        };
+        transaction.commit()?;
+        Ok(StoreVectorBackfillOutcome::Authorized(AuthorizedVectorBackfillPage {
+            page,
+            next_cursor,
         }))
     }
 
@@ -1505,6 +1804,142 @@ fn enumerate_in(
         updates.push((sequence, metadata));
     }
     Ok(StoredUpdatePage { has_more, last_sequence, updates })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "bounded dynamic vector selection and metadata pagination remain adjacent"
+)]
+fn vector_backfill_in(
+    connection: &Connection,
+    document_id: DocumentId,
+    position: AcceptanceSequence,
+    terminal_sequence: AcceptanceSequence,
+    oplog_version: &LoroOplogVersion,
+    metadata_byte_limit: usize,
+) -> Result<StoredUpdatePage, StoreError> {
+    let document_bytes = document_id.into_bytes();
+    if terminal_sequence == AcceptanceSequence::ORIGIN || position > terminal_sequence {
+        return Err(StoreError::InvalidCursor);
+    }
+    for sequence in [position, terminal_sequence] {
+        if sequence == AcceptanceSequence::ORIGIN {
+            continue;
+        }
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM updates
+                 WHERE document_id = ?1 AND acceptance_sequence = ?2",
+                params![document_bytes.as_slice(), sequence.to_be_bytes().as_slice()],
+                |_row| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Err(StoreError::InvalidCursor);
+        }
+    }
+    let mut query = String::from(
+        "SELECT u.acceptance_sequence, u.encoded_record
+         FROM updates AS u
+         WHERE u.document_id = ?1
+           AND u.acceptance_sequence > ?2
+           AND u.acceptance_sequence <= ?3
+           AND EXISTS (
+               SELECT 1 FROM update_loro_ranges AS r
+               WHERE r.document_id = u.document_id
+                 AND r.update_id = u.update_id",
+    );
+    let mut parameters = vec![
+        Value::Blob(document_bytes.to_vec()),
+        Value::Blob(position.to_be_bytes().to_vec()),
+        Value::Blob(terminal_sequence.to_be_bytes().to_vec()),
+    ];
+    if !oplog_version.as_slice().is_empty() {
+        query.push_str(" AND (r.peer_id NOT IN (");
+        for (index, entry) in oplog_version.as_slice().iter().enumerate() {
+            if index != 0 {
+                query.push(',');
+            }
+            write!(query, "?{}", parameters.len() + 1)
+                .map_err(|_error| StoreError::Corrupt("vector query formatting failed"))?;
+            parameters.push(Value::Blob(entry.peer_id().to_be_bytes().to_vec()));
+        }
+        query.push(')');
+        for entry in oplog_version.as_slice() {
+            write!(
+                query,
+                " OR (r.peer_id = ?{} AND r.end_counter > ?{})",
+                parameters.len() + 1,
+                parameters.len() + 2,
+            )
+            .map_err(|_error| StoreError::Corrupt("vector query formatting failed"))?;
+            parameters.push(Value::Blob(entry.peer_id().to_be_bytes().to_vec()));
+            parameters.push(Value::Blob(entry.end_counter().to_be_bytes().to_vec()));
+        }
+        query.push(')');
+    }
+    query.push_str(") ORDER BY u.acceptance_sequence");
+    let mut statement = connection.prepare(&query)?;
+    let mut rows = statement.query(params_from_iter(parameters.iter()))?;
+    let mut used = 0_usize;
+    let mut updates = Vec::new();
+    let mut last_sequence = None;
+    let mut has_more = false;
+    while let Some(row) = rows.next()? {
+        let sequence = decode_sequence(&row.get::<_, Vec<u8>>(0)?)?;
+        let record = row.get::<_, Vec<u8>>(1)?;
+        let update = decode_update_record(&record)
+            .map_err(|_error| StoreError::Corrupt("stored update record is invalid"))?;
+        if update.document_id() != document_id {
+            return Err(StoreError::Corrupt("stored update document disagrees with index"));
+        }
+        if !update
+            .public_loro_ranges()
+            .as_slice()
+            .iter()
+            .any(|range| range.end_counter() > oplog_version.end_counter_for(range.peer_id()))
+        {
+            return Err(StoreError::Corrupt(
+                "range index selected metadata covered by the client vector",
+            ));
+        }
+        let metadata = metadata(&update)?;
+        let encoded_length = metadata_encoded_length(&metadata)
+            .map_err(|_error| StoreError::Corrupt("stored metadata cannot be encoded"))?;
+        let Some(next_used) = used.checked_add(encoded_length) else {
+            has_more = true;
+            break;
+        };
+        if next_used > metadata_byte_limit {
+            has_more = true;
+            break;
+        }
+        used = next_used;
+        last_sequence = Some(sequence);
+        updates.push((sequence, metadata));
+    }
+    Ok(StoredUpdatePage { has_more, last_sequence, updates })
+}
+
+fn issue_vector_continuation(
+    random: &SystemRandom,
+    continuations: &mut HashMap<[u8; VECTOR_CONTINUATION_LENGTH], VectorContinuation>,
+    continuation: VectorContinuation,
+) -> Result<Option<[u8; VECTOR_CONTINUATION_LENGTH]>, StoreError> {
+    if continuations.len() >= MAX_VECTOR_CONTINUATIONS {
+        return Ok(None);
+    }
+    for _attempt in 0..4 {
+        let mut token = [0_u8; VECTOR_CONTINUATION_LENGTH];
+        random.fill(&mut token).map_err(|_error| StoreError::EntropyUnavailable)?;
+        if continuations.contains_key(&token) {
+            continue;
+        }
+        continuations.insert(token, continuation);
+        return Ok(Some(token));
+    }
+    Ok(None)
 }
 
 fn fetch_in(
@@ -2443,6 +2878,8 @@ pub enum StoreError {
     InvalidDatabasePath,
     /// A structurally valid cursor did not name an acceptance in its document.
     InvalidCursor,
+    /// The operating system could not mint an opaque continuation token.
+    EntropyUnavailable,
     /// Recovered state violated an invariant.
     Corrupt(&'static str),
     /// On-disk schema is not understood.
@@ -2459,6 +2896,7 @@ impl fmt::Display for StoreError {
             Self::Io(error) => write!(f, "store filesystem operation failed: {error}"),
             Self::InvalidDatabasePath => f.write_str("store database path has no parent"),
             Self::InvalidCursor => f.write_str("store cursor does not name an acceptance"),
+            Self::EntropyUnavailable => f.write_str("continuation-token entropy is unavailable"),
             Self::Corrupt(message) => write!(f, "durable store is corrupt: {message}"),
             Self::UnsupportedSchema { actual } => {
                 write!(f, "unsupported durable store schema version {actual}")
@@ -2474,6 +2912,7 @@ impl Error for StoreError {
             Self::Io(error) => Some(error),
             Self::InvalidDatabasePath
             | Self::InvalidCursor
+            | Self::EntropyUnavailable
             | Self::Corrupt(_)
             | Self::UnsupportedSchema { .. } => None,
         }
@@ -2497,12 +2936,280 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use renee_types::{LoroRange, PublicLoroRanges};
+    use renee_types::{LoroOplogVersionEntry, LoroRange, PublicLoroRanges};
     use renee_wire::encode_update_record;
 
     use crate::subscription::{UPDATE_NOTIFICATION_QUEUE_CAPACITY, UpdateSubscriptionPoll};
 
     use super::*;
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one sequential scenario keeps snapshot, pagination, query binding, and expiry visible"
+    )]
+    fn vector_backfill_selects_missing_ranges_from_one_stable_bounded_pass() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let document_id = DocumentId::from_bytes([0x61; IDENTIFIER_LENGTH]);
+        let capability_id = CapabilityId::from_bytes([0x62; IDENTIFIER_LENGTH]);
+        let authenticator = Authenticator::from_bytes([0x63; 32]);
+        let mut store = open_store(&database);
+        create_fixture_document(&mut store, document_id, capability_id, &authenticator, 0x64);
+        let updates = [
+            ranged_fixture_update(document_id, 0x65, 7, 0, 2),
+            ranged_fixture_update(document_id, 0x66, 8, 0, 1),
+            ranged_fixture_update(document_id, 0x67, 7, 2, 4),
+        ];
+        for update in &updates {
+            let encoded = encode_update_record(update).expect("fixture record must encode");
+            assert_eq!(
+                store
+                    .accept(capability_id, &authenticator, update, &encoded)
+                    .expect("fixture update must commit"),
+                StoreAcceptOutcome::Inserted,
+            );
+        }
+        let version = LoroOplogVersion::new(vec![
+            LoroOplogVersionEntry::new(7, 2).expect("fixture version must be valid"),
+        ])
+        .expect("fixture version must be canonical");
+        let one_metadata = metadata_encoded_length(&metadata(&updates[1]).expect("metadata"))
+            .expect("metadata length must fit");
+        let StoreVectorBackfillOutcome::Authorized(first) = store
+            .vector_backfill_authorized(
+                document_id,
+                capability_id,
+                &authenticator,
+                &version,
+                StoreVectorBackfillStart::Origin,
+                one_metadata,
+            )
+            .expect("first vector page must resolve")
+        else {
+            panic!("read-authorized vector pass must succeed");
+        };
+        assert!(first.page.has_more);
+        assert_eq!(
+            first
+                .page
+                .updates
+                .iter()
+                .map(|(_sequence, metadata)| metadata.update_id)
+                .collect::<Vec<_>>(),
+            vec![updates[1].update_id()],
+        );
+        let cursor = first.next_cursor.expect("continuable page must have a token");
+        assert_eq!(cursor.len(), VECTOR_CONTINUATION_LENGTH);
+
+        let accepted_after_snapshot = ranged_fixture_update(document_id, 0x68, 9, 0, 1);
+        let encoded = encode_update_record(&accepted_after_snapshot).expect("fixture must encode");
+        assert_eq!(
+            store
+                .accept(capability_id, &authenticator, &accepted_after_snapshot, &encoded)
+                .expect("concurrent update must commit"),
+            StoreAcceptOutcome::Inserted,
+        );
+
+        let StoreVectorBackfillOutcome::Authorized(second) = store
+            .vector_backfill_authorized(
+                document_id,
+                capability_id,
+                &authenticator,
+                &version,
+                StoreVectorBackfillStart::Continue(cursor.clone()),
+                one_metadata,
+            )
+            .expect("continuation must resolve")
+        else {
+            panic!("valid continuation must remain authorized");
+        };
+        assert!(!second.page.has_more);
+        assert_eq!(
+            second
+                .page
+                .updates
+                .iter()
+                .map(|(_sequence, metadata)| metadata.update_id)
+                .collect::<Vec<_>>(),
+            vec![updates[2].update_id()],
+        );
+        assert!(second.next_cursor.is_none());
+
+        let changed_version = LoroOplogVersion::default();
+        assert!(matches!(
+            store
+                .vector_backfill_authorized(
+                    document_id,
+                    capability_id,
+                    &authenticator,
+                    &changed_version,
+                    StoreVectorBackfillStart::Continue(cursor.clone()),
+                    one_metadata,
+                )
+                .expect("mismatched continuation must resolve"),
+            StoreVectorBackfillOutcome::InvalidContinuation,
+        ));
+
+        let token = <[u8; VECTOR_CONTINUATION_LENGTH]>::try_from(cursor.as_slice())
+            .expect("fixture continuation has the fixed length");
+        store
+            .vector_continuations
+            .get_mut(&token)
+            .expect("fixture continuation must remain registered")
+            .expires_at = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("fixture duration must precede the current instant");
+        assert!(matches!(
+            store
+                .vector_backfill_authorized(
+                    document_id,
+                    capability_id,
+                    &authenticator,
+                    &version,
+                    StoreVectorBackfillStart::Continue(cursor),
+                    one_metadata,
+                )
+                .expect("expired continuation must resolve"),
+            StoreVectorBackfillOutcome::InvalidContinuation,
+        ));
+    }
+
+    #[test]
+    fn vector_backfill_reauthorizes_before_continuing_a_pass() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let document_id = DocumentId::from_bytes([0x51; IDENTIFIER_LENGTH]);
+        let root_capability = CapabilityId::from_bytes([0x52; IDENTIFIER_LENGTH]);
+        let root_authenticator = Authenticator::from_bytes([0x53; 32]);
+        let child_capability = CapabilityId::from_bytes([0x54; IDENTIFIER_LENGTH]);
+        let child_authenticator = Authenticator::from_bytes([0x55; 32]);
+        let mut store = open_store(&database);
+        create_fixture_document(
+            &mut store,
+            document_id,
+            root_capability,
+            &root_authenticator,
+            0x56,
+        );
+        assert_eq!(
+            store
+                .grant_capability(
+                    document_id,
+                    root_capability,
+                    &root_authenticator,
+                    RequestId::from_bytes([0x57; IDENTIFIER_LENGTH]),
+                    child_capability,
+                    &child_authenticator,
+                    OperationSet::one(Operation::Read),
+                )
+                .expect("read grant must commit"),
+            StoreControlOutcome::Inserted,
+        );
+        let updates = [
+            ranged_fixture_update(document_id, 0x58, 1, 0, 1),
+            ranged_fixture_update(document_id, 0x59, 2, 0, 1),
+        ];
+        for update in &updates {
+            let encoded = encode_update_record(update).expect("fixture record must encode");
+            assert_eq!(
+                store
+                    .accept(root_capability, &root_authenticator, update, &encoded)
+                    .expect("fixture update must commit"),
+                StoreAcceptOutcome::Inserted,
+            );
+        }
+        let page_limit = metadata_encoded_length(&metadata(&updates[0]).expect("metadata"))
+            .expect("metadata length must fit");
+        let StoreVectorBackfillOutcome::Authorized(first) = store
+            .vector_backfill_authorized(
+                document_id,
+                child_capability,
+                &child_authenticator,
+                &LoroOplogVersion::default(),
+                StoreVectorBackfillStart::Origin,
+                page_limit,
+            )
+            .expect("first page must resolve")
+        else {
+            panic!("read-authorized vector pass must begin");
+        };
+        let cursor = first.next_cursor.expect("first page must continue");
+
+        assert_eq!(
+            store
+                .revoke_capability(
+                    document_id,
+                    root_capability,
+                    &root_authenticator,
+                    RequestId::from_bytes([0x5a; IDENTIFIER_LENGTH]),
+                    child_capability,
+                )
+                .expect("revocation must commit"),
+            StoreControlOutcome::Inserted,
+        );
+        assert!(matches!(
+            store
+                .vector_backfill_authorized(
+                    document_id,
+                    child_capability,
+                    &child_authenticator,
+                    &LoroOplogVersion::default(),
+                    StoreVectorBackfillStart::Continue(cursor),
+                    page_limit,
+                )
+                .expect("revoked continuation must resolve"),
+            StoreVectorBackfillOutcome::AuthorizationDenied,
+        ));
+    }
+
+    #[test]
+    fn opening_an_existing_store_installs_the_vector_range_index() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let document_id = DocumentId::from_bytes([0x41; IDENTIFIER_LENGTH]);
+        let capability_id = CapabilityId::from_bytes([0x42; IDENTIFIER_LENGTH]);
+        let authenticator = Authenticator::from_bytes([0x43; 32]);
+        let update = ranged_fixture_update(document_id, 0x44, 9, 0, 1);
+        let mut store = open_store(&database);
+        create_fixture_document(&mut store, document_id, capability_id, &authenticator, 0x45);
+        let encoded = encode_update_record(&update).expect("fixture record must encode");
+        assert_eq!(
+            store
+                .accept(capability_id, &authenticator, &update, &encoded)
+                .expect("fixture update must commit"),
+            StoreAcceptOutcome::Inserted,
+        );
+        drop(store);
+        let connection = Connection::open(&database).expect("fixture database must reopen");
+        connection
+            .execute_batch("DROP TABLE update_loro_ranges;")
+            .expect("fixture must emulate the additive pre-index schema");
+        drop(connection);
+
+        let mut reopened_store = open_store(&database);
+        let StoreVectorBackfillOutcome::Authorized(page) = reopened_store
+            .vector_backfill_authorized(
+                document_id,
+                capability_id,
+                &authenticator,
+                &LoroOplogVersion::default(),
+                StoreVectorBackfillStart::Origin,
+                usize::MAX,
+            )
+            .expect("backfilled range index must be readable")
+        else {
+            panic!("existing read authority must remain valid");
+        };
+        assert_eq!(
+            page.page
+                .updates
+                .iter()
+                .map(|(_sequence, metadata)| metadata.update_id)
+                .collect::<Vec<_>>(),
+            vec![update.update_id()],
+        );
+    }
 
     #[test]
     fn acknowledged_subscription_closes_the_acceptance_race_and_notifies_submitter() {
@@ -3178,6 +3885,25 @@ mod tests {
             UpdateId::from_bytes([marker; IDENTIFIER_LENGTH]),
             PublicLoroRanges::new(vec![
                 LoroRange::new(u64::from(marker), 0, 1).expect("fixture range must be valid"),
+            ])
+            .expect("fixture ranges must be canonical"),
+            vec![marker],
+        )
+    }
+
+    fn ranged_fixture_update(
+        document_id: DocumentId,
+        marker: u8,
+        peer_id: u64,
+        start_counter: u32,
+        end_counter: u32,
+    ) -> ImmutableUpdate {
+        ImmutableUpdate::new(
+            document_id,
+            UpdateId::from_bytes([marker; IDENTIFIER_LENGTH]),
+            PublicLoroRanges::new(vec![
+                LoroRange::new(peer_id, start_counter, end_counter)
+                    .expect("fixture range must be valid"),
             ])
             .expect("fixture ranges must be canonical"),
             vec![marker],

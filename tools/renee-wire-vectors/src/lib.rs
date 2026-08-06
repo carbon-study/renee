@@ -10,8 +10,8 @@ use core::fmt;
 
 use renee_types::{
     AcceptanceSequence, Authenticator, CapabilityId, CreateAuthorityId, DocumentId,
-    ImmutableUpdate, LoroRange, Operation, OperationSet, PublicLoroRanges, RequestId, UpdateId,
-    UpdateMetadata,
+    ImmutableUpdate, LoroOplogVersion, LoroOplogVersionEntry, LoroRange, Operation, OperationSet,
+    PublicLoroRanges, RequestId, UpdateId, UpdateMetadata,
 };
 use renee_wire::{
     ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor,
@@ -27,7 +27,8 @@ use renee_wire::{
     REVOKE_CAPABILITY_RESPONSE, RevokeCapabilityRequest, SERVER_HELLO, SUBSCRIBE_UPDATES,
     SUBSCRIBE_UPDATES_ACK, SubscribeUpdatesRequest, UPDATE_ERROR, UPDATE_NOTIFICATION,
     UPDATE_SUBSCRIPTION_INVALIDATED, UPDATE_SUBSCRIPTION_OVERFLOW, UpdateErrorCode,
-    UpdateNotification, UpdateSubscriptionId, VERSION, encode_accept_response,
+    UpdateNotification, UpdateSubscriptionId, VECTOR_BACKFILL, VECTOR_BACKFILL_RESPONSE, VERSION,
+    VectorBackfillRequest, VectorBackfillResponse, VectorBackfillStart, encode_accept_response,
     encode_acceptance_cursor, encode_authorized_update_request, encode_cancel_update_subscription,
     encode_capability_error, encode_control_mutation_response, encode_create_document_request,
     encode_create_document_response, encode_enumerate_request, encode_enumerate_response,
@@ -35,7 +36,8 @@ use renee_wire::{
     encode_greeting, encode_revoke_capability_request, encode_subscribe_updates_ack,
     encode_subscribe_updates_request, encode_update_error, encode_update_notification,
     encode_update_record, encode_update_subscription_invalidated,
-    encode_update_subscription_overflow,
+    encode_update_subscription_overflow, encode_vector_backfill_request,
+    encode_vector_backfill_response,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
@@ -100,6 +102,12 @@ pub fn generate() -> Result<String, GenerateError> {
     };
     let (certificate_manifest, control_public_key) = certificate_manifest_fixture()?;
     let subscription_id = UpdateSubscriptionId::from_bytes([0x60; 16]);
+    let oplog_version = LoroOplogVersion::new(vec![
+        LoroOplogVersionEntry::new(0x0102_0304_0506_0708, 3)
+            .map_err(|error| GenerateError::new(error.to_string()))?,
+    ])
+    .map_err(|error| GenerateError::new(error.to_string()))?;
+    let vector_cursor = vec![0x6a; 32];
 
     let mut frames = vec![
         frame(
@@ -274,7 +282,7 @@ pub fn generate() -> Result<String, GenerateError> {
             encode_enumerate_response(&EnumerateResponse {
                 has_more: true,
                 next_cursor: Some(cursor),
-                updates: vec![metadata],
+                updates: vec![metadata.clone()],
             })?,
         )?,
         frame(
@@ -286,6 +294,41 @@ pub fn generate() -> Result<String, GenerateError> {
                 has_more: false,
                 next_cursor: None,
                 updates: Vec::new(),
+            })?,
+        )?,
+        frame(
+            "vector-backfill.request.origin",
+            "vector-backfill",
+            VECTOR_BACKFILL,
+            0x35,
+            encode_vector_backfill_request(&VectorBackfillRequest {
+                authority: root.clone(),
+                document_id,
+                oplog_version: oplog_version.clone(),
+                start: VectorBackfillStart::Origin,
+            })?,
+        )?,
+        frame(
+            "vector-backfill.request.continue",
+            "vector-backfill",
+            VECTOR_BACKFILL,
+            0x36,
+            encode_vector_backfill_request(&VectorBackfillRequest {
+                authority: root.clone(),
+                document_id,
+                oplog_version,
+                start: VectorBackfillStart::Continue(vector_cursor.clone()),
+            })?,
+        )?,
+        frame(
+            "vector-backfill.response.page",
+            "vector-backfill",
+            VECTOR_BACKFILL_RESPONSE,
+            0x35,
+            encode_vector_backfill_response(&VectorBackfillResponse {
+                has_more: true,
+                next_cursor: Some(vector_cursor),
+                updates: vec![metadata],
             })?,
         )?,
         frame(
@@ -374,6 +417,11 @@ pub fn generate() -> Result<String, GenerateError> {
         ("error.update.counter-exhausted", UpdateErrorCode::CounterExhausted),
         ("error.update.authorization-denied", UpdateErrorCode::AuthorizationDenied),
         ("error.update.backpressure", UpdateErrorCode::Backpressure),
+        ("error.update.invalid-loro-metadata", UpdateErrorCode::InvalidLoroMetadata),
+        (
+            "error.update.invalid-or-expired-continuation",
+            UpdateErrorCode::InvalidOrExpiredContinuation,
+        ),
     ] {
         frames.push(frame(name, "errors", UPDATE_ERROR, 0x51, encode_update_error(error))?);
     }

@@ -28,22 +28,26 @@ use renee_wire::{
     GRANT_CAPABILITY_RESPONSE, MAX_APPLICATION_PAYLOAD_LENGTH, REVOKE_CAPABILITY,
     REVOKE_CAPABILITY_RESPONSE, SUBSCRIBE_UPDATES, SUBSCRIBE_UPDATES_ACK, UPDATE_ERROR,
     UPDATE_NOTIFICATION, UPDATE_SUBSCRIPTION_INVALIDATED, UPDATE_SUBSCRIPTION_OVERFLOW,
-    UpdateErrorCode, UpdateNotification, UpdateSubscriptionId, VERSION, decode_acceptance_cursor,
-    decode_authorized_update_request, decode_body, decode_cancel_update_subscription,
-    decode_create_document_request, decode_enumerate_request, decode_fetch_request,
-    decode_grant_capability_request, decode_revoke_capability_request,
-    decode_subscribe_updates_request, decode_update_record, encode_accept_response,
-    encode_acceptance_cursor, encode_body, encode_cancel_update_subscription,
-    encode_capability_error, encode_control_mutation_response, encode_create_document_response,
-    encode_enumerate_response, encode_fetch_response, encode_subscribe_updates_ack,
-    encode_update_error, encode_update_notification, encode_update_subscription_invalidated,
-    encode_update_subscription_overflow, enumerate_response_base_length, read_body, write_body,
+    UpdateCodecError, UpdateErrorCode, UpdateNotification, UpdateSubscriptionId, VECTOR_BACKFILL,
+    VECTOR_BACKFILL_RESPONSE, VERSION, VectorBackfillResponse, VectorBackfillStart,
+    decode_acceptance_cursor, decode_authorized_update_request, decode_body,
+    decode_cancel_update_subscription, decode_create_document_request, decode_enumerate_request,
+    decode_fetch_request, decode_grant_capability_request, decode_revoke_capability_request,
+    decode_subscribe_updates_request, decode_update_record, decode_vector_backfill_request,
+    encode_accept_response, encode_acceptance_cursor, encode_body,
+    encode_cancel_update_subscription, encode_capability_error, encode_control_mutation_response,
+    encode_create_document_response, encode_enumerate_response, encode_fetch_response,
+    encode_subscribe_updates_ack, encode_update_error, encode_update_notification,
+    encode_update_subscription_invalidated, encode_update_subscription_overflow,
+    encode_vector_backfill_response, enumerate_response_base_length, read_body,
+    vector_backfill_response_base_length, write_body,
 };
 #[cfg(feature = "conformance")]
 use store::StoreError;
 use store::{
     CreateAuthorityProvision, DurableUpdateStore, StoreAcceptOutcome, StoreControlOutcome,
     StoreCreateOutcome, StoreEnumerateStart, StoreReadOutcome, StoreSubscribeOutcome,
+    StoreVectorBackfillOutcome, StoreVectorBackfillStart,
 };
 use subscription::{
     MAX_UPDATE_SUBSCRIPTIONS_PER_CHANNEL, UpdateSubscription, UpdateSubscriptionEnd,
@@ -930,6 +934,83 @@ async fn handle_request(
                     has_more: page.has_more,
                     next_cursor,
                     updates,
+                })
+                .map_err(codec_error)?,
+            )
+        }
+        VECTOR_BACKFILL => {
+            let backfill = match decode_vector_backfill_request(&request.payload) {
+                Ok(backfill) => backfill,
+                Err(UpdateCodecError::InvalidLoroMetadata) => {
+                    return response(
+                        request,
+                        UPDATE_ERROR,
+                        encode_update_error(UpdateErrorCode::InvalidLoroMetadata),
+                    );
+                }
+                Err(_error) => {
+                    return response(
+                        request,
+                        UPDATE_ERROR,
+                        encode_update_error(UpdateErrorCode::Malformed),
+                    );
+                }
+            };
+            let start = match backfill.start {
+                VectorBackfillStart::Origin => StoreVectorBackfillStart::Origin,
+                VectorBackfillStart::Continue(cursor) => StoreVectorBackfillStart::Continue(cursor),
+            };
+            let example_cursor = [0_u8; 32];
+            let response_overhead =
+                vector_backfill_response_base_length(Some(&example_cursor)).map_err(codec_error)?;
+            let metadata_byte_limit = MAX_APPLICATION_PAYLOAD_LENGTH
+                .checked_sub(response_overhead)
+                .ok_or_else(|| io::Error::other("vector response overhead exceeds frame"))?;
+            let selected = store.lock().await.vector_backfill_authorized(
+                backfill.document_id,
+                backfill.authority.capability_id,
+                &backfill.authority.authenticator,
+                &backfill.oplog_version,
+                start,
+                metadata_byte_limit,
+            );
+            let authorized = match selected {
+                Ok(StoreVectorBackfillOutcome::Authorized(page)) => page,
+                Ok(StoreVectorBackfillOutcome::AuthorizationDenied) => {
+                    return response(
+                        request,
+                        UPDATE_ERROR,
+                        encode_update_error(UpdateErrorCode::AuthorizationDenied),
+                    );
+                }
+                Ok(StoreVectorBackfillOutcome::InvalidContinuation) => {
+                    return response(
+                        request,
+                        UPDATE_ERROR,
+                        encode_update_error(UpdateErrorCode::InvalidOrExpiredContinuation),
+                    );
+                }
+                Ok(StoreVectorBackfillOutcome::Backpressure) => {
+                    return response(
+                        request,
+                        UPDATE_ERROR,
+                        encode_update_error(UpdateErrorCode::Backpressure),
+                    );
+                }
+                Err(error) => return Err(store_error(error)),
+            };
+            response(
+                request,
+                VECTOR_BACKFILL_RESPONSE,
+                encode_vector_backfill_response(&VectorBackfillResponse {
+                    has_more: authorized.page.has_more,
+                    next_cursor: authorized.next_cursor,
+                    updates: authorized
+                        .page
+                        .updates
+                        .into_iter()
+                        .map(|(_sequence, metadata)| metadata)
+                        .collect(),
                 })
                 .map_err(codec_error)?,
             )

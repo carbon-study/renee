@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included};
 
 use renee_types::{
-    AcceptanceSequence, Authenticator, CapabilityId, DocumentId, ImmutableUpdate, Operation,
-    OperationSet, RequestId, UpdateId, UpdateMetadata,
+    AcceptanceSequence, Authenticator, CapabilityId, DocumentId, ImmutableUpdate, LoroOplogVersion,
+    Operation, OperationSet, RequestId, UpdateId, UpdateMetadata,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -522,6 +522,23 @@ impl UpdateModel {
                     },
                 ))
             })
+    }
+
+    /// Selects metadata with an advertised range beyond the supplied Loro version.
+    pub fn vector_backfill<'a>(
+        &'a self,
+        document_id: DocumentId,
+        oplog_version: &'a LoroOplogVersion,
+        after: Option<AcceptanceSequence>,
+        terminal_sequence: AcceptanceSequence,
+    ) -> impl Iterator<Item = (AcceptanceSequence, UpdateMetadata)> + 'a {
+        self.enumerate(document_id, after, terminal_sequence).filter(
+            move |(_sequence, metadata)| {
+                metadata.public_loro_ranges.as_slice().iter().any(|range| {
+                    range.end_counter() > oplog_version.end_counter_for(range.peer_id())
+                })
+            },
+        )
     }
 
     /// Fetches an authorized opaque payload by its complete idempotency key.
