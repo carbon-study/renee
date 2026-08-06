@@ -23,6 +23,8 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior, params,
 };
 
+pub use crate::subscription::{BrokerChannel, UpdateSubscription, UpdateSubscriptionEnd};
+use crate::subscription::{RegisterError, UpdateSubscriptionRegistry};
 use crate::verifier;
 
 const SCHEMA_VERSION: u32 = 3;
@@ -300,6 +302,20 @@ pub enum StoreReadOutcome<Value> {
     InvalidCursor,
 }
 
+/// Authorization-preserving result of creating a broker-local update subscription.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "broker-local subscription IPC is not on the public wire")
+)]
+pub enum StoreSubscribeOutcome {
+    /// The subscription is installed and eligible before this acknowledgement returns.
+    Acknowledged(UpdateSubscription),
+    /// Channel identity or document-scoped read authority was denied.
+    AuthorizationDenied,
+    /// A finite broker subscription bound was reached.
+    Backpressure,
+}
+
 /// One authorized finite-window page and its captured high water.
 pub struct AuthorizedStoredUpdatePage {
     /// Page selected under the same transaction as authorization.
@@ -311,6 +327,7 @@ pub struct AuthorizedStoredUpdatePage {
 /// Authoritative capability and immutable-update `SQLite` connection.
 pub struct DurableUpdateStore {
     connection: Connection,
+    subscriptions: UpdateSubscriptionRegistry,
 }
 
 fn provision_create_authority(
@@ -394,9 +411,113 @@ impl DurableUpdateStore {
         connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         synchronize_directory(parent)?;
 
-        let mut store = Self { connection };
+        let mut store = Self { connection, subscriptions: UpdateSubscriptionRegistry::new() };
         store.validate()?;
         Ok(store)
+    }
+
+    /// Opens one unforgeable broker-local channel lease.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "broker-local subscription IPC is not on the public wire")
+    )]
+    pub fn open_broker_channel(&mut self) -> Option<BrokerChannel> {
+        self.subscriptions.open_channel()
+    }
+
+    /// Authorizes and installs one document-scoped update subscription.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "broker-local subscription IPC is not on the public wire")
+    )]
+    pub fn subscribe_updates(
+        &mut self,
+        channel: &BrokerChannel,
+        document_id: DocumentId,
+        capability_id: CapabilityId,
+        authenticator: &Authenticator,
+    ) -> Result<StoreSubscribeOutcome, StoreError> {
+        self.subscribe_updates_internal(channel, document_id, capability_id, authenticator, || {})
+    }
+
+    #[cfg(test)]
+    fn subscribe_updates_with_test_barrier(
+        &mut self,
+        channel: &BrokerChannel,
+        document_id: DocumentId,
+        capability_id: CapabilityId,
+        authenticator: &Authenticator,
+        before_acknowledgement: impl FnOnce(),
+    ) -> Result<StoreSubscribeOutcome, StoreError> {
+        self.subscribe_updates_internal(
+            channel,
+            document_id,
+            capability_id,
+            authenticator,
+            before_acknowledgement,
+        )
+    }
+
+    fn subscribe_updates_internal(
+        &mut self,
+        channel: &BrokerChannel,
+        document_id: DocumentId,
+        capability_id: CapabilityId,
+        authenticator: &Authenticator,
+        before_acknowledgement: impl FnOnce(),
+    ) -> Result<StoreSubscribeOutcome, StoreError> {
+        if !self.subscriptions.recognizes(channel) {
+            return Ok(StoreSubscribeOutcome::AuthorizationDenied);
+        }
+        let transaction =
+            self.connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        if !authorize(&transaction, document_id, capability_id, authenticator, Operation::Read)? {
+            return Ok(StoreSubscribeOutcome::AuthorizationDenied);
+        }
+        transaction.commit()?;
+        let subscription = match self.subscriptions.register(channel, document_id, capability_id) {
+            Ok(subscription) => subscription,
+            Err(RegisterError::InvalidChannel) => {
+                return Ok(StoreSubscribeOutcome::AuthorizationDenied);
+            }
+            Err(RegisterError::Backpressure) => return Ok(StoreSubscribeOutcome::Backpressure),
+        };
+        before_acknowledgement();
+        Ok(StoreSubscribeOutcome::Acknowledged(subscription))
+    }
+
+    /// Invalidates all subscriptions issued on one lost broker-local channel.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "broker-local subscription IPC is not on the public wire")
+    )]
+    pub fn close_broker_channel(&mut self, channel: BrokerChannel) {
+        self.subscriptions.close_channel(channel);
+    }
+
+    /// Invalidates subscriptions after the named document's retirement is durable.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "broker-local subscription IPC is not on the public wire")
+    )]
+    pub fn publish_committed_retirement(
+        &mut self,
+        document_id: DocumentId,
+    ) -> Result<(), StoreError> {
+        let document_bytes = document_id.into_bytes();
+        let retired = self
+            .connection
+            .query_row(
+                "SELECT state FROM documents WHERE document_id = ?1",
+                params![document_bytes.as_slice()],
+                |row| row.get::<_, u8>(0),
+            )
+            .optional()?
+            == Some(1);
+        if retired {
+            self.subscriptions.invalidate_document(document_id, UpdateSubscriptionEnd::Retired);
+        }
+        Ok(())
     }
 
     /// Creates one active document and its unique full-operation root capability.
@@ -930,6 +1051,7 @@ impl DurableUpdateStore {
         #[cfg(feature = "conformance")] before_exact_retry: impl FnOnce() -> Result<(), StoreError>,
     ) -> Result<StoreControlOutcome, StoreError> {
         let normalized_input = target_capability_id.into_bytes();
+        let subscription_contexts = self.subscriptions.contexts(document_id);
         let transaction =
             self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(outcome) = resolve_control_receipt(
@@ -979,6 +1101,17 @@ impl DurableUpdateStore {
         )? {
             return Ok(StoreControlOutcome::LimitExceeded);
         }
+        let mut revoked_subscription_ids = Vec::new();
+        for context in subscription_contexts {
+            if is_descendant_or_self(
+                &transaction,
+                document_id,
+                target_capability_id,
+                context.capability_id,
+            )? {
+                revoked_subscription_ids.push(context.subscription_id);
+            }
+        }
         let document_bytes = document_id.into_bytes();
         let target_bytes = target_capability_id.into_bytes();
         transaction.execute(
@@ -1009,6 +1142,8 @@ impl DurableUpdateStore {
         #[cfg(feature = "conformance")]
         before_commit()?;
         transaction.commit()?;
+        self.subscriptions
+            .invalidate_subscriptions(&revoked_subscription_ids, UpdateSubscriptionEnd::Revoked);
         Ok(StoreControlOutcome::Inserted)
     }
 
@@ -1149,6 +1284,7 @@ impl DurableUpdateStore {
         #[cfg(feature = "conformance")]
         before_commit()?;
         transaction.commit()?;
+        self.subscriptions.notify(update.document_id(), update.update_id());
         Ok(StoreAcceptOutcome::Inserted)
     }
 
@@ -2111,6 +2247,35 @@ fn is_active_descendant(
     Ok(false)
 }
 
+fn is_descendant_or_self(
+    transaction: &Transaction<'_>,
+    document_id: DocumentId,
+    ancestor_capability_id: CapabilityId,
+    candidate_capability_id: CapabilityId,
+) -> Result<bool, StoreError> {
+    let document_bytes = document_id.into_bytes();
+    let mut current = candidate_capability_id;
+    for _depth in 0..MAX_CAPABILITY_DEPTH {
+        if current == ancestor_capability_id {
+            return Ok(true);
+        }
+        let current_bytes = current.into_bytes();
+        let parent = transaction
+            .query_row(
+                "SELECT parent_capability_id FROM capabilities
+                 WHERE document_id = ?1 AND capability_id = ?2",
+                params![document_bytes.as_slice(), current_bytes.as_slice()],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?;
+        let Some(Some(parent)) = parent else {
+            return Ok(false);
+        };
+        current = CapabilityId::from_bytes(decode_identifier(&parent)?);
+    }
+    Ok(false)
+}
+
 fn authorize(
     transaction: &Transaction<'_>,
     document_id: DocumentId,
@@ -2346,11 +2511,315 @@ impl From<std::io::Error> for StoreError {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use renee_types::{LoroRange, PublicLoroRanges};
     use renee_wire::encode_update_record;
 
+    use crate::subscription::{UPDATE_NOTIFICATION_QUEUE_CAPACITY, UpdateSubscriptionPoll};
+
     use super::*;
+
+    #[test]
+    fn acknowledged_subscription_closes_the_acceptance_race_and_notifies_submitter() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let document_id = DocumentId::from_bytes([0x71; IDENTIFIER_LENGTH]);
+        let capability_id = CapabilityId::from_bytes([0x72; IDENTIFIER_LENGTH]);
+        let authenticator = Authenticator::from_bytes([0x73; 32]);
+        let mut store = open_store(&database);
+        create_fixture_document(&mut store, document_id, capability_id, &authenticator, 0x74);
+        let channel = store.open_broker_channel().expect("channel id must remain available");
+        let store = Arc::new(Mutex::new(store));
+        let update = fixture_update_for(document_id, 0x75);
+        let encoded = encode_update_record(&update).expect("fixture record must encode");
+
+        let (registered_sender, registered_receiver) = std::sync::mpsc::channel();
+        let (attempted_sender, attempted_receiver) = std::sync::mpsc::channel();
+        let subscription_authenticator = authenticator.clone();
+        let (subscription_result, acceptance_result) = std::thread::scope(|scope| {
+            let subscription_store = Arc::clone(&store);
+            let subscription_thread = scope.spawn(move || {
+                let mut store_guard =
+                    subscription_store.lock().expect("store lock must remain usable");
+                let result = store_guard.subscribe_updates_with_test_barrier(
+                    &channel,
+                    document_id,
+                    capability_id,
+                    &subscription_authenticator,
+                    || {
+                        registered_sender.send(()).expect("race signal must send");
+                        attempted_receiver.recv().expect("accept attempt must arrive");
+                    },
+                );
+                (result, channel)
+            });
+            let acceptance_store = Arc::clone(&store);
+            let acceptance_thread = scope.spawn(move || {
+                registered_receiver.recv().expect("subscription must become eligible");
+                assert!(
+                    acceptance_store.try_lock().is_err(),
+                    "acceptance must remain serialized until acknowledgement"
+                );
+                attempted_sender.send(()).expect("race signal must send");
+                acceptance_store.lock().expect("store lock must remain usable").accept(
+                    capability_id,
+                    &authenticator,
+                    &update,
+                    &encoded,
+                )
+            });
+            (
+                subscription_thread.join().expect("subscription thread must finish"),
+                acceptance_thread.join().expect("acceptance thread must finish"),
+            )
+        });
+
+        let (subscription_result, _channel) = subscription_result;
+        let StoreSubscribeOutcome::Acknowledged(mut subscription) =
+            subscription_result.expect("subscription must resolve")
+        else {
+            panic!("read-authorized subscription must be acknowledged");
+        };
+        assert_eq!(
+            acceptance_result.expect("acceptance must resolve"),
+            StoreAcceptOutcome::Inserted
+        );
+        assert_eq!(
+            subscription.try_next(),
+            UpdateSubscriptionPoll::Notification(UpdateId::from_bytes([0x75; IDENTIFIER_LENGTH]))
+        );
+    }
+
+    #[test]
+    fn subscription_authorization_is_non_disclosing_and_document_scoped() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let first_document = DocumentId::from_bytes([0x81; IDENTIFIER_LENGTH]);
+        let first_capability = CapabilityId::from_bytes([0x82; IDENTIFIER_LENGTH]);
+        let first_authenticator = Authenticator::from_bytes([0x83; 32]);
+        let second_document = DocumentId::from_bytes([0x84; IDENTIFIER_LENGTH]);
+        let second_capability = CapabilityId::from_bytes([0x85; IDENTIFIER_LENGTH]);
+        let second_authenticator = Authenticator::from_bytes([0x86; 32]);
+        let mut store = open_store(&database);
+        create_fixture_document(
+            &mut store,
+            first_document,
+            first_capability,
+            &first_authenticator,
+            0x87,
+        );
+        create_fixture_document(
+            &mut store,
+            second_document,
+            second_capability,
+            &second_authenticator,
+            0x88,
+        );
+        let channel = store.open_broker_channel().expect("channel id must remain available");
+        let StoreSubscribeOutcome::Acknowledged(mut subscription) = store
+            .subscribe_updates(&channel, first_document, first_capability, &first_authenticator)
+            .expect("authorized subscription must resolve")
+        else {
+            panic!("read-authorized subscription must be acknowledged");
+        };
+
+        for (document_id, capability_id, authenticator) in [
+            (first_document, second_capability, second_authenticator.clone()),
+            (
+                first_document,
+                CapabilityId::from_bytes([0xff; IDENTIFIER_LENGTH]),
+                Authenticator::from_bytes([0xff; 32]),
+            ),
+            (second_document, first_capability, first_authenticator),
+        ] {
+            assert!(matches!(
+                store
+                    .subscribe_updates(&channel, document_id, capability_id, &authenticator)
+                    .expect("denial must resolve"),
+                StoreSubscribeOutcome::AuthorizationDenied
+            ));
+        }
+
+        let update = fixture_update_for(second_document, 0x89);
+        let encoded = encode_update_record(&update).expect("fixture record must encode");
+        assert_eq!(
+            store
+                .accept(second_capability, &second_authenticator, &update, &encoded)
+                .expect("other document acceptance must commit"),
+            StoreAcceptOutcome::Inserted
+        );
+        assert_eq!(subscription.try_next(), UpdateSubscriptionPoll::Pending);
+    }
+
+    #[test]
+    fn bounded_subscription_overflow_is_explicit_and_terminal() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let document_id = DocumentId::from_bytes([0x91; IDENTIFIER_LENGTH]);
+        let capability_id = CapabilityId::from_bytes([0x92; IDENTIFIER_LENGTH]);
+        let authenticator = Authenticator::from_bytes([0x93; 32]);
+        let mut store = open_store(&database);
+        create_fixture_document(&mut store, document_id, capability_id, &authenticator, 0x94);
+        let channel = store.open_broker_channel().expect("channel id must remain available");
+        let StoreSubscribeOutcome::Acknowledged(mut subscription) = store
+            .subscribe_updates(&channel, document_id, capability_id, &authenticator)
+            .expect("subscription must resolve")
+        else {
+            panic!("read-authorized subscription must be acknowledged");
+        };
+
+        for offset in 0..=UPDATE_NOTIFICATION_QUEUE_CAPACITY {
+            let marker = u8::try_from(offset + 1).expect("bounded marker must fit");
+            let update = fixture_update_for(document_id, marker);
+            let encoded = encode_update_record(&update).expect("fixture record must encode");
+            assert_eq!(
+                store
+                    .accept(capability_id, &authenticator, &update, &encoded)
+                    .expect("bounded acceptance must commit"),
+                StoreAcceptOutcome::Inserted
+            );
+        }
+        assert_eq!(
+            subscription.try_next(),
+            UpdateSubscriptionPoll::Invalidated(UpdateSubscriptionEnd::Overflowed)
+        );
+    }
+
+    #[test]
+    fn cancellation_and_channel_loss_invalidate_without_progress_claims() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let document_id = DocumentId::from_bytes([0xa4; IDENTIFIER_LENGTH]);
+        let capability_id = CapabilityId::from_bytes([0xa5; IDENTIFIER_LENGTH]);
+        let authenticator = Authenticator::from_bytes([0xa6; 32]);
+        let mut store = open_store(&database);
+        create_fixture_document(&mut store, document_id, capability_id, &authenticator, 0xa7);
+
+        let channel = store.open_broker_channel().expect("channel id must remain available");
+        let StoreSubscribeOutcome::Acknowledged(mut cancelled) = store
+            .subscribe_updates(&channel, document_id, capability_id, &authenticator)
+            .expect("subscription must resolve")
+        else {
+            panic!("read-authorized subscription must be acknowledged");
+        };
+        cancelled.cancel();
+        assert_eq!(
+            cancelled.try_next(),
+            UpdateSubscriptionPoll::Invalidated(UpdateSubscriptionEnd::Cancelled)
+        );
+
+        let StoreSubscribeOutcome::Acknowledged(mut lost) = store
+            .subscribe_updates(&channel, document_id, capability_id, &authenticator)
+            .expect("subscription must resolve")
+        else {
+            panic!("read-authorized subscription must be acknowledged");
+        };
+        store.close_broker_channel(channel);
+        assert_eq!(
+            lost.try_next(),
+            UpdateSubscriptionPoll::Invalidated(UpdateSubscriptionEnd::ChannelLost)
+        );
+    }
+
+    #[test]
+    fn committed_revocation_and_retirement_invalidate_affected_subscriptions() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let document_id = DocumentId::from_bytes([0xb4; IDENTIFIER_LENGTH]);
+        let root_capability = CapabilityId::from_bytes([0xb5; IDENTIFIER_LENGTH]);
+        let root_authenticator = Authenticator::from_bytes([0xb6; 32]);
+        let child_capability = CapabilityId::from_bytes([0xb7; IDENTIFIER_LENGTH]);
+        let child_authenticator = Authenticator::from_bytes([0xb8; 32]);
+        let mut store = open_store(&database);
+        create_fixture_document(
+            &mut store,
+            document_id,
+            root_capability,
+            &root_authenticator,
+            0xb9,
+        );
+        assert_eq!(
+            store
+                .grant_capability(
+                    document_id,
+                    root_capability,
+                    &root_authenticator,
+                    RequestId::from_bytes([0xba; IDENTIFIER_LENGTH]),
+                    child_capability,
+                    &child_authenticator,
+                    OperationSet::one(Operation::Read),
+                )
+                .expect("read grant must commit"),
+            StoreControlOutcome::Inserted
+        );
+        let channel = store.open_broker_channel().expect("channel id must remain available");
+        let StoreSubscribeOutcome::Acknowledged(mut revoked) = store
+            .subscribe_updates(&channel, document_id, child_capability, &child_authenticator)
+            .expect("child subscription must resolve")
+        else {
+            panic!("read-authorized child subscription must be acknowledged");
+        };
+        assert_eq!(
+            store
+                .revoke_capability(
+                    document_id,
+                    root_capability,
+                    &root_authenticator,
+                    RequestId::from_bytes([0xbb; IDENTIFIER_LENGTH]),
+                    child_capability,
+                )
+                .expect("revoke must commit"),
+            StoreControlOutcome::Inserted
+        );
+        assert_eq!(
+            revoked.try_next(),
+            UpdateSubscriptionPoll::Invalidated(UpdateSubscriptionEnd::Revoked)
+        );
+
+        let StoreSubscribeOutcome::Acknowledged(mut retired) = store
+            .subscribe_updates(&channel, document_id, root_capability, &root_authenticator)
+            .expect("root subscription must resolve")
+        else {
+            panic!("root subscription must be acknowledged");
+        };
+        let document_bytes = document_id.into_bytes();
+        store
+            .connection
+            .execute(
+                "UPDATE documents SET state = 1 WHERE document_id = ?1",
+                params![document_bytes.as_slice()],
+            )
+            .expect("retirement fixture must commit");
+        store.publish_committed_retirement(document_id).expect("durable retirement must publish");
+        assert_eq!(
+            retired.try_next(),
+            UpdateSubscriptionPoll::Invalidated(UpdateSubscriptionEnd::Retired)
+        );
+    }
+
+    #[test]
+    fn broker_shutdown_invalidates_acknowledged_subscriptions() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let document_id = DocumentId::from_bytes([0xc4; IDENTIFIER_LENGTH]);
+        let capability_id = CapabilityId::from_bytes([0xc5; IDENTIFIER_LENGTH]);
+        let authenticator = Authenticator::from_bytes([0xc6; 32]);
+        let mut store = open_store(&database);
+        create_fixture_document(&mut store, document_id, capability_id, &authenticator, 0xc7);
+        let channel = store.open_broker_channel().expect("channel id must remain available");
+        let StoreSubscribeOutcome::Acknowledged(mut subscription) = store
+            .subscribe_updates(&channel, document_id, capability_id, &authenticator)
+            .expect("subscription must resolve")
+        else {
+            panic!("read-authorized subscription must be acknowledged");
+        };
+        drop(store);
+        assert_eq!(
+            subscription.try_next(),
+            UpdateSubscriptionPoll::Invalidated(UpdateSubscriptionEnd::BrokerShutdown)
+        );
+    }
 
     #[test]
     fn clean_reopen_preserves_exact_retry_enumeration_and_fetch() {
@@ -2695,6 +3164,40 @@ mod tests {
             live_verifier: pair.live,
             receipt_verifier: pair.receipt,
         }
+    }
+
+    fn create_fixture_document(
+        store: &mut DurableUpdateStore,
+        document_id: DocumentId,
+        capability_id: CapabilityId,
+        authenticator: &Authenticator,
+        request_marker: u8,
+    ) {
+        assert_eq!(
+            store
+                .create_document(
+                    create_authority_id(),
+                    &create_authenticator(),
+                    RequestId::from_bytes([request_marker; IDENTIFIER_LENGTH]),
+                    document_id,
+                    capability_id,
+                    authenticator,
+                )
+                .expect("fixture document creation must commit"),
+            StoreCreateOutcome::Inserted
+        );
+    }
+
+    fn fixture_update_for(document_id: DocumentId, marker: u8) -> ImmutableUpdate {
+        ImmutableUpdate::new(
+            document_id,
+            UpdateId::from_bytes([marker; IDENTIFIER_LENGTH]),
+            PublicLoroRanges::new(vec![
+                LoroRange::new(u64::from(marker), 0, 1).expect("fixture range must be valid"),
+            ])
+            .expect("fixture ranges must be canonical"),
+            vec![marker],
+        )
     }
 
     fn fixture_update() -> ImmutableUpdate {

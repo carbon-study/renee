@@ -3,6 +3,11 @@
 #![forbid(unsafe_code)]
 
 mod store;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "broker-local subscription IPC is not on the public wire")
+)]
+mod subscription;
 #[cfg(feature = "conformance")]
 mod test_barrier;
 mod verifier;
