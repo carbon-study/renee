@@ -6,16 +6,16 @@ use std::io;
 use std::time::Duration;
 
 use renee_subject::{
-    CONFORMANCE_CREATE_AUTHENTICATOR, CreateDocumentObservation, HarnessResult, ServerHarness,
-    UpdateSubscriptionEvent,
+    CONFORMANCE_CREATE_AUTHENTICATOR, ControlMutationObservation, CreateDocumentObservation,
+    HarnessResult, ServerHarness, UpdateSubscriptionEvent,
 };
 use renee_types::{
     Authenticator, CapabilityId, CreateAuthorityId, DocumentId, ImmutableUpdate, LoroRange,
-    PublicLoroRanges, RequestId, UpdateId,
+    Operation, OperationSet, PublicLoroRanges, RequestId, UpdateId,
 };
 use renee_wire::{
-    CapabilityAuthority, CreateAuthority, CreateDocumentRequest, UpdateErrorCode,
-    encode_update_record,
+    CapabilityAuthority, CreateAuthority, CreateDocumentRequest, GrantCapabilityRequest,
+    RevokeCapabilityRequest, UpdateErrorCode, encode_update_record,
 };
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -211,5 +211,73 @@ async fn disconnect_discards_connection_bound_subscriptions() -> HarnessResult<(
         return Err(io::Error::other("replacement subscription did not own delivery").into());
     }
     server.ensure_process_tree_is_running()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn committed_revocation_emits_generic_terminal_invalidation() -> HarnessResult<()> {
+    let server = ServerHarness::start().await?;
+    let connection = server.connect_webtransport().await?;
+    connection.negotiate().await?;
+    let root = create_root(&connection, 0x15).await?;
+    let reader = CapabilityAuthority {
+        capability_id: CapabilityId::from_bytes([0x75; 16]),
+        authenticator: Authenticator::from_bytes([0x76; 32]),
+    };
+    if connection
+        .grant_capability(&GrantCapabilityRequest {
+            document_id: root.document_id,
+            issuer: root.root.clone(),
+            request_id: RequestId::from_bytes([0x77; 16]),
+            descendant: reader.clone(),
+            operations: OperationSet::one(Operation::Read),
+        })
+        .await?
+        != ControlMutationObservation::Inserted
+    {
+        return Err(io::Error::other("reader capability was not granted").into());
+    }
+    let subscription = connection.subscribe_updates(&reader, root.document_id).await?;
+    if connection
+        .revoke_capability(&RevokeCapabilityRequest {
+            document_id: root.document_id,
+            issuer: root.root.clone(),
+            request_id: RequestId::from_bytes([0x78; 16]),
+            target_capability_id: reader.capability_id,
+        })
+        .await?
+        != ControlMutationObservation::Inserted
+    {
+        return Err(io::Error::other("reader revocation was not committed").into());
+    }
+    let event =
+        tokio::time::timeout(EVENT_TIMEOUT, connection.next_update_subscription_event()).await??;
+    if event
+        != (UpdateSubscriptionEvent::Invalidated {
+            correlation_id: subscription.correlation_id,
+            subscription_id: subscription.subscription_id,
+        })
+    {
+        return Err(io::Error::other("revocation cause or subscription identity leaked").into());
+    }
+    let replacement = connection.subscribe_updates(&root.root, root.document_id).await?;
+    connection.cancel_update_subscription(replacement.subscription_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_forwarders_are_reaped_across_repeated_subscription_cycles() -> HarnessResult<()>
+{
+    let server = ServerHarness::start().await?;
+    let connection = server.connect_webtransport().await?;
+    connection.negotiate().await?;
+    let root = create_root(&connection, 0x16).await?;
+
+    // Exceed the concurrent per-channel bound twice over. This remains valid
+    // only if each cancelled forwarding task is reaped before later opens.
+    for _cycle in 0..64 {
+        let subscription = connection.subscribe_updates(&root.root, root.document_id).await?;
+        connection.cancel_update_subscription(subscription.subscription_id).await?;
+    }
     Ok(())
 }

@@ -26,14 +26,16 @@ use renee_wire::{
     MAX_APPLICATION_PAYLOAD_LENGTH, PROFILE, PROTOCOL_ERROR, REVOKE_CAPABILITY,
     REVOKE_CAPABILITY_RESPONSE, RevokeCapabilityRequest, SERVER_HELLO, SUBSCRIBE_UPDATES,
     SUBSCRIBE_UPDATES_ACK, SubscribeUpdatesRequest, UPDATE_ERROR, UPDATE_NOTIFICATION,
-    UPDATE_SUBSCRIPTION_OVERFLOW, UpdateErrorCode, UpdateNotification, UpdateSubscriptionId,
-    VERSION, encode_accept_response, encode_acceptance_cursor, encode_authorized_update_request,
-    encode_cancel_update_subscription, encode_capability_error, encode_control_mutation_response,
-    encode_create_document_request, encode_create_document_response, encode_enumerate_request,
-    encode_enumerate_response, encode_fetch_request, encode_fetch_response, encode_frame,
-    encode_grant_capability_request, encode_greeting, encode_revoke_capability_request,
-    encode_subscribe_updates_ack, encode_subscribe_updates_request, encode_update_error,
-    encode_update_notification, encode_update_record, encode_update_subscription_overflow,
+    UPDATE_SUBSCRIPTION_INVALIDATED, UPDATE_SUBSCRIPTION_OVERFLOW, UpdateErrorCode,
+    UpdateNotification, UpdateSubscriptionId, VERSION, encode_accept_response,
+    encode_acceptance_cursor, encode_authorized_update_request, encode_cancel_update_subscription,
+    encode_capability_error, encode_control_mutation_response, encode_create_document_request,
+    encode_create_document_response, encode_enumerate_request, encode_enumerate_response,
+    encode_fetch_request, encode_fetch_response, encode_frame, encode_grant_capability_request,
+    encode_greeting, encode_revoke_capability_request, encode_subscribe_updates_ack,
+    encode_subscribe_updates_request, encode_update_error, encode_update_notification,
+    encode_update_record, encode_update_subscription_invalidated,
+    encode_update_subscription_overflow,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
@@ -330,6 +332,13 @@ pub fn generate() -> Result<String, GenerateError> {
             UPDATE_SUBSCRIPTION_OVERFLOW,
             0x42,
             encode_update_subscription_overflow(subscription_id),
+        )?,
+        frame(
+            "subscription.invalidated",
+            "subscription",
+            UPDATE_SUBSCRIPTION_INVALIDATED,
+            0x42,
+            encode_update_subscription_invalidated(subscription_id),
         )?,
         frame(
             "subscription.cancel.request",

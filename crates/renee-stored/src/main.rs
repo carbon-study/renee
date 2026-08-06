@@ -27,15 +27,16 @@ use renee_wire::{
     EnumerateStart, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE, GRANT_CAPABILITY,
     GRANT_CAPABILITY_RESPONSE, MAX_APPLICATION_PAYLOAD_LENGTH, REVOKE_CAPABILITY,
     REVOKE_CAPABILITY_RESPONSE, SUBSCRIBE_UPDATES, SUBSCRIBE_UPDATES_ACK, UPDATE_ERROR,
-    UPDATE_NOTIFICATION, UPDATE_SUBSCRIPTION_OVERFLOW, UpdateErrorCode, UpdateNotification,
-    UpdateSubscriptionId, VERSION, decode_acceptance_cursor, decode_authorized_update_request,
-    decode_body, decode_cancel_update_subscription, decode_create_document_request,
-    decode_enumerate_request, decode_fetch_request, decode_grant_capability_request,
-    decode_revoke_capability_request, decode_subscribe_updates_request, decode_update_record,
-    encode_accept_response, encode_acceptance_cursor, encode_body,
-    encode_cancel_update_subscription, encode_capability_error, encode_control_mutation_response,
-    encode_create_document_response, encode_enumerate_response, encode_fetch_response,
-    encode_subscribe_updates_ack, encode_update_error, encode_update_notification,
+    UPDATE_NOTIFICATION, UPDATE_SUBSCRIPTION_INVALIDATED, UPDATE_SUBSCRIPTION_OVERFLOW,
+    UpdateErrorCode, UpdateNotification, UpdateSubscriptionId, VERSION, decode_acceptance_cursor,
+    decode_authorized_update_request, decode_body, decode_cancel_update_subscription,
+    decode_create_document_request, decode_enumerate_request, decode_fetch_request,
+    decode_grant_capability_request, decode_revoke_capability_request,
+    decode_subscribe_updates_request, decode_update_record, encode_accept_response,
+    encode_acceptance_cursor, encode_body, encode_cancel_update_subscription,
+    encode_capability_error, encode_control_mutation_response, encode_create_document_response,
+    encode_enumerate_response, encode_fetch_response, encode_subscribe_updates_ack,
+    encode_update_error, encode_update_notification, encode_update_subscription_invalidated,
     encode_update_subscription_overflow, enumerate_response_base_length, read_body, write_body,
 };
 #[cfg(feature = "conformance")]
@@ -44,7 +45,10 @@ use store::{
     CreateAuthorityProvision, DurableUpdateStore, StoreAcceptOutcome, StoreControlOutcome,
     StoreCreateOutcome, StoreEnumerateStart, StoreReadOutcome, StoreSubscribeOutcome,
 };
-use subscription::{UpdateSubscription, UpdateSubscriptionEnd, UpdateSubscriptionPoll};
+use subscription::{
+    MAX_UPDATE_SUBSCRIPTIONS_PER_CHANNEL, UpdateSubscription, UpdateSubscriptionEnd,
+    UpdateSubscriptionPoll,
+};
 use tokio::io::AsyncReadExt as _;
 use tokio::net::{TcpListener, TcpStream, tcp::OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -280,6 +284,17 @@ async fn serve_connection_with_channel(
         active_subscriptions
             .retain(|_subscription_id, subscription| !subscription.cancellation.is_closed());
         tokio::select! {
+            biased;
+            task = subscription_tasks.join_next(), if !subscription_tasks.is_empty() => {
+                match task {
+                    Some(Ok(())) | None => {}
+                    Some(Err(error)) => {
+                        return Err(io::Error::other(format!(
+                            "subscription forwarding task failed: {error}"
+                        )));
+                    }
+                }
+            }
             event = event_receiver.recv() => {
                 let Some(event) = event else {
                     return Err(io::Error::other("connection event queue closed"));
@@ -309,6 +324,15 @@ async fn serve_connection_with_channel(
                             continue;
                         }
                     };
+                    if subscription_tasks.len() >= MAX_UPDATE_SUBSCRIPTIONS_PER_CHANNEL {
+                        let backpressure = response(
+                            &request,
+                            UPDATE_ERROR,
+                            encode_update_error(UpdateErrorCode::Backpressure),
+                        )?;
+                        write_body(output, &backpressure).await?;
+                        continue;
+                    }
                     let subscription_id =
                         UpdateSubscriptionId::from_bytes(next_subscription_id.to_be_bytes());
                     let Some(following_subscription_id) = next_subscription_id.checked_add(1) else {
@@ -446,16 +470,12 @@ async fn forward_subscription(
                 UPDATE_NOTIFICATION,
                 encode_update_notification(UpdateNotification { subscription_id, update_id }),
             ),
-            UpdateSubscriptionPoll::Invalidated(UpdateSubscriptionEnd::Overflowed) => {
-                (UPDATE_SUBSCRIPTION_OVERFLOW, encode_update_subscription_overflow(subscription_id))
+            UpdateSubscriptionPoll::Invalidated(ended) => {
+                let Some(event) = terminal_subscription_event(ended, subscription_id) else {
+                    return;
+                };
+                event
             }
-            UpdateSubscriptionPoll::Invalidated(
-                UpdateSubscriptionEnd::Cancelled
-                | UpdateSubscriptionEnd::Revoked
-                | UpdateSubscriptionEnd::Retired
-                | UpdateSubscriptionEnd::ChannelLost
-                | UpdateSubscriptionEnd::BrokerShutdown,
-            ) => return,
             #[cfg(test)]
             UpdateSubscriptionPoll::Pending => continue,
         };
@@ -491,6 +511,25 @@ async fn forward_subscription(
                 return;
             }
         }
+    }
+}
+
+fn terminal_subscription_event(
+    ended: UpdateSubscriptionEnd,
+    subscription_id: UpdateSubscriptionId,
+) -> Option<(u16, Vec<u8>)> {
+    match ended {
+        UpdateSubscriptionEnd::Overflowed => Some((
+            UPDATE_SUBSCRIPTION_OVERFLOW,
+            encode_update_subscription_overflow(subscription_id),
+        )),
+        UpdateSubscriptionEnd::Revoked | UpdateSubscriptionEnd::Retired => Some((
+            UPDATE_SUBSCRIPTION_INVALIDATED,
+            encode_update_subscription_invalidated(subscription_id),
+        )),
+        UpdateSubscriptionEnd::Cancelled
+        | UpdateSubscriptionEnd::ChannelLost
+        | UpdateSubscriptionEnd::BrokerShutdown => None,
     }
 }
 
@@ -1007,4 +1046,26 @@ fn emit_readiness(record: &str) -> io::Result<()> {
     let mut output = stdout.lock();
     writeln!(output, "{record}")?;
     output.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revocation_and_retirement_share_one_non_disclosing_terminal_event() {
+        let subscription_id = UpdateSubscriptionId::from_bytes([0x91; 16]);
+        let expected = Some((
+            UPDATE_SUBSCRIPTION_INVALIDATED,
+            encode_update_subscription_invalidated(subscription_id),
+        ));
+        assert_eq!(
+            terminal_subscription_event(UpdateSubscriptionEnd::Revoked, subscription_id),
+            expected
+        );
+        assert_eq!(
+            terminal_subscription_event(UpdateSubscriptionEnd::Retired, subscription_id),
+            expected
+        );
+    }
 }

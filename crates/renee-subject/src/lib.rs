@@ -28,15 +28,16 @@ use renee_wire::{
     GRANT_CAPABILITY_RESPONSE, GrantCapabilityRequest, PROFILE, PROTOCOL_ERROR, REVOKE_CAPABILITY,
     REVOKE_CAPABILITY_RESPONSE, RevokeCapabilityRequest, SERVER_HELLO, SUBSCRIBE_UPDATES,
     SUBSCRIBE_UPDATES_ACK, SubscribeUpdatesRequest, UPDATE_ERROR, UPDATE_NOTIFICATION,
-    UPDATE_SUBSCRIPTION_OVERFLOW, UpdateErrorCode, UpdateSubscriptionId, VERSION,
-    decode_accept_response, decode_body, decode_cancel_update_subscription,
-    decode_capability_error, decode_control_mutation_response, decode_create_document_response,
-    decode_enumerate_response, decode_fetch_response, decode_greeting,
-    decode_subscribe_updates_ack, decode_update_error, decode_update_notification,
-    decode_update_subscription_overflow, encode_authorized_update_request, encode_body,
-    encode_cancel_update_subscription, encode_create_document_request, encode_enumerate_request,
-    encode_fetch_request, encode_grant_capability_request, encode_greeting,
-    encode_revoke_capability_request, encode_subscribe_updates_request, read_body, write_body,
+    UPDATE_SUBSCRIPTION_INVALIDATED, UPDATE_SUBSCRIPTION_OVERFLOW, UpdateErrorCode,
+    UpdateSubscriptionId, VERSION, decode_accept_response, decode_body,
+    decode_cancel_update_subscription, decode_capability_error, decode_control_mutation_response,
+    decode_create_document_response, decode_enumerate_response, decode_fetch_response,
+    decode_greeting, decode_subscribe_updates_ack, decode_update_error, decode_update_notification,
+    decode_update_subscription_invalidated, decode_update_subscription_overflow,
+    encode_authorized_update_request, encode_body, encode_cancel_update_subscription,
+    encode_create_document_request, encode_enumerate_request, encode_fetch_request,
+    encode_grant_capability_request, encode_greeting, encode_revoke_capability_request,
+    encode_subscribe_updates_request, read_body, write_body,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
@@ -205,6 +206,13 @@ pub enum UpdateSubscriptionEvent {
     },
     /// The subscription can no longer support a complete handoff.
     Overflow {
+        /// Request correlation retained for demultiplexing only.
+        correlation_id: [u8; 16],
+        /// Connection-scoped subscription identity.
+        subscription_id: UpdateSubscriptionId,
+    },
+    /// The acknowledged subscription ended without disclosing why.
+    Invalidated {
         /// Request correlation retained for demultiplexing only.
         correlation_id: [u8; 16],
         /// Connection-scoped subscription identity.
@@ -830,6 +838,10 @@ impl WebTransportConnection {
             UPDATE_SUBSCRIPTION_OVERFLOW => Ok(UpdateSubscriptionEvent::Overflow {
                 correlation_id: event.correlation_id,
                 subscription_id: decode_update_subscription_overflow(&event.payload)?,
+            }),
+            UPDATE_SUBSCRIPTION_INVALIDATED => Ok(UpdateSubscriptionEvent::Invalidated {
+                correlation_id: event.correlation_id,
+                subscription_id: decode_update_subscription_invalidated(&event.payload)?,
             }),
             _unexpected => Err(io::Error::other("unexpected subscription event type").into()),
         }

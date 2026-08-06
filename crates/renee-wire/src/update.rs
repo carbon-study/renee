@@ -41,6 +41,8 @@ pub const UPDATE_SUBSCRIPTION_OVERFLOW: u16 = 20;
 pub const CANCEL_UPDATE_SUBSCRIPTION: u16 = 21;
 /// Confirms cancellation without disclosing subscription topology.
 pub const CANCEL_UPDATE_SUBSCRIPTION_RESPONSE: u16 = 22;
+/// Terminal indication that an acknowledged subscription was invalidated.
+pub const UPDATE_SUBSCRIPTION_INVALIDATED: u16 = 23;
 
 const RECORD_MAGIC: [u8; 8] = *b"CARBREC\0";
 const RECORD_VERSION: u16 = 1;
@@ -636,6 +638,18 @@ pub fn decode_update_subscription_overflow(
     decode_subscription_identity(payload)
 }
 
+/// Encodes one generic terminal invalidation without disclosing its cause.
+pub fn encode_update_subscription_invalidated(subscription_id: UpdateSubscriptionId) -> Vec<u8> {
+    encode_subscription_identity(subscription_id)
+}
+
+/// Decodes one complete generic terminal invalidation.
+pub fn decode_update_subscription_invalidated(
+    payload: &[u8],
+) -> Result<UpdateSubscriptionId, UpdateCodecError> {
+    decode_subscription_identity(payload)
+}
+
 /// Encodes one cancellation request or response identity.
 pub fn encode_cancel_update_subscription(subscription_id: UpdateSubscriptionId) -> Vec<u8> {
     encode_subscription_identity(subscription_id)
@@ -650,7 +664,10 @@ pub fn decode_cancel_update_subscription(
 
 /// Returns whether a message is an asynchronous subscription event.
 pub const fn is_update_subscription_event(message_type: u16) -> bool {
-    matches!(message_type, UPDATE_NOTIFICATION | UPDATE_SUBSCRIPTION_OVERFLOW)
+    matches!(
+        message_type,
+        UPDATE_NOTIFICATION | UPDATE_SUBSCRIPTION_OVERFLOW | UPDATE_SUBSCRIPTION_INVALIDATED
+    )
 }
 
 fn encode_subscription_identity(subscription_id: UpdateSubscriptionId) -> Vec<u8> {
@@ -1006,6 +1023,7 @@ mod tests {
         let identity_payloads = [
             encode_subscribe_updates_ack(subscription_id),
             encode_update_subscription_overflow(subscription_id),
+            encode_update_subscription_invalidated(subscription_id),
             encode_cancel_update_subscription(subscription_id),
         ];
         for payload in identity_payloads {
@@ -1019,6 +1037,7 @@ mod tests {
         assert_eq!(decode_update_notification(&encoded_notification), Ok(notification));
         assert!(is_update_subscription_event(UPDATE_NOTIFICATION));
         assert!(is_update_subscription_event(UPDATE_SUBSCRIPTION_OVERFLOW));
+        assert!(is_update_subscription_event(UPDATE_SUBSCRIPTION_INVALIDATED));
         assert!(!is_update_subscription_event(SUBSCRIBE_UPDATES_ACK));
     }
 

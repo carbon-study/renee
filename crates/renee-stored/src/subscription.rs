@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, watch};
 
 pub(crate) const UPDATE_NOTIFICATION_QUEUE_CAPACITY: usize = 8;
 const MAX_UPDATE_SUBSCRIPTIONS: usize = 1_024;
-const MAX_UPDATE_SUBSCRIPTIONS_PER_CHANNEL: usize = 32;
+pub(crate) const MAX_UPDATE_SUBSCRIPTIONS_PER_CHANNEL: usize = 32;
 const MAX_UPDATE_SUBSCRIPTIONS_PER_DOCUMENT: usize = 128;
 
 const ACTIVE: u8 = 0;
