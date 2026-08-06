@@ -548,9 +548,7 @@ pub fn decode_vector_backfill_request(
     let cursor_length = usize::from(u16::from_be_bytes(decoder.take_array()?));
     let start = match (mode, cursor_length) {
         (0, 0) => VectorBackfillStart::Origin,
-        (1, length) if length <= VECTOR_CURSOR_LENGTH => {
-            VectorBackfillStart::Continue(decoder.take(cursor_length)?.to_vec())
-        }
+        (1, length) => VectorBackfillStart::Continue(decoder.take(length)?.to_vec()),
         _invalid => return Err(UpdateCodecError::InvalidCursor),
     };
     let vector_length = usize::from(u16::from_be_bytes(decoder.take_array()?));
@@ -721,6 +719,9 @@ pub fn decode_enumerate_response(payload: &[u8]) -> Result<EnumerateResponse, Up
 pub fn encode_vector_backfill_response(
     response: &VectorBackfillResponse,
 ) -> Result<Vec<u8>, UpdateCodecError> {
+    if response.has_more != response.next_cursor.is_some() {
+        return Err(UpdateCodecError::InvalidCursor);
+    }
     let count = u16::try_from(response.updates.len())
         .map_err(|_error| UpdateCodecError::IntegerOutOfRange)?;
     let cursor_length = match response.next_cursor.as_deref() {
@@ -773,6 +774,9 @@ pub fn decode_vector_backfill_response(
         VECTOR_CURSOR_LENGTH => Some(decoder.take(cursor_length)?.to_vec()),
         _invalid => return Err(UpdateCodecError::InvalidCursor),
     };
+    if has_more != next_cursor.is_some() {
+        return Err(UpdateCodecError::InvalidCursor);
+    }
     let count = usize::from(u16::from_be_bytes(decoder.take_array()?));
     let mut updates = Vec::new();
     for _entry_index in 0..count {
@@ -1354,6 +1358,67 @@ mod tests {
                 &encode_vector_backfill_response(&response).expect("response must encode"),
             ),
             Ok(response),
+        );
+    }
+
+    #[test]
+    fn vector_backfill_decoder_preserves_invalid_token_lengths_for_authorized_rejection() {
+        let request = VectorBackfillRequest {
+            authority: CapabilityAuthority {
+                capability_id: renee_types::CapabilityId::from_bytes([0x71; 16]),
+                authenticator: renee_types::Authenticator::from_bytes([0x72; 32]),
+            },
+            document_id: DocumentId::from_bytes([0x73; 16]),
+            oplog_version: LoroOplogVersion::default(),
+            start: VectorBackfillStart::Origin,
+        };
+        let encoded = encode_vector_backfill_request(&request).expect("request must encode");
+        let mode_offset = 2 + CAPABILITY_AUTHORITY_LENGTH + IDENTIFIER_LENGTH;
+        let cursor_offset = mode_offset + 3;
+        let mut overlength = Vec::with_capacity(encoded.len() + VECTOR_CURSOR_LENGTH + 1);
+        overlength.extend_from_slice(&encoded[..mode_offset]);
+        overlength.push(1);
+        overlength.extend_from_slice(
+            &u16::try_from(VECTOR_CURSOR_LENGTH + 1)
+                .expect("invalid fixture length must fit")
+                .to_be_bytes(),
+        );
+        overlength.extend_from_slice(&[0x74; VECTOR_CURSOR_LENGTH + 1]);
+        overlength.extend_from_slice(&encoded[cursor_offset..]);
+        let decoded = decode_vector_backfill_request(&overlength)
+            .expect("bounded invalid token must reach authorized store validation");
+        assert_eq!(
+            decoded.start,
+            VectorBackfillStart::Continue(vec![0x74; VECTOR_CURSOR_LENGTH + 1]),
+        );
+    }
+
+    #[test]
+    fn vector_backfill_response_rejects_contradictory_pagination_state() {
+        for response in [
+            VectorBackfillResponse { has_more: true, next_cursor: None, updates: Vec::new() },
+            VectorBackfillResponse {
+                has_more: false,
+                next_cursor: Some(vec![0x75; VECTOR_CURSOR_LENGTH]),
+                updates: Vec::new(),
+            },
+        ] {
+            assert_eq!(
+                encode_vector_backfill_response(&response),
+                Err(UpdateCodecError::InvalidCursor),
+            );
+        }
+
+        assert_eq!(
+            decode_vector_backfill_response(&[1, 0, 0, 0, 0]),
+            Err(UpdateCodecError::InvalidCursor),
+        );
+        let mut terminal_with_cursor = vec![0, 0, 32];
+        terminal_with_cursor.extend_from_slice(&[0x75; VECTOR_CURSOR_LENGTH]);
+        terminal_with_cursor.extend_from_slice(&0_u16.to_be_bytes());
+        assert_eq!(
+            decode_vector_backfill_response(&terminal_with_cursor),
+            Err(UpdateCodecError::InvalidCursor),
         );
     }
 

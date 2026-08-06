@@ -489,6 +489,29 @@ pub fn generate() -> Result<String, GenerateError> {
             wrong_subscription_version,
         )?,
     });
+    invalid_payloads.push(InvalidPayloadVector {
+        expected_error: "vector-pagination-state",
+        frame: frame(
+            "vector-backfill.response.more-without-cursor",
+            "vector-backfill",
+            VECTOR_BACKFILL_RESPONSE,
+            0x66,
+            vec![1, 0, 0, 0, 0],
+        )?,
+    });
+    let mut terminal_with_cursor = vec![0, 0, 32];
+    terminal_with_cursor.extend_from_slice(&[0x6a; 32]);
+    terminal_with_cursor.extend_from_slice(&0_u16.to_be_bytes());
+    invalid_payloads.push(InvalidPayloadVector {
+        expected_error: "vector-pagination-state",
+        frame: frame(
+            "vector-backfill.response.terminal-with-cursor",
+            "vector-backfill",
+            VECTOR_BACKFILL_RESPONSE,
+            0x67,
+            terminal_with_cursor,
+        )?,
+    });
     let invalid_frames = invalid_frame_vectors(frames.first().ok_or_else(|| {
         GenerateError::new("golden frame corpus unexpectedly has no first vector")
     })?)?;

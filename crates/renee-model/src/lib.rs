@@ -5,12 +5,12 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Included};
 
 use renee_types::{
     AcceptanceSequence, Authenticator, CapabilityId, DocumentId, ImmutableUpdate, LoroOplogVersion,
-    Operation, OperationSet, RequestId, UpdateId, UpdateMetadata,
+    MAX_LORO_PEERS, Operation, OperationSet, RequestId, UpdateId, UpdateMetadata,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -447,6 +447,8 @@ pub enum AcceptOutcome {
     IdentifierConflict,
     /// The document-scoped acceptance sequence cannot advance.
     CounterExhausted,
+    /// The document-wide Loro peer union exceeds the frozen profile.
+    InvalidLoroMetadata,
 }
 
 #[derive(Debug)]
@@ -459,6 +461,7 @@ struct AcceptedUpdate {
 #[derive(Debug, Default)]
 pub struct UpdateModel {
     acceptance_order: BTreeMap<(DocumentId, AcceptanceSequence), UpdateId>,
+    document_peers: BTreeMap<DocumentId, BTreeSet<u64>>,
     next_sequences: BTreeMap<DocumentId, AcceptanceSequence>,
     updates: BTreeMap<(DocumentId, UpdateId), AcceptedUpdate>,
 }
@@ -480,8 +483,22 @@ impl UpdateModel {
         let Some(next_sequence) = sequence.checked_next() else {
             return AcceptOutcome::CounterExhausted;
         };
+        let existing_peers = self.document_peers.get(&document_id);
+        let additional_peer_count = update
+            .public_loro_ranges()
+            .as_slice()
+            .iter()
+            .filter(|range| existing_peers.is_none_or(|peers| !peers.contains(&range.peer_id())))
+            .count();
+        if existing_peers.map_or(0, BTreeSet::len) + additional_peer_count > MAX_LORO_PEERS {
+            return AcceptOutcome::InvalidLoroMetadata;
+        }
         self.next_sequences.insert(document_id, next_sequence);
         self.acceptance_order.insert((document_id, sequence), update.update_id());
+        self.document_peers
+            .entry(document_id)
+            .or_default()
+            .extend(update.public_loro_ranges().as_slice().iter().map(|range| range.peer_id()));
         self.updates.insert(key, AcceptedUpdate { sequence, update });
         AcceptOutcome::Inserted
     }

@@ -20,6 +20,54 @@ use renee_wire::{
 };
 
 #[tokio::test]
+async fn accepted_document_peer_union_remains_exactly_vector_representable() -> HarnessResult<()> {
+    let server = ServerHarness::start().await?;
+    let connection = server.connect_webtransport().await?;
+    if !matches!(connection.negotiate().await?, NegotiationObservation::Selected { .. }) {
+        return Err(io::Error::other("peer-union fixture did not negotiate").into());
+    }
+    let document = root(0x21);
+    if connection.create_document(&document).await? != CreateDocumentObservation::Inserted {
+        return Err(io::Error::other("peer-union fixture document was not created").into());
+    }
+    let accepted = [
+        peer_union_update(document.document_id, 0x22, 0..248),
+        peer_union_update(document.document_id, 0x23, 248..256),
+    ];
+    let mut model = UpdateModel::default();
+    for update in &accepted {
+        if model.accept(update.clone()) != AcceptOutcome::Inserted
+            || connection.accept_update(&document.root, &encode_update_record(update)?).await?
+                != AcceptObservation::Inserted
+        {
+            return Err(io::Error::other("bounded peer-union update was not accepted").into());
+        }
+    }
+    let excessive = peer_union_update(document.document_id, 0x24, 256..257);
+    if model.accept(excessive.clone()) != AcceptOutcome::InvalidLoroMetadata
+        || connection.accept_update(&document.root, &encode_update_record(&excessive)?).await?
+            != AcceptObservation::InvalidLoroMetadata
+    {
+        return Err(io::Error::other("excessive document peer union was not rejected").into());
+    }
+    let version = LoroOplogVersion::new(
+        (0_u64..256)
+            .map(|peer_id| LoroOplogVersionEntry::new(peer_id, 1))
+            .collect::<Result<Vec<_>, _>>()?,
+    )?;
+    let VectorBackfillObservation::Page(page) =
+        connection.vector_backfill(&document.root, document.document_id, &version, None).await?
+    else {
+        return Err(io::Error::other("exact maximum peer vector was not accepted").into());
+    };
+    if page.has_more || page.next_cursor.is_some() || !page.updates.is_empty() {
+        return Err(io::Error::other("exact maximum peer vector was not converged").into());
+    }
+    connection.close();
+    server.shutdown().await
+}
+
+#[tokio::test]
 #[expect(
     clippy::too_many_lines,
     reason = "one process scenario keeps pagination, stable snapshot, authorization, and malformed input visible"
@@ -40,9 +88,9 @@ async fn authenticated_vector_backfill_is_paginated_stable_and_context_bound() -
     }
 
     let initial = [
-        update(document.document_id, 0x41, 100),
-        update(document.document_id, 0x42, 300),
-        update(document.document_id, 0x43, 500),
+        update(document.document_id, 0x41, 0),
+        update(document.document_id, 0x42, 1),
+        update(document.document_id, 0x43, 2),
     ];
     let mut model = UpdateModel::default();
     for update in &initial {
@@ -80,7 +128,7 @@ async fn authenticated_vector_backfill_is_paginated_stable_and_context_bound() -
         return Err(io::Error::other("vector continuation was not the opaque fixed length").into());
     }
 
-    let accepted_after_snapshot = update(document.document_id, 0x44, 700);
+    let accepted_after_snapshot = update(document.document_id, 0x44, 3);
     if model.accept(accepted_after_snapshot.clone()) != AcceptOutcome::Inserted
         || connection
             .accept_update(&document.root, &encode_update_record(&accepted_after_snapshot)?)
@@ -129,6 +177,28 @@ async fn authenticated_vector_backfill_is_paginated_stable_and_context_bound() -
         return Err(io::Error::other("unknown vector continuation was accepted").into());
     }
 
+    let origin = encode_vector_backfill_request(&VectorBackfillRequest {
+        authority: document.root.clone(),
+        document_id: document.document_id,
+        oplog_version: LoroOplogVersion::default(),
+        start: VectorBackfillStart::Origin,
+    })?;
+    let mode_offset = 2 + 48 + 16;
+    let cursor_offset = mode_offset + 3;
+    let mut overlength_cursor = Vec::with_capacity(origin.len() + 33);
+    overlength_cursor.extend_from_slice(&origin[..mode_offset]);
+    overlength_cursor.push(1);
+    overlength_cursor.extend_from_slice(&[0, 33]);
+    overlength_cursor.extend_from_slice(&[0xee; 33]);
+    overlength_cursor.extend_from_slice(&origin[cursor_offset..]);
+    let overlength_error = connection.malformed_vector_backfill(overlength_cursor).await?;
+    if overlength_error != UpdateErrorCode::InvalidOrExpiredContinuation {
+        return Err(io::Error::other(format!(
+            "overlength continuation disclosed {overlength_error:?}"
+        ))
+        .into());
+    }
+
     let mut malformed = encode_vector_backfill_request(&VectorBackfillRequest {
         authority: document.root.clone(),
         document_id: document.document_id,
@@ -147,9 +217,26 @@ async fn authenticated_vector_backfill_is_paginated_stable_and_context_bound() -
     server.shutdown().await
 }
 
-fn update(document_id: DocumentId, marker: u8, first_peer: u64) -> ImmutableUpdate {
+fn update(document_id: DocumentId, marker: u8, start_counter: u32) -> ImmutableUpdate {
     let ranges = (0_u64..124)
-        .map(|offset| LoroRange::new(first_peer + offset, 0, 1))
+        .map(|offset| LoroRange::new(100 + offset, start_counter, start_counter + 1))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("fixture ranges must be valid");
+    ImmutableUpdate::new(
+        document_id,
+        UpdateId::from_bytes([marker; 16]),
+        PublicLoroRanges::new(ranges).expect("fixture ranges must be canonical"),
+        vec![marker],
+    )
+}
+
+fn peer_union_update(
+    document_id: DocumentId,
+    marker: u8,
+    peers: core::ops::Range<u64>,
+) -> ImmutableUpdate {
+    let ranges = peers
+        .map(|peer_id| LoroRange::new(peer_id, 0, 1))
         .collect::<Result<Vec<_>, _>>()
         .expect("fixture ranges must be valid");
     ImmutableUpdate::new(

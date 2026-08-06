@@ -437,7 +437,7 @@ async fn serve_connection_with_channel(
                     write_body(output, &cancelled).await?;
                     continue;
                 }
-                let response_body = handle_request(&request, store).await?;
+                let response_body = handle_request(&request, store, broker_channel).await?;
                 write_body(output, &response_body).await?;
             }
         }
@@ -546,6 +546,7 @@ fn terminal_subscription_event(
 async fn handle_request(
     request: &Envelope,
     store: &Mutex<DurableUpdateStore>,
+    broker_channel: &store::BrokerChannel,
 ) -> io::Result<Vec<u8>> {
     if request.version != VERSION {
         return response(request, UPDATE_ERROR, encode_update_error(UpdateErrorCode::Malformed));
@@ -820,6 +821,11 @@ async fn handle_request(
                     UPDATE_ERROR,
                     encode_update_error(UpdateErrorCode::CounterExhausted),
                 ),
+                StoreAcceptOutcome::InvalidLoroMetadata => response(
+                    request,
+                    UPDATE_ERROR,
+                    encode_update_error(UpdateErrorCode::InvalidLoroMetadata),
+                ),
                 StoreAcceptOutcome::AuthorizationDenied => response(
                     request,
                     UPDATE_ERROR,
@@ -967,6 +973,7 @@ async fn handle_request(
                 .checked_sub(response_overhead)
                 .ok_or_else(|| io::Error::other("vector response overhead exceeds frame"))?;
             let selected = store.lock().await.vector_backfill_authorized(
+                broker_channel,
                 backfill.document_id,
                 backfill.authority.capability_id,
                 &backfill.authority.authenticator,
@@ -1005,12 +1012,7 @@ async fn handle_request(
                 encode_vector_backfill_response(&VectorBackfillResponse {
                     has_more: authorized.page.has_more,
                     next_cursor: authorized.next_cursor,
-                    updates: authorized
-                        .page
-                        .updates
-                        .into_iter()
-                        .map(|(_sequence, metadata)| metadata)
-                        .collect(),
+                    updates: authorized.page.updates,
                 })
                 .map_err(codec_error)?,
             )

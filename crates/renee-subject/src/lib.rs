@@ -119,6 +119,8 @@ pub enum AcceptObservation {
     IdentifierConflict,
     /// Renee rejected the record structure.
     Malformed,
+    /// The accepted document would exceed the frozen Loro peer profile.
+    InvalidLoroMetadata,
     /// Renee denied the indistinguishable document capability authority.
     AuthorizationDenied,
 }
@@ -650,13 +652,13 @@ impl WebTransportConnection {
             UPDATE_ERROR => match decode_update_error(&response.payload)? {
                 UpdateErrorCode::IdentifierConflict => Ok(AcceptObservation::IdentifierConflict),
                 UpdateErrorCode::Malformed => Ok(AcceptObservation::Malformed),
+                UpdateErrorCode::InvalidLoroMetadata => Ok(AcceptObservation::InvalidLoroMetadata),
                 UpdateErrorCode::AuthorizationDenied => Ok(AcceptObservation::AuthorizationDenied),
                 UpdateErrorCode::NotFound
                 | UpdateErrorCode::NotNegotiated
                 | UpdateErrorCode::InvalidCursor
                 | UpdateErrorCode::CounterExhausted
                 | UpdateErrorCode::Backpressure
-                | UpdateErrorCode::InvalidLoroMetadata
                 | UpdateErrorCode::InvalidOrExpiredContinuation => {
                     Err(io::Error::other("unexpected accept rejection").into())
                 }

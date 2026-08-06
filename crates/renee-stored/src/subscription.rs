@@ -32,6 +32,12 @@ pub struct BrokerChannel {
     lease: Arc<ChannelLease>,
 }
 
+impl BrokerChannel {
+    pub(crate) fn id(&self) -> u64 {
+        self.lease.id
+    }
+}
+
 /// Explicit reason an acknowledged subscription is no longer complete.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UpdateSubscriptionEnd {
