@@ -480,7 +480,7 @@ fn initialize_or_check_schema(connection: &mut Connection) -> Result<(), StoreEr
         }
     } else {
         let object_count = connection.query_row(
-            "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
             [],
             |row| row.get::<_, i64>(0),
         )?;
@@ -3798,6 +3798,44 @@ mod tests {
             .expect("schema lookup must resolve")
             .is_some();
         assert!(!current_table_exists);
+    }
+
+    #[test]
+    fn unrecognized_sqliteevil_database_is_rejected_without_schema_initialization() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let connection = Connection::open(&database).expect("fixture database must open");
+        connection
+            .execute_batch(
+                "CREATE TABLE sqliteevil(value INTEGER NOT NULL) STRICT;
+                 INSERT INTO sqliteevil(value) VALUES (17);",
+            )
+            .expect("unrecognized database fixture must initialize");
+        drop(connection);
+
+        assert!(matches!(
+            DurableUpdateStore::open(&database, create_authority_provision()),
+            Err(StoreError::Corrupt("database does not contain a recognized schema")),
+        ));
+        let reopened = Connection::open(&database).expect("fixture database must remain readable");
+        let value = reopened
+            .query_row("SELECT value FROM sqliteevil", [], |row| row.get::<_, i64>(0))
+            .expect("unrecognized table must remain untouched");
+        assert_eq!(value, 17);
+        let schema_meta_exists = reopened
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'schema_meta'",
+                [],
+                |_row| Ok(()),
+            )
+            .optional()
+            .expect("schema lookup must resolve")
+            .is_some();
+        assert!(!schema_meta_exists);
+        let user_version = reopened
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .expect("user version must remain readable");
+        assert_eq!(user_version, 0);
     }
 
     #[test]
