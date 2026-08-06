@@ -514,7 +514,7 @@ fn schema_objects(connection: &Connection) -> Result<Vec<SchemaObject>, StoreErr
     let mut statement = connection.prepare(
         "SELECT type, name, tbl_name, sql
          FROM sqlite_schema
-         WHERE name NOT LIKE 'sqlite_%'
+         WHERE name NOT GLOB 'sqlite_*'
          ORDER BY type, name",
     )?;
     let rows =
@@ -649,7 +649,7 @@ fn create_limits_exceeded(
 }
 
 impl DurableUpdateStore {
-    /// Opens, configures, initializes, synchronizes, and validates the store.
+    /// Opens, configures, initializes, validates, provisions, and synchronizes the store.
     pub fn open(
         path: &Path,
         create_authority: CreateAuthorityProvision,
@@ -668,8 +668,6 @@ impl DurableUpdateStore {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "wal_autocheckpoint", 1_000_u32)?;
         initialize_or_check_schema(&mut connection)?;
-        provision_create_authority(&connection, create_authority)?;
-        synchronize_directory(parent)?;
 
         let mut store = Self {
             connection,
@@ -678,6 +676,8 @@ impl DurableUpdateStore {
             vector_passes: Vec::new(),
         };
         store.validate()?;
+        provision_create_authority(&store.connection, create_authority)?;
+        synchronize_directory(parent)?;
         Ok(store)
     }
 
@@ -3846,20 +3846,20 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_rejects_an_unexpected_write_trigger() {
+    fn current_schema_does_not_treat_sqliteevil_as_an_internal_trigger() {
         let directory = TestDirectory::create();
         let database = directory.path.join("renee.sqlite3");
         drop(open_store(&database));
         let connection = Connection::open(&database).expect("fixture database must reopen");
         connection
             .execute_batch(
-                "CREATE TRIGGER discard_update_loro_range_insert
-                 BEFORE INSERT ON update_loro_ranges
+                "CREATE TRIGGER sqliteevil
+                 BEFORE INSERT ON document_loro_peers
                  BEGIN
                      SELECT RAISE(IGNORE);
                  END;",
             )
-            .expect("unexpected trigger fixture must install");
+            .expect("sqliteevil trigger fixture must install");
         drop(connection);
 
         assert!(matches!(
@@ -3983,6 +3983,44 @@ mod tests {
         assert!(matches!(
             DurableUpdateStore::open(&database, create_authority_provision()),
             Err(StoreError::Corrupt("SQLite foreign key check failed")),
+        ));
+        let reopened = Connection::open(&database).expect("corrupt fixture must remain readable");
+        let authority_count = reopened
+            .query_row("SELECT COUNT(*) FROM create_authorities", [], |row| row.get::<_, i64>(0))
+            .expect("authority count must remain readable");
+        assert_eq!(authority_count, 0);
+    }
+
+    #[test]
+    fn semantic_recovery_failure_does_not_provision_create_authority() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let connection = Connection::open(&database).expect("fixture database must open");
+        connection.execute_batch(SCHEMA).expect("current schema must initialize");
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .expect("current user version must initialize");
+        let document_id = DocumentId::from_bytes([0xc1; IDENTIFIER_LENGTH]);
+        let root_capability_id = CapabilityId::from_bytes([0xc2; IDENTIFIER_LENGTH]);
+        let document_bytes = document_id.into_bytes();
+        let root_bytes = root_capability_id.into_bytes();
+        connection
+            .execute(
+                "INSERT INTO documents(
+                    document_id, state, control_revision, root_capability_id
+                 ) VALUES (?1, 0, ?2, ?3)",
+                params![
+                    document_bytes.as_slice(),
+                    1_u64.to_be_bytes().as_slice(),
+                    root_bytes.as_slice(),
+                ],
+            )
+            .expect("foreign-key-clean semantic corruption fixture must insert");
+        drop(connection);
+
+        assert!(matches!(
+            DurableUpdateStore::open(&database, create_authority_provision()),
+            Err(StoreError::Corrupt(_)),
         ));
         let reopened = Connection::open(&database).expect("corrupt fixture must remain readable");
         let authority_count = reopened
