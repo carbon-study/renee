@@ -46,7 +46,28 @@ const MAX_VECTOR_PASSES_PER_CHANNEL: usize = 32;
 const MAX_VECTOR_PASSES_PER_DOCUMENT: usize = 32;
 const MAX_VECTOR_SCAN_RECORDS: usize = 64;
 const VECTOR_CONTINUATION_LENGTH: usize = 32;
-const VECTOR_CONTINUATION_TTL: Duration = Duration::from_secs(300);
+const VECTOR_PASS_IDLE_TTL: Duration = Duration::from_secs(300);
+
+const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
+    ("table", "schema_meta"),
+    ("table", "create_authorities"),
+    ("table", "documents"),
+    ("table", "capabilities"),
+    ("index", "one_root_capability_per_document"),
+    ("table", "capability_operations"),
+    ("table", "control_receipts"),
+    ("table", "create_receipts"),
+    ("table", "document_acceptance_sequences"),
+    ("table", "updates"),
+    ("table", "update_loro_ranges"),
+    ("table", "document_loro_peers"),
+    ("trigger", "document_loro_peers_are_immutable"),
+    ("trigger", "document_loro_peers_are_retained"),
+    ("trigger", "update_loro_ranges_are_immutable"),
+    ("trigger", "update_loro_ranges_are_retained"),
+    ("trigger", "updates_are_immutable"),
+    ("trigger", "updates_are_retained"),
+];
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -465,7 +486,20 @@ fn initialize_or_check_schema(connection: &mut Connection) -> Result<(), StoreEr
         )
         .optional()?
         .is_some();
-    if !has_schema {
+    if has_schema {
+        let schema_version = connection.query_row(
+            "SELECT schema_version FROM schema_meta WHERE singleton = 1",
+            [],
+            |row| row.get::<_, u32>(0),
+        )?;
+        if schema_version != SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchema { actual: schema_version });
+        }
+        let user_version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if user_version != SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchema { actual: user_version });
+        }
+    } else {
         let object_count = connection.query_row(
             "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
             [],
@@ -478,20 +512,24 @@ fn initialize_or_check_schema(connection: &mut Connection) -> Result<(), StoreEr
         transaction.execute_batch(SCHEMA)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
-        return Ok(());
     }
+    validate_required_schema_objects(connection)?;
+    Ok(())
+}
 
-    let schema_version = connection.query_row(
-        "SELECT schema_version FROM schema_meta WHERE singleton = 1",
-        [],
-        |row| row.get::<_, u32>(0),
-    )?;
-    if schema_version != SCHEMA_VERSION {
-        return Err(StoreError::UnsupportedSchema { actual: schema_version });
-    }
-    let user_version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if user_version != SCHEMA_VERSION {
-        return Err(StoreError::UnsupportedSchema { actual: user_version });
+fn validate_required_schema_objects(connection: &Connection) -> Result<(), StoreError> {
+    for (object_type, name) in REQUIRED_SCHEMA_OBJECTS {
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2",
+                params![object_type, name],
+                |_row| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Err(StoreError::Corrupt("required durable schema object is absent"));
+        }
     }
     Ok(())
 }
@@ -1689,7 +1727,7 @@ impl DurableUpdateStore {
                         channel_id,
                         current: Some(VectorPassPosition { position, token }),
                         document_id,
-                        expires_at: now + VECTOR_CONTINUATION_TTL,
+                        expires_at: now + VECTOR_PASS_IDLE_TTL,
                         oplog_version: oplog_version.clone(),
                         retry: None,
                         terminal_sequence,
@@ -1729,6 +1767,8 @@ impl DurableUpdateStore {
                     if retry.token == token {
                         let response = retry.response.clone();
                         transaction.commit()?;
+                        self.vector_passes[pass_index].expires_at =
+                            Instant::now() + VECTOR_PASS_IDLE_TTL;
                         return Ok(StoreVectorBackfillOutcome::Authorized(response));
                     }
                 }
@@ -1776,13 +1816,14 @@ impl DurableUpdateStore {
                     page,
                     next_cursor: next_token.map(|next| next.to_vec()),
                 };
+                transaction.commit()?;
                 let mutable_pass = &mut self.vector_passes[pass_index];
                 mutable_pass.current =
                     next_position.zip(next_token).map(|(position, next_token_value)| {
                         VectorPassPosition { position, token: next_token_value }
                     });
                 mutable_pass.retry = Some(VectorPassRetry { response: response.clone(), token });
-                transaction.commit()?;
+                mutable_pass.expires_at = Instant::now() + VECTOR_PASS_IDLE_TTL;
                 Ok(StoreVectorBackfillOutcome::Authorized(response))
             }
         }
@@ -1806,6 +1847,10 @@ impl DurableUpdateStore {
         Ok(StoreReadOutcome::Authorized(payload))
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one recovery snapshot validates control, updates, exact Loro indexes, and counters"
+    )]
     fn validate(&mut self) -> Result<(), StoreError> {
         let integrity =
             self.connection.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))?;
@@ -1826,13 +1871,22 @@ impl DurableUpdateStore {
         validate_create_state(&transaction)?;
         validate_capability_state(&transaction)?;
         let mut maxima = BTreeMap::<DocumentId, AcceptanceSequence>::new();
+        let mut expected_peer_counts = BTreeMap::<DocumentId, usize>::new();
+        let mut expected_peers = BTreeSet::<(DocumentId, u64)>::new();
+        let mut expected_range_count = 0_usize;
         {
-            let mut statement = transaction.prepare(
+            let mut update_statement = transaction.prepare(
                 "SELECT document_id, update_id, acceptance_sequence, encoded_record
                  FROM updates
                  ORDER BY document_id, acceptance_sequence",
             )?;
-            let mut rows = statement.query([])?;
+            let mut range_statement = transaction.prepare(
+                "SELECT peer_id, start_counter, end_counter
+                 FROM update_loro_ranges
+                 WHERE document_id = ?1 AND update_id = ?2
+                 ORDER BY peer_id",
+            )?;
+            let mut rows = update_statement.query([])?;
             while let Some(row) = rows.next()? {
                 let document_id =
                     DocumentId::from_bytes(decode_identifier(&row.get::<_, Vec<u8>>(0)?)?);
@@ -1848,7 +1902,85 @@ impl DurableUpdateStore {
                 if update.document_id() != document_id || update.update_id() != update_id {
                     return Err(StoreError::Corrupt("stored update identity disagrees with index"));
                 }
+                let document_bytes = document_id.into_bytes();
+                let update_bytes = update_id.into_bytes();
+                let mut range_rows = range_statement
+                    .query(params![document_bytes.as_slice(), update_bytes.as_slice(),])?;
+                for expected in update.public_loro_ranges().as_slice() {
+                    let Some(range_row) = range_rows.next()? else {
+                        return Err(StoreError::Corrupt(
+                            "stored Loro range index disagrees with update records",
+                        ));
+                    };
+                    let peer_id = decode_stored_loro_peer(&range_row.get::<_, Vec<u8>>(0)?)?;
+                    let start_counter =
+                        decode_stored_loro_counter(&range_row.get::<_, Vec<u8>>(1)?)?;
+                    let end_counter = decode_stored_loro_counter(&range_row.get::<_, Vec<u8>>(2)?)?;
+                    if (peer_id, start_counter, end_counter)
+                        != (expected.peer_id(), expected.start_counter(), expected.end_counter())
+                    {
+                        return Err(StoreError::Corrupt(
+                            "stored Loro range index disagrees with update records",
+                        ));
+                    }
+                    expected_range_count = expected_range_count
+                        .checked_add(1)
+                        .ok_or(StoreError::Corrupt("stored Loro range count overflowed"))?;
+                    if expected_peers.insert((document_id, expected.peer_id())) {
+                        let count = expected_peer_counts.entry(document_id).or_default();
+                        *count = count
+                            .checked_add(1)
+                            .ok_or(StoreError::Corrupt("stored Loro peer count overflowed"))?;
+                        if *count > MAX_LORO_PEERS {
+                            return Err(StoreError::Corrupt(
+                                "stored document Loro peer union exceeds the configured limit",
+                            ));
+                        }
+                    }
+                }
+                if range_rows.next()?.is_some() {
+                    return Err(StoreError::Corrupt(
+                        "stored Loro range index disagrees with update records",
+                    ));
+                }
                 maxima.insert(document_id, sequence);
+            }
+        }
+
+        let actual_range_count = usize::try_from(transaction.query_row(
+            "SELECT COUNT(*) FROM update_loro_ranges",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?)
+        .map_err(|_error| StoreError::Corrupt("stored Loro range count is invalid"))?;
+        if actual_range_count != expected_range_count {
+            return Err(StoreError::Corrupt(
+                "stored Loro range index disagrees with update records",
+            ));
+        }
+
+        {
+            let mut expected = expected_peers.iter().copied();
+            let mut statement = transaction.prepare(
+                "SELECT document_id, peer_id
+                 FROM document_loro_peers
+                 ORDER BY document_id, peer_id",
+            )?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let document_id =
+                    DocumentId::from_bytes(decode_identifier(&row.get::<_, Vec<u8>>(0)?)?);
+                let peer_id = decode_stored_loro_peer(&row.get::<_, Vec<u8>>(1)?)?;
+                if expected.next() != Some((document_id, peer_id)) {
+                    return Err(StoreError::Corrupt(
+                        "stored document Loro peer union disagrees with update records",
+                    ));
+                }
+            }
+            if expected.next().is_some() {
+                return Err(StoreError::Corrupt(
+                    "stored document Loro peer union disagrees with update records",
+                ));
             }
         }
 
@@ -3029,6 +3161,20 @@ fn decode_sequence(encoded: &[u8]) -> Result<AcceptanceSequence, StoreError> {
     Ok(AcceptanceSequence::from_be_bytes(bytes))
 }
 
+fn decode_stored_loro_peer(encoded: &[u8]) -> Result<u64, StoreError> {
+    let bytes = encoded
+        .try_into()
+        .map_err(|_error| StoreError::Corrupt("stored Loro peer has invalid length"))?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn decode_stored_loro_counter(encoded: &[u8]) -> Result<u32, StoreError> {
+    let bytes = encoded
+        .try_into()
+        .map_err(|_error| StoreError::Corrupt("stored Loro counter has invalid length"))?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
 #[cfg(unix)]
 fn synchronize_directory(path: &Path) -> Result<(), StoreError> {
     File::open(path)?.sync_all()?;
@@ -3321,6 +3467,111 @@ mod tests {
     }
 
     #[test]
+    fn vector_backfill_refreshes_idle_expiry_on_advancement_and_exact_retry() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let document_id = DocumentId::from_bytes([0x71; IDENTIFIER_LENGTH]);
+        let capability_id = CapabilityId::from_bytes([0x72; IDENTIFIER_LENGTH]);
+        let authenticator = Authenticator::from_bytes([0x73; 32]);
+        let mut store = open_store(&database);
+        create_fixture_document(&mut store, document_id, capability_id, &authenticator, 0x74);
+        let updates = [
+            ranged_fixture_update(document_id, 0x75, 1, 0, 1),
+            ranged_fixture_update(document_id, 0x76, 2, 0, 1),
+            ranged_fixture_update(document_id, 0x77, 3, 0, 1),
+        ];
+        for update in &updates {
+            let encoded = encode_update_record(update).expect("fixture update must encode");
+            assert_eq!(
+                store
+                    .accept(capability_id, &authenticator, update, &encoded)
+                    .expect("fixture update must commit"),
+                StoreAcceptOutcome::Inserted,
+            );
+        }
+        let page_limit = metadata_encoded_length(&metadata(&updates[0]).expect("metadata"))
+            .expect("metadata length must fit");
+        let channel = store.open_broker_channel().expect("channel must be available");
+        let StoreVectorBackfillOutcome::Authorized(first) = store
+            .vector_backfill_authorized(
+                &channel,
+                document_id,
+                capability_id,
+                &authenticator,
+                &LoroOplogVersion::default(),
+                StoreVectorBackfillStart::Origin,
+                page_limit,
+            )
+            .expect("first page must resolve")
+        else {
+            panic!("vector pass must begin");
+        };
+        let first_cursor = first.next_cursor.expect("first page must continue");
+        let first_token = <[u8; VECTOR_CONTINUATION_LENGTH]>::try_from(first_cursor.as_slice())
+            .expect("continuation must have fixed length");
+        let short_advancement_deadline = Instant::now() + Duration::from_secs(60);
+        store
+            .vector_passes
+            .iter_mut()
+            .find(|pass| vector_pass_contains_token(pass, first_token))
+            .expect("pass must remain registered")
+            .expires_at = short_advancement_deadline;
+
+        let StoreVectorBackfillOutcome::Authorized(second) = store
+            .vector_backfill_authorized(
+                &channel,
+                document_id,
+                capability_id,
+                &authenticator,
+                &LoroOplogVersion::default(),
+                StoreVectorBackfillStart::Continue(first_cursor.clone()),
+                page_limit,
+            )
+            .expect("advancement must resolve")
+        else {
+            panic!("valid continuation must advance");
+        };
+        let second_cursor = second.next_cursor.as_ref().expect("second page must continue");
+        let second_token = <[u8; VECTOR_CONTINUATION_LENGTH]>::try_from(second_cursor.as_slice())
+            .expect("continuation must have fixed length");
+        let advanced_pass = store
+            .vector_passes
+            .iter()
+            .find(|candidate| vector_pass_contains_token(candidate, second_token))
+            .expect("advanced pass must remain registered");
+        assert!(advanced_pass.expires_at > short_advancement_deadline);
+
+        let short_retry_deadline = Instant::now() + Duration::from_secs(60);
+        store
+            .vector_passes
+            .iter_mut()
+            .find(|candidate| vector_pass_contains_token(candidate, first_token))
+            .expect("retry token must remain registered")
+            .expires_at = short_retry_deadline;
+        let StoreVectorBackfillOutcome::Authorized(retried) = store
+            .vector_backfill_authorized(
+                &channel,
+                document_id,
+                capability_id,
+                &authenticator,
+                &LoroOplogVersion::default(),
+                StoreVectorBackfillStart::Continue(first_cursor),
+                page_limit,
+            )
+            .expect("exact retry must resolve")
+        else {
+            panic!("exact retry must remain authorized");
+        };
+        assert_eq!(retried.next_cursor, second.next_cursor);
+        let retried_pass = store
+            .vector_passes
+            .iter()
+            .find(|candidate| vector_pass_contains_token(candidate, second_token))
+            .expect("retried pass must remain registered");
+        assert!(retried_pass.expires_at > short_retry_deadline);
+    }
+
+    #[test]
     fn vector_backfill_reauthorizes_before_continuing_a_pass() {
         let directory = TestDirectory::create();
         let database = directory.path.join("renee.sqlite3");
@@ -3545,6 +3796,83 @@ mod tests {
             .expect("schema lookup must resolve")
             .is_some();
         assert!(!current_table_exists);
+    }
+
+    #[test]
+    fn current_schema_requires_every_durable_loro_index_object() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let _fixture = create_loro_index_recovery_fixture(&database);
+        let connection = Connection::open(&database).expect("fixture database must reopen");
+        connection
+            .execute("DROP TABLE update_loro_ranges", [])
+            .expect("range-index table must be removable for corruption fixture");
+        drop(connection);
+
+        assert!(matches!(
+            DurableUpdateStore::open(&database, create_authority_provision()),
+            Err(StoreError::Corrupt("required durable schema object is absent")),
+        ));
+    }
+
+    #[test]
+    fn recovery_rejects_loro_range_index_disagreement() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let (document_id, update_id, peer_id) = create_loro_index_recovery_fixture(&database);
+        let connection = Connection::open(&database).expect("fixture database must reopen");
+        let document_bytes = document_id.into_bytes();
+        let update_bytes = update_id.into_bytes();
+        connection
+            .execute_batch("DROP TRIGGER update_loro_ranges_are_immutable;")
+            .expect("immutable-range trigger must be removable for corruption fixture");
+        connection
+            .execute(
+                "UPDATE update_loro_ranges
+                 SET end_counter = ?1
+                 WHERE document_id = ?2 AND update_id = ?3 AND peer_id = ?4",
+                params![
+                    6_u32.to_be_bytes().as_slice(),
+                    document_bytes.as_slice(),
+                    update_bytes.as_slice(),
+                    peer_id.to_be_bytes().as_slice(),
+                ],
+            )
+            .expect("range index must be corruptible for recovery fixture");
+        connection.execute_batch(SCHEMA).expect("fixture trigger must be restored");
+        drop(connection);
+
+        assert!(matches!(
+            DurableUpdateStore::open(&database, create_authority_provision()),
+            Err(StoreError::Corrupt("stored Loro range index disagrees with update records")),
+        ));
+    }
+
+    #[test]
+    fn recovery_rejects_loro_peer_union_disagreement() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let (document_id, _update_id, peer_id) = create_loro_index_recovery_fixture(&database);
+        let connection = Connection::open(&database).expect("fixture database must reopen");
+        let document_bytes = document_id.into_bytes();
+        connection
+            .execute_batch("DROP TRIGGER document_loro_peers_are_retained;")
+            .expect("retained-peer trigger must be removable for corruption fixture");
+        connection
+            .execute(
+                "DELETE FROM document_loro_peers WHERE document_id = ?1 AND peer_id = ?2",
+                params![document_bytes.as_slice(), peer_id.to_be_bytes().as_slice()],
+            )
+            .expect("peer union must be corruptible for recovery fixture");
+        connection.execute_batch(SCHEMA).expect("fixture trigger must be restored");
+        drop(connection);
+
+        assert!(matches!(
+            DurableUpdateStore::open(&database, create_authority_provision()),
+            Err(StoreError::Corrupt(
+                "stored document Loro peer union disagrees with update records"
+            )),
+        ));
     }
 
     #[test]
@@ -4757,6 +5085,23 @@ mod tests {
                 .expect("fixture document creation must commit"),
             StoreCreateOutcome::Inserted
         );
+    }
+
+    fn create_loro_index_recovery_fixture(database: &Path) -> (DocumentId, UpdateId, u64) {
+        let document_id = DocumentId::from_bytes([0x91; IDENTIFIER_LENGTH]);
+        let capability_id = CapabilityId::from_bytes([0x92; IDENTIFIER_LENGTH]);
+        let authenticator = Authenticator::from_bytes([0x93; 32]);
+        let update = ranged_fixture_update(document_id, 0x94, 17, 3, 5);
+        let mut store = open_store(database);
+        create_fixture_document(&mut store, document_id, capability_id, &authenticator, 0x95);
+        let encoded = encode_update_record(&update).expect("fixture update must encode");
+        assert_eq!(
+            store
+                .accept(capability_id, &authenticator, &update, &encoded)
+                .expect("fixture update must commit"),
+            StoreAcceptOutcome::Inserted,
+        );
+        (document_id, update.update_id(), 17)
     }
 
     fn fixture_update_for(document_id: DocumentId, marker: u8) -> ImmutableUpdate {
