@@ -10,6 +10,7 @@ mod identity;
 #[cfg(debug_assertions)]
 mod test_barrier;
 
+use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
@@ -21,24 +22,74 @@ use std::process::Stdio;
 use std::time::Duration;
 
 #[cfg(debug_assertions)]
-use renee_wire::{
-    CERTIFICATE_MANIFEST, CERTIFICATE_MANIFEST_RESPONSE, Envelope, VERSION, decode_body,
-    encode_body,
-};
+use renee_wire::{CERTIFICATE_MANIFEST, CERTIFICATE_MANIFEST_RESPONSE, VERSION, encode_body};
+use renee_wire::{Envelope, SUBSCRIBE_UPDATES_ACK, decode_body, is_update_subscription_event};
 use renee_wire::{read_body, write_body};
 #[cfg(debug_assertions)]
 use std::sync::Arc;
 #[cfg(debug_assertions)]
 use time::OffsetDateTime;
-use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{
+    AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWriteExt as _, BufReader,
+};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 use wtransport::endpoint::IncomingSession;
-use wtransport::stream::BiStream;
 use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:4433";
 const DEFAULT_STORE_ADDRESS: &str = "127.0.0.1:4434";
 const STREAM_EOF_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_CONNECTION_REQUESTS: usize = 64;
+
+struct GatewayRequest {
+    body: Vec<u8>,
+    response: oneshot::Sender<GatewayResponse>,
+}
+
+struct GatewayResponse {
+    body: Vec<u8>,
+    delivered: Option<oneshot::Sender<()>>,
+}
+
+enum SessionOutput {
+    Frame(Vec<u8>),
+    Closed,
+    Error(io::Error),
+}
+
+struct PublicRequestStream {
+    complete: bool,
+    streams: Option<(wtransport::SendStream, wtransport::RecvStream)>,
+}
+
+impl PublicRequestStream {
+    fn new(streams: (wtransport::SendStream, wtransport::RecvStream)) -> Self {
+        Self { complete: false, streams: Some(streams) }
+    }
+
+    fn streams(&mut self) -> (&mut wtransport::SendStream, &mut wtransport::RecvStream) {
+        let (send, receive) = self.streams.as_mut().expect("request stream is present until drop");
+        (send, receive)
+    }
+
+    fn complete(&mut self) {
+        self.complete = true;
+    }
+}
+
+impl Drop for PublicRequestStream {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        if let Some((mut send, receive)) = self.streams.take() {
+            let _reset_result = send.reset(1_u32.into());
+            receive.stop(1_u32.into());
+        }
+    }
+}
 
 struct Configuration {
     bind_address: SocketAddr,
@@ -263,7 +314,7 @@ fn emit_readiness(record: &str) -> io::Result<()> {
 struct SessionProcess {
     child: Child,
     input: ChildStdin,
-    output: BufReader<ChildStdout>,
+    output: Option<BufReader<ChildStdout>>,
 }
 
 async fn hold_session(
@@ -283,6 +334,10 @@ async fn hold_session(
         &manifest,
     )
     .await;
+    // Relay failure can leave request streams owned by dispatcher tasks. Close
+    // the WebTransport session explicitly so every such stream unblocks before
+    // the per-connection worker is reaped.
+    connection.close(1_u32.into(), b"session relay ended");
     let shutdown_result = shutdown_session(session).await;
     // Teardown was already attempted above. Preserve the relay failure as the
     // primary cause when both the session and its cleanup fail.
@@ -290,11 +345,26 @@ async fn hold_session(
     shutdown_result
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one bounded dispatcher makes correlation and event routing auditable together"
+)]
 async fn relay_session(
     connection: &Connection,
     session: &mut SessionProcess,
     #[cfg(debug_assertions)] manifest: &[u8],
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let (request_sender, mut request_receiver) = mpsc::channel(MAX_CONNECTION_REQUESTS);
+    let mut request_tasks = JoinSet::new();
+    let (session_output_sender, mut session_output_receiver) =
+        mpsc::channel(MAX_CONNECTION_REQUESTS);
+    let session_output = session
+        .output
+        .take()
+        .ok_or_else(|| io::Error::other("sessiond output is already being relayed"))?;
+    let mut session_output_tasks = JoinSet::new();
+    session_output_tasks.spawn(read_session_output(session_output, session_output_sender));
+    let mut pending = HashMap::<[u8; 16], oneshot::Sender<GatewayResponse>>::new();
     loop {
         tokio::select! {
             stream = connection.accept_bi() => {
@@ -304,28 +374,139 @@ async fn relay_session(
                 let Ok(stream) = stream else {
                     break;
                 };
-                let mut stream = BiStream::join(stream);
-                let Some(body) = read_body(&mut stream).await? else {
-                    continue;
+                if request_tasks.len() >= MAX_CONNECTION_REQUESTS {
+                    return Err(io::Error::other("connection request limit exceeded").into());
+                }
+                request_tasks.spawn(relay_public_request(stream, request_sender.clone()));
+            }
+            request = request_receiver.recv() => {
+                let Some(request) = request else {
+                    return Err(io::Error::other("gateway request queue closed").into());
                 };
-                require_request_eof(&mut stream).await?;
+                let envelope = decode_body(&request.body)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 #[cfg(debug_assertions)]
-                test_barrier::checkpoint("gateway-request-admitted").await?;
-                #[cfg(debug_assertions)]
-                if let Some(response) = certificate_manifest_response(&body, manifest)? {
-                    write_body(&mut stream, &response).await?;
+                if let Some(response) = certificate_manifest_response(&request.body, manifest)? {
+                    let _response_result = request.response.send(GatewayResponse {
+                        body: response,
+                        delivered: None,
+                    });
                     continue;
                 }
-                write_body(&mut session.input, &body).await?;
-                let response = read_body(&mut session.output)
-                    .await?
-                    .ok_or_else(|| io::Error::other("sessiond closed before response"))?;
-                write_body(&mut stream, &response).await?;
-                stream.shutdown().await?;
+                if pending.len() >= MAX_CONNECTION_REQUESTS {
+                    return Err(io::Error::other("connection correlation limit exceeded").into());
+                }
+                if pending.contains_key(&envelope.correlation_id) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "duplicate active correlation identifier",
+                    ).into());
+                }
+                pending.insert(envelope.correlation_id, request.response);
+                write_body(&mut session.input, &request.body).await?;
+            }
+            response = session_output_receiver.recv() => {
+                let response = match response {
+                    Some(SessionOutput::Frame(response)) => response,
+                    Some(SessionOutput::Closed) | None => {
+                        return Err(io::Error::other("sessiond closed before response").into());
+                    }
+                    Some(SessionOutput::Error(error)) => return Err(error.into()),
+                };
+                let envelope = decode_body(&response)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                if is_update_subscription_event(envelope.message_type) {
+                    let mut stream = connection.open_uni().await?.await?;
+                    write_body(&mut stream, &response).await?;
+                    stream.shutdown().await?;
+                    continue;
+                }
+                let responder = pending.remove(&envelope.correlation_id).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "sessiond returned an impossible correlation identifier",
+                    )
+                })?;
+                if envelope.message_type == SUBSCRIBE_UPDATES_ACK {
+                    let (delivered, delivery) = oneshot::channel();
+                    responder
+                        .send(GatewayResponse {
+                            body: response,
+                            delivered: Some(delivered),
+                        })
+                        .map_err(|_response| {
+                            io::Error::other("subscription client closed before acknowledgement")
+                        })?;
+                    delivery.await.map_err(|_error| {
+                        io::Error::other("subscription acknowledgement stream closed early")
+                    })?;
+                } else {
+                    let _response_result = responder.send(GatewayResponse {
+                        body: response,
+                        delivered: None,
+                    });
+                }
+            }
+            task = request_tasks.join_next(), if !request_tasks.is_empty() => {
+                match task {
+                    Some(Ok(Ok(()))) | None => {}
+                    Some(Ok(Err(error))) => return Err(error),
+                    Some(Err(error)) => return Err(error.into()),
+                }
             }
             _closed = connection.closed() => break,
         }
     }
+    request_tasks.abort_all();
+    Ok(())
+}
+
+async fn read_session_output(
+    mut output: BufReader<ChildStdout>,
+    sender: mpsc::Sender<SessionOutput>,
+) {
+    loop {
+        let output = match read_body(&mut output).await {
+            Ok(Some(frame)) => SessionOutput::Frame(frame),
+            Ok(None) => SessionOutput::Closed,
+            Err(error) => SessionOutput::Error(error),
+        };
+        let terminal = !matches!(output, SessionOutput::Frame(_));
+        if sender.send(output).await.is_err() || terminal {
+            return;
+        }
+    }
+}
+
+async fn relay_public_request(
+    stream: (wtransport::SendStream, wtransport::RecvStream),
+    request_sender: mpsc::Sender<GatewayRequest>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut stream = PublicRequestStream::new(stream);
+    let (_, receive) = stream.streams();
+    let Some(body) = read_body(receive).await? else {
+        stream.complete();
+        return Ok(());
+    };
+    let (_, trailing_receive) = stream.streams();
+    require_request_eof(trailing_receive).await?;
+    #[cfg(debug_assertions)]
+    test_barrier::checkpoint("gateway-request-admitted").await?;
+    let (response_sender, receive_response) = oneshot::channel();
+    request_sender
+        .send(GatewayRequest { body, response: response_sender })
+        .await
+        .map_err(|_error| io::Error::other("gateway request dispatcher closed"))?;
+    let routed_response = receive_response
+        .await
+        .map_err(|_error| io::Error::other("gateway response dispatcher closed"))?;
+    let (send, _) = stream.streams();
+    write_body(send, &routed_response.body).await?;
+    send.shutdown().await?;
+    if let Some(delivered) = routed_response.delivered {
+        let _delivery_result = delivered.send(());
+    }
+    stream.complete();
     Ok(())
 }
 
@@ -353,7 +534,10 @@ async fn wait_for_rotation(delay: Option<Duration>) {
     }
 }
 
-async fn require_request_eof(stream: &mut BiStream) -> io::Result<()> {
+async fn require_request_eof<R>(stream: &mut R) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
     let mut trailing = [0_u8; 1];
     let bytes_read =
         match tokio::time::timeout(STREAM_EOF_TIMEOUT, stream.read(&mut trailing)).await {
@@ -410,5 +594,5 @@ async fn spawn_session(
     if readiness.trim_end() != "READY sessiond" {
         return Err(io::Error::other("sessiond emitted malformed readiness").into());
     }
-    Ok(SessionProcess { child, input, output })
+    Ok(SessionProcess { child, input, output: Some(output) })
 }

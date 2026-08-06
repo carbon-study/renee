@@ -19,19 +19,24 @@ use std::time::Duration;
 use renee_types::{DocumentId, UpdateId};
 use renee_wire::{
     ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AuthorizedUpdateRequest,
-    CAPABILITY_ERROR, CLIENT_HELLO, CREATE_DOCUMENT, CREATE_DOCUMENT_RESPONSE, CapabilityAuthority,
+    CANCEL_UPDATE_SUBSCRIPTION, CANCEL_UPDATE_SUBSCRIPTION_RESPONSE, CAPABILITY_ERROR,
+    CLIENT_HELLO, CREATE_DOCUMENT, CREATE_DOCUMENT_RESPONSE, CapabilityAuthority,
     CapabilityErrorCode, ControlMutationOutcome, CreateDocumentOutcome, CreateDocumentRequest,
     ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, ERROR_ALREADY_NEGOTIATED, ERROR_EXPECTED_HELLO,
     ERROR_UNSUPPORTED_PROFILE, ERROR_UNSUPPORTED_VERSION, EnumerateRequest, EnumerateResponse,
     EnumerateStart, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE, FetchRequest, GRANT_CAPABILITY,
     GRANT_CAPABILITY_RESPONSE, GrantCapabilityRequest, PROFILE, PROTOCOL_ERROR, REVOKE_CAPABILITY,
-    REVOKE_CAPABILITY_RESPONSE, RevokeCapabilityRequest, SERVER_HELLO, UPDATE_ERROR,
-    UpdateErrorCode, VERSION, decode_accept_response, decode_body, decode_capability_error,
-    decode_control_mutation_response, decode_create_document_response, decode_enumerate_response,
-    decode_fetch_response, decode_greeting, decode_update_error, encode_authorized_update_request,
-    encode_body, encode_create_document_request, encode_enumerate_request, encode_fetch_request,
-    encode_grant_capability_request, encode_greeting, encode_revoke_capability_request, read_body,
-    write_body,
+    REVOKE_CAPABILITY_RESPONSE, RevokeCapabilityRequest, SERVER_HELLO, SUBSCRIBE_UPDATES,
+    SUBSCRIBE_UPDATES_ACK, SubscribeUpdatesRequest, UPDATE_ERROR, UPDATE_NOTIFICATION,
+    UPDATE_SUBSCRIPTION_OVERFLOW, UpdateErrorCode, UpdateSubscriptionId, VERSION,
+    decode_accept_response, decode_body, decode_cancel_update_subscription,
+    decode_capability_error, decode_control_mutation_response, decode_create_document_response,
+    decode_enumerate_response, decode_fetch_response, decode_greeting,
+    decode_subscribe_updates_ack, decode_update_error, decode_update_notification,
+    decode_update_subscription_overflow, encode_authorized_update_request, encode_body,
+    encode_cancel_update_subscription, encode_create_document_request, encode_enumerate_request,
+    encode_fetch_request, encode_grant_capability_request, encode_greeting,
+    encode_revoke_capability_request, encode_subscribe_updates_request, read_body, write_body,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
@@ -177,6 +182,36 @@ pub enum EnumerateObservation {
     AuthorizationDenied,
 }
 
+/// One acknowledged experimental update subscription.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UpdateSubscriptionHandle {
+    /// Correlation copied from the opening request onto asynchronous events.
+    pub correlation_id: [u8; 16],
+    /// Server-generated identity valid only on this connection.
+    pub subscription_id: UpdateSubscriptionId,
+}
+
+/// One asynchronous experimental subscription event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateSubscriptionEvent {
+    /// One update-ID wakeup with no cursor or ordering claim.
+    Notification {
+        /// Request correlation retained for demultiplexing only.
+        correlation_id: [u8; 16],
+        /// Connection-scoped subscription identity.
+        subscription_id: UpdateSubscriptionId,
+        /// Document-scoped update identity.
+        update_id: UpdateId,
+    },
+    /// The subscription can no longer support a complete handoff.
+    Overflow {
+        /// Request correlation retained for demultiplexing only.
+        correlation_id: [u8; 16],
+        /// Connection-scoped subscription identity.
+        subscription_id: UpdateSubscriptionId,
+    },
+}
+
 struct TemporaryDirectory {
     path: PathBuf,
 }
@@ -269,8 +304,8 @@ impl ServerHarness {
         fs::write(self.barrier_directory.join(format!("armed-{name}")), [])
     }
 
-    /// Waits for an armed store barrier, kills stored there, and observes replacement.
-    pub async fn crash_store_at_barrier(&mut self, name: &'static str) -> HarnessResult<()> {
+    /// Waits until an armed store barrier has stopped its operation.
+    pub async fn wait_for_store_barrier(&self, name: &'static str) -> HarnessResult<()> {
         let reached = self.barrier_directory.join(format!("reached-{name}"));
         tokio::time::timeout(STARTUP_TIMEOUT, async {
             loop {
@@ -284,6 +319,18 @@ impl ServerHarness {
             }
         })
         .await??;
+        Ok(())
+    }
+
+    /// Releases one reached store barrier without terminating the daemon.
+    pub fn release_store_barrier(&self, name: &'static str) -> io::Result<()> {
+        fs::write(self.barrier_directory.join(format!("release-{name}")), [])
+    }
+
+    /// Waits for an armed store barrier, kills stored there, and observes replacement.
+    pub async fn crash_store_at_barrier(&mut self, name: &'static str) -> HarnessResult<()> {
+        self.wait_for_store_barrier(name).await?;
+        let reached = self.barrier_directory.join(format!("reached-{name}"));
         self.kill_and_wait_for_restart(PermanentDaemon::Store).await?;
         drop(fs::remove_file(reached));
         Ok(())
@@ -582,7 +629,8 @@ impl WebTransportConnection {
                 UpdateErrorCode::NotFound
                 | UpdateErrorCode::NotNegotiated
                 | UpdateErrorCode::InvalidCursor
-                | UpdateErrorCode::CounterExhausted => {
+                | UpdateErrorCode::CounterExhausted
+                | UpdateErrorCode::Backpressure => {
                     Err(io::Error::other("unexpected accept rejection").into())
                 }
             },
@@ -719,13 +767,111 @@ impl WebTransportConnection {
         }
     }
 
+    /// Opens one acknowledged experimental update subscription.
+    pub async fn subscribe_updates(
+        &self,
+        authority: &CapabilityAuthority,
+        document_id: DocumentId,
+    ) -> HarnessResult<UpdateSubscriptionHandle> {
+        let correlation_id = [0x44; 16];
+        let response = self
+            .exchange_with_correlation(
+                correlation_id,
+                SUBSCRIBE_UPDATES,
+                encode_subscribe_updates_request(&SubscribeUpdatesRequest {
+                    authority: authority.clone(),
+                    document_id,
+                }),
+            )
+            .await?;
+        if response.message_type != SUBSCRIBE_UPDATES_ACK {
+            return Err(io::Error::other("update subscription was not acknowledged").into());
+        }
+        Ok(UpdateSubscriptionHandle {
+            correlation_id,
+            subscription_id: decode_subscribe_updates_ack(&response.payload)?,
+        })
+    }
+
+    /// Sends malformed subscription bytes and returns their stable update error.
+    pub async fn malformed_subscribe_updates(
+        &self,
+        payload: Vec<u8>,
+    ) -> HarnessResult<UpdateErrorCode> {
+        let response =
+            self.exchange_with_correlation([0x46; 16], SUBSCRIBE_UPDATES, payload).await?;
+        if response.message_type != UPDATE_ERROR {
+            return Err(
+                io::Error::other("malformed subscription received a success response").into()
+            );
+        }
+        Ok(decode_update_error(&response.payload)?)
+    }
+
+    /// Receives one server-initiated subscription event stream.
+    pub async fn next_update_subscription_event(&self) -> HarnessResult<UpdateSubscriptionEvent> {
+        let mut stream = self.connection.accept_uni().await?;
+        let body = read_body(&mut stream)
+            .await?
+            .ok_or_else(|| io::Error::other("subscription event stream was empty"))?;
+        let event = decode_body(&body)?;
+        if event.version != VERSION {
+            return Err(io::Error::other("subscription event changed envelope version").into());
+        }
+        match event.message_type {
+            UPDATE_NOTIFICATION => {
+                let notification = decode_update_notification(&event.payload)?;
+                Ok(UpdateSubscriptionEvent::Notification {
+                    correlation_id: event.correlation_id,
+                    subscription_id: notification.subscription_id,
+                    update_id: notification.update_id,
+                })
+            }
+            UPDATE_SUBSCRIPTION_OVERFLOW => Ok(UpdateSubscriptionEvent::Overflow {
+                correlation_id: event.correlation_id,
+                subscription_id: decode_update_subscription_overflow(&event.payload)?,
+            }),
+            _unexpected => Err(io::Error::other("unexpected subscription event type").into()),
+        }
+    }
+
+    /// Cancels one connection-bound subscription and verifies identity preservation.
+    pub async fn cancel_update_subscription(
+        &self,
+        subscription_id: UpdateSubscriptionId,
+    ) -> HarnessResult<()> {
+        let response = self
+            .exchange_with_correlation(
+                [0x45; 16],
+                CANCEL_UPDATE_SUBSCRIPTION,
+                encode_cancel_update_subscription(subscription_id),
+            )
+            .await?;
+        if response.message_type != CANCEL_UPDATE_SUBSCRIPTION_RESPONSE
+            || decode_cancel_update_subscription(&response.payload)? != subscription_id
+        {
+            return Err(
+                io::Error::other("cancellation response changed subscription identity").into()
+            );
+        }
+        Ok(())
+    }
+
     /// Closes the test connection without defining an application close protocol.
     pub fn close(self) {
         self.connection.close(0_u32.into(), b"conformance connection complete");
     }
 
     async fn exchange(&self, message_type: u16, payload: Vec<u8>) -> HarnessResult<Envelope> {
-        let correlation_id = [0x22_u8; 16];
+        self.exchange_with_correlation([0x22; 16], message_type, payload).await
+    }
+
+    async fn exchange_with_correlation(
+        &self,
+        correlation_id: [u8; 16],
+        message_type: u16,
+        payload: Vec<u8>,
+    ) -> HarnessResult<Envelope> {
         let request = Envelope { correlation_id, message_type, payload, version: VERSION };
         let mut stream =
             wtransport::stream::BiStream::join(self.connection.open_bi().await?.await?);

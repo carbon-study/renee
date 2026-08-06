@@ -29,6 +29,18 @@ pub const FETCH_UPDATE: u16 = 14;
 pub const FETCH_UPDATE_RESPONSE: u16 = 15;
 /// Stable update-operation rejection.
 pub const UPDATE_ERROR: u16 = 16;
+/// Opens one acknowledged document update subscription.
+pub const SUBSCRIBE_UPDATES: u16 = 17;
+/// Confirms that the subscription delivery barrier is established.
+pub const SUBSCRIBE_UPDATES_ACK: u16 = 18;
+/// Asynchronous update-ID wakeup for one subscription.
+pub const UPDATE_NOTIFICATION: u16 = 19;
+/// Terminal indication that a subscription can no longer be complete.
+pub const UPDATE_SUBSCRIPTION_OVERFLOW: u16 = 20;
+/// Cancels one connection-bound update subscription.
+pub const CANCEL_UPDATE_SUBSCRIPTION: u16 = 21;
+/// Confirms cancellation without disclosing subscription topology.
+pub const CANCEL_UPDATE_SUBSCRIPTION_RESPONSE: u16 = 22;
 
 const RECORD_MAGIC: [u8; 8] = *b"CARBREC\0";
 const RECORD_VERSION: u16 = 1;
@@ -41,6 +53,7 @@ const CURSOR_LENGTH: usize = 8 + 2 + IDENTIFIER_LENGTH + 8 + 8;
 const ENUMERATE_RESPONSE_WITH_CURSOR_LENGTH: usize = 1 + 2 + CURSOR_LENGTH + 2;
 const MAX_ENUMERABLE_METADATA_LENGTH: usize =
     MAX_APPLICATION_PAYLOAD_LENGTH - ENUMERATE_RESPONSE_WITH_CURSOR_LENGTH;
+const SUBSCRIPTION_PAYLOAD_VERSION: u16 = 1;
 
 /// Successful immutable accept outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +81,42 @@ pub enum UpdateErrorCode {
     CounterExhausted,
     /// Document, capability, secret, ancestry, or operation authority was denied.
     AuthorizationDenied,
+    /// A finite subscription or broker-channel bound was reached.
+    Backpressure,
+}
+
+/// One server-generated, connection-scoped subscription identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct UpdateSubscriptionId([u8; IDENTIFIER_LENGTH]);
+
+impl UpdateSubscriptionId {
+    /// Constructs one opaque experimental subscription identity.
+    pub const fn from_bytes(bytes: [u8; IDENTIFIER_LENGTH]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the complete opaque identity bytes.
+    pub const fn into_bytes(self) -> [u8; IDENTIFIER_LENGTH] {
+        self.0
+    }
+}
+
+/// One document-scoped update-subscription request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscribeUpdatesRequest {
+    /// Capability claiming read authority.
+    pub authority: CapabilityAuthority,
+    /// The one document whose accepted update IDs may wake the subscription.
+    pub document_id: DocumentId,
+}
+
+/// One update-ID notification carrying no ordering or durable progress.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UpdateNotification {
+    /// Connection-scoped subscription identity.
+    pub subscription_id: UpdateSubscriptionId,
+    /// Document-scoped immutable update identity.
+    pub update_id: UpdateId,
 }
 
 /// One metadata enumeration cursor.
@@ -150,6 +199,8 @@ pub enum UpdateCodecError {
     InvalidCursor,
     /// A value cannot be represented by the frozen codec.
     IntegerOutOfRange,
+    /// A subscription payload used an unsupported private schema version.
+    UnsupportedSubscriptionVersion,
 }
 
 impl fmt::Display for UpdateCodecError {
@@ -167,6 +218,9 @@ impl fmt::Display for UpdateCodecError {
             Self::InvalidDiscriminant => f.write_str("invalid update payload discriminant"),
             Self::InvalidCursor => f.write_str("invalid update enumeration cursor"),
             Self::IntegerOutOfRange => f.write_str("update field is out of range"),
+            Self::UnsupportedSubscriptionVersion => {
+                f.write_str("unsupported update-subscription payload version")
+            }
         }
     }
 }
@@ -518,6 +572,102 @@ pub fn decode_fetch_response(payload: &[u8]) -> Result<&[u8], UpdateCodecError> 
     Ok(payload)
 }
 
+/// Encodes one fixed-length, versioned subscription request.
+pub fn encode_subscribe_updates_request(request: &SubscribeUpdatesRequest) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(2 + CAPABILITY_AUTHORITY_LENGTH + IDENTIFIER_LENGTH);
+    payload.extend_from_slice(&SUBSCRIPTION_PAYLOAD_VERSION.to_be_bytes());
+    encode_authority(&mut payload, &request.authority);
+    payload.extend_from_slice(&request.document_id.into_bytes());
+    payload
+}
+
+/// Decodes one complete versioned subscription request before allocating state.
+pub fn decode_subscribe_updates_request(
+    payload: &[u8],
+) -> Result<SubscribeUpdatesRequest, UpdateCodecError> {
+    let mut decoder = Decoder::new(payload);
+    decoder.take_subscription_version()?;
+    let authority = decoder.take_authority()?;
+    let document_id = DocumentId::from_bytes(decoder.take_array()?);
+    decoder.finish()?;
+    Ok(SubscribeUpdatesRequest { authority, document_id })
+}
+
+/// Encodes an acknowledged connection-scoped subscription identity.
+pub fn encode_subscribe_updates_ack(subscription_id: UpdateSubscriptionId) -> Vec<u8> {
+    encode_subscription_identity(subscription_id)
+}
+
+/// Decodes an acknowledged connection-scoped subscription identity.
+pub fn decode_subscribe_updates_ack(
+    payload: &[u8],
+) -> Result<UpdateSubscriptionId, UpdateCodecError> {
+    decode_subscription_identity(payload)
+}
+
+/// Encodes one update-ID wakeup without a sequence or cursor.
+pub fn encode_update_notification(notification: UpdateNotification) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(2 + IDENTIFIER_LENGTH * 2);
+    payload.extend_from_slice(&SUBSCRIPTION_PAYLOAD_VERSION.to_be_bytes());
+    payload.extend_from_slice(&notification.subscription_id.into_bytes());
+    payload.extend_from_slice(&notification.update_id.into_bytes());
+    payload
+}
+
+/// Decodes one complete update-ID wakeup.
+pub fn decode_update_notification(payload: &[u8]) -> Result<UpdateNotification, UpdateCodecError> {
+    let mut decoder = Decoder::new(payload);
+    decoder.take_subscription_version()?;
+    let subscription_id = UpdateSubscriptionId::from_bytes(decoder.take_array()?);
+    let update_id = UpdateId::from_bytes(decoder.take_array()?);
+    decoder.finish()?;
+    Ok(UpdateNotification { subscription_id, update_id })
+}
+
+/// Encodes one terminal overflow indication.
+pub fn encode_update_subscription_overflow(subscription_id: UpdateSubscriptionId) -> Vec<u8> {
+    encode_subscription_identity(subscription_id)
+}
+
+/// Decodes one terminal overflow indication.
+pub fn decode_update_subscription_overflow(
+    payload: &[u8],
+) -> Result<UpdateSubscriptionId, UpdateCodecError> {
+    decode_subscription_identity(payload)
+}
+
+/// Encodes one cancellation request or response identity.
+pub fn encode_cancel_update_subscription(subscription_id: UpdateSubscriptionId) -> Vec<u8> {
+    encode_subscription_identity(subscription_id)
+}
+
+/// Decodes one complete cancellation request or response identity.
+pub fn decode_cancel_update_subscription(
+    payload: &[u8],
+) -> Result<UpdateSubscriptionId, UpdateCodecError> {
+    decode_subscription_identity(payload)
+}
+
+/// Returns whether a message is an asynchronous subscription event.
+pub const fn is_update_subscription_event(message_type: u16) -> bool {
+    matches!(message_type, UPDATE_NOTIFICATION | UPDATE_SUBSCRIPTION_OVERFLOW)
+}
+
+fn encode_subscription_identity(subscription_id: UpdateSubscriptionId) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(2 + IDENTIFIER_LENGTH);
+    payload.extend_from_slice(&SUBSCRIPTION_PAYLOAD_VERSION.to_be_bytes());
+    payload.extend_from_slice(&subscription_id.into_bytes());
+    payload
+}
+
+fn decode_subscription_identity(payload: &[u8]) -> Result<UpdateSubscriptionId, UpdateCodecError> {
+    let mut decoder = Decoder::new(payload);
+    decoder.take_subscription_version()?;
+    let subscription_id = UpdateSubscriptionId::from_bytes(decoder.take_array()?);
+    decoder.finish()?;
+    Ok(subscription_id)
+}
+
 /// Encodes a stable one-byte update error.
 pub fn encode_update_error(error: UpdateErrorCode) -> Vec<u8> {
     vec![match error {
@@ -528,6 +678,7 @@ pub fn encode_update_error(error: UpdateErrorCode) -> Vec<u8> {
         UpdateErrorCode::InvalidCursor => 4,
         UpdateErrorCode::CounterExhausted => 5,
         UpdateErrorCode::AuthorizationDenied => 6,
+        UpdateErrorCode::Backpressure => 7,
     }]
 }
 
@@ -541,6 +692,7 @@ pub fn decode_update_error(payload: &[u8]) -> Result<UpdateErrorCode, UpdateCode
         [4] => Ok(UpdateErrorCode::InvalidCursor),
         [5] => Ok(UpdateErrorCode::CounterExhausted),
         [6] => Ok(UpdateErrorCode::AuthorizationDenied),
+        [7] => Ok(UpdateErrorCode::Backpressure),
         [_unknown] => Err(UpdateCodecError::InvalidDiscriminant),
         _ => Err(UpdateCodecError::TrailingBytes),
     }
@@ -597,6 +749,14 @@ impl<'bytes> Decoder<'bytes> {
     fn take_byte(&mut self) -> Result<u8, UpdateCodecError> {
         let [value] = self.take_array::<1>()?;
         Ok(value)
+    }
+
+    fn take_subscription_version(&mut self) -> Result<(), UpdateCodecError> {
+        if u16::from_be_bytes(self.take_array()?) == SUBSCRIPTION_PAYLOAD_VERSION {
+            Ok(())
+        } else {
+            Err(UpdateCodecError::UnsupportedSubscriptionVersion)
+        }
     }
 }
 
@@ -825,6 +985,70 @@ mod tests {
                 &encode_enumerate_response(&response).expect("response must encode")
             ),
             Ok(response)
+        );
+    }
+
+    #[test]
+    fn subscription_messages_are_fixed_versioned_and_identity_preserving() {
+        let subscription_id = UpdateSubscriptionId::from_bytes([0x81; IDENTIFIER_LENGTH]);
+        let update_id = UpdateId::from_bytes([0x82; IDENTIFIER_LENGTH]);
+        let request = SubscribeUpdatesRequest {
+            authority: CapabilityAuthority {
+                capability_id: renee_types::CapabilityId::from_bytes([0x83; IDENTIFIER_LENGTH]),
+                authenticator: renee_types::Authenticator::from_bytes([0x84; 32]),
+            },
+            document_id: DocumentId::from_bytes([0x85; IDENTIFIER_LENGTH]),
+        };
+        let encoded_request = encode_subscribe_updates_request(&request);
+        assert_eq!(encoded_request.len(), 2 + CAPABILITY_AUTHORITY_LENGTH + IDENTIFIER_LENGTH);
+        assert_eq!(decode_subscribe_updates_request(&encoded_request), Ok(request));
+
+        let identity_payloads = [
+            encode_subscribe_updates_ack(subscription_id),
+            encode_update_subscription_overflow(subscription_id),
+            encode_cancel_update_subscription(subscription_id),
+        ];
+        for payload in identity_payloads {
+            assert_eq!(payload.len(), 2 + IDENTIFIER_LENGTH);
+            assert_eq!(decode_subscription_identity(&payload), Ok(subscription_id));
+        }
+
+        let notification = UpdateNotification { subscription_id, update_id };
+        let encoded_notification = encode_update_notification(notification);
+        assert_eq!(encoded_notification.len(), 2 + IDENTIFIER_LENGTH * 2);
+        assert_eq!(decode_update_notification(&encoded_notification), Ok(notification));
+        assert!(is_update_subscription_event(UPDATE_NOTIFICATION));
+        assert!(is_update_subscription_event(UPDATE_SUBSCRIPTION_OVERFLOW));
+        assert!(!is_update_subscription_event(SUBSCRIBE_UPDATES_ACK));
+    }
+
+    #[test]
+    fn subscription_decoders_reject_wrong_lengths_and_versions_before_state_allocation() {
+        let request = SubscribeUpdatesRequest {
+            authority: CapabilityAuthority {
+                capability_id: renee_types::CapabilityId::from_bytes([0x91; IDENTIFIER_LENGTH]),
+                authenticator: renee_types::Authenticator::from_bytes([0x92; 32]),
+            },
+            document_id: DocumentId::from_bytes([0x93; IDENTIFIER_LENGTH]),
+        };
+        let mut payload = encode_subscribe_updates_request(&request);
+        assert_eq!(
+            decode_subscribe_updates_request(&payload[..payload.len() - 1]),
+            Err(UpdateCodecError::Truncated)
+        );
+        payload.push(0);
+        assert_eq!(
+            decode_subscribe_updates_request(&payload),
+            Err(UpdateCodecError::TrailingBytes)
+        );
+
+        let mut wrong_version = encode_cancel_update_subscription(
+            UpdateSubscriptionId::from_bytes([0x94; IDENTIFIER_LENGTH]),
+        );
+        wrong_version[1] ^= 1;
+        assert_eq!(
+            decode_cancel_update_subscription(&wrong_version),
+            Err(UpdateCodecError::UnsupportedSubscriptionVersion)
         );
     }
 }

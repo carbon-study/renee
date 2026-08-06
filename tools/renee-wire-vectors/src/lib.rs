@@ -15,21 +15,25 @@ use renee_types::{
 };
 use renee_wire::{
     ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor,
-    AuthorizedUpdateRequest, CAPABILITY_ERROR, CERTIFICATE_MANIFEST, CERTIFICATE_MANIFEST_RESPONSE,
-    CLIENT_HELLO, CREATE_DOCUMENT, CREATE_DOCUMENT_RESPONSE, CapabilityAuthority,
-    CapabilityErrorCode, ControlMutationOutcome, CreateAuthority, CreateDocumentOutcome,
-    CreateDocumentRequest, ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, ERROR_ALREADY_NEGOTIATED,
-    ERROR_EXPECTED_HELLO, ERROR_MALFORMED_HELLO, ERROR_UNSUPPORTED_PROFILE,
-    ERROR_UNSUPPORTED_VERSION, EnumerateRequest, EnumerateResponse, EnumerateStart, Envelope,
-    FETCH_UPDATE, FETCH_UPDATE_RESPONSE, FetchRequest, GRANT_CAPABILITY, GRANT_CAPABILITY_RESPONSE,
-    GrantCapabilityRequest, MAX_APPLICATION_PAYLOAD_LENGTH, PROFILE, PROTOCOL_ERROR,
-    REVOKE_CAPABILITY, REVOKE_CAPABILITY_RESPONSE, RevokeCapabilityRequest, SERVER_HELLO,
-    UPDATE_ERROR, UpdateErrorCode, VERSION, encode_accept_response, encode_acceptance_cursor,
-    encode_authorized_update_request, encode_capability_error, encode_control_mutation_response,
+    AuthorizedUpdateRequest, CANCEL_UPDATE_SUBSCRIPTION, CANCEL_UPDATE_SUBSCRIPTION_RESPONSE,
+    CAPABILITY_ERROR, CERTIFICATE_MANIFEST, CERTIFICATE_MANIFEST_RESPONSE, CLIENT_HELLO,
+    CREATE_DOCUMENT, CREATE_DOCUMENT_RESPONSE, CapabilityAuthority, CapabilityErrorCode,
+    ControlMutationOutcome, CreateAuthority, CreateDocumentOutcome, CreateDocumentRequest,
+    ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, ERROR_ALREADY_NEGOTIATED, ERROR_EXPECTED_HELLO,
+    ERROR_MALFORMED_HELLO, ERROR_UNSUPPORTED_PROFILE, ERROR_UNSUPPORTED_VERSION, EnumerateRequest,
+    EnumerateResponse, EnumerateStart, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE, FetchRequest,
+    GRANT_CAPABILITY, GRANT_CAPABILITY_RESPONSE, GrantCapabilityRequest,
+    MAX_APPLICATION_PAYLOAD_LENGTH, PROFILE, PROTOCOL_ERROR, REVOKE_CAPABILITY,
+    REVOKE_CAPABILITY_RESPONSE, RevokeCapabilityRequest, SERVER_HELLO, SUBSCRIBE_UPDATES,
+    SUBSCRIBE_UPDATES_ACK, SubscribeUpdatesRequest, UPDATE_ERROR, UPDATE_NOTIFICATION,
+    UPDATE_SUBSCRIPTION_OVERFLOW, UpdateErrorCode, UpdateNotification, UpdateSubscriptionId,
+    VERSION, encode_accept_response, encode_acceptance_cursor, encode_authorized_update_request,
+    encode_cancel_update_subscription, encode_capability_error, encode_control_mutation_response,
     encode_create_document_request, encode_create_document_response, encode_enumerate_request,
     encode_enumerate_response, encode_fetch_request, encode_fetch_response, encode_frame,
     encode_grant_capability_request, encode_greeting, encode_revoke_capability_request,
-    encode_update_error, encode_update_record,
+    encode_subscribe_updates_ack, encode_subscribe_updates_request, encode_update_error,
+    encode_update_notification, encode_update_record, encode_update_subscription_overflow,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
@@ -93,6 +97,7 @@ pub fn generate() -> Result<String, GenerateError> {
         update_id,
     };
     let (certificate_manifest, control_public_key) = certificate_manifest_fixture()?;
+    let subscription_id = UpdateSubscriptionId::from_bytes([0x60; 16]);
 
     let mut frames = vec![
         frame(
@@ -295,6 +300,51 @@ pub fn generate() -> Result<String, GenerateError> {
             0x41,
             encode_fetch_response(update.encrypted_payload())?,
         )?,
+        frame(
+            "subscription.request",
+            "subscription",
+            SUBSCRIBE_UPDATES,
+            0x42,
+            encode_subscribe_updates_request(&SubscribeUpdatesRequest {
+                authority: root.clone(),
+                document_id,
+            }),
+        )?,
+        frame(
+            "subscription.acknowledgement",
+            "subscription",
+            SUBSCRIBE_UPDATES_ACK,
+            0x42,
+            encode_subscribe_updates_ack(subscription_id),
+        )?,
+        frame(
+            "subscription.notification",
+            "subscription",
+            UPDATE_NOTIFICATION,
+            0x42,
+            encode_update_notification(UpdateNotification { subscription_id, update_id }),
+        )?,
+        frame(
+            "subscription.overflow",
+            "subscription",
+            UPDATE_SUBSCRIPTION_OVERFLOW,
+            0x42,
+            encode_update_subscription_overflow(subscription_id),
+        )?,
+        frame(
+            "subscription.cancel.request",
+            "subscription",
+            CANCEL_UPDATE_SUBSCRIPTION,
+            0x43,
+            encode_cancel_update_subscription(subscription_id),
+        )?,
+        frame(
+            "subscription.cancel.response",
+            "subscription",
+            CANCEL_UPDATE_SUBSCRIPTION_RESPONSE,
+            0x43,
+            encode_cancel_update_subscription(subscription_id),
+        )?,
     ];
 
     for (name, payload) in [
@@ -314,6 +364,7 @@ pub fn generate() -> Result<String, GenerateError> {
         ("error.update.invalid-cursor", UpdateErrorCode::InvalidCursor),
         ("error.update.counter-exhausted", UpdateErrorCode::CounterExhausted),
         ("error.update.authorization-denied", UpdateErrorCode::AuthorizationDenied),
+        ("error.update.backpressure", UpdateErrorCode::Backpressure),
     ] {
         frames.push(frame(name, "errors", UPDATE_ERROR, 0x51, encode_update_error(error))?);
     }
@@ -349,7 +400,7 @@ pub fn generate() -> Result<String, GenerateError> {
     )?);
 
     let oversized_greeting = oversized_greeting_payload();
-    let invalid_payloads = vec![InvalidPayloadVector {
+    let mut invalid_payloads = vec![InvalidPayloadVector {
         expected_error: "greeting-field-too-long",
         frame: frame(
             "limit.oversized-greeting-field",
@@ -359,6 +410,28 @@ pub fn generate() -> Result<String, GenerateError> {
             oversized_greeting,
         )?,
     }];
+    invalid_payloads.push(InvalidPayloadVector {
+        expected_error: "subscription-payload-truncated",
+        frame: frame(
+            "subscription.request.truncated",
+            "subscription",
+            SUBSCRIBE_UPDATES,
+            0x64,
+            vec![0, 1, 0],
+        )?,
+    });
+    let mut wrong_subscription_version = encode_cancel_update_subscription(subscription_id);
+    wrong_subscription_version[1] ^= 1;
+    invalid_payloads.push(InvalidPayloadVector {
+        expected_error: "unsupported-subscription-payload-version",
+        frame: frame(
+            "subscription.cancel.wrong-version",
+            "subscription",
+            CANCEL_UPDATE_SUBSCRIPTION,
+            0x65,
+            wrong_subscription_version,
+        )?,
+    });
     let invalid_frames = invalid_frame_vectors(frames.first().ok_or_else(|| {
         GenerateError::new("golden frame corpus unexpectedly has no first vector")
     })?)?;

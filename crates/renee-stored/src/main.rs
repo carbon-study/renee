@@ -3,15 +3,12 @@
 #![forbid(unsafe_code)]
 
 mod store;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "broker-local subscription IPC is not on the public wire")
-)]
 mod subscription;
 #[cfg(feature = "conformance")]
 mod test_barrier;
 mod verifier;
 
+use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
@@ -23,31 +20,43 @@ use std::sync::Arc;
 
 use renee_types::CreateAuthorityId;
 use renee_wire::{
-    ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor, CAPABILITY_ERROR,
+    ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor,
+    CANCEL_UPDATE_SUBSCRIPTION, CANCEL_UPDATE_SUBSCRIPTION_RESPONSE, CAPABILITY_ERROR,
     CREATE_DOCUMENT, CREATE_DOCUMENT_RESPONSE, CapabilityErrorCode, ControlMutationOutcome,
     CreateDocumentOutcome, ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, EnumerateResponse,
     EnumerateStart, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE, GRANT_CAPABILITY,
     GRANT_CAPABILITY_RESPONSE, MAX_APPLICATION_PAYLOAD_LENGTH, REVOKE_CAPABILITY,
-    REVOKE_CAPABILITY_RESPONSE, UPDATE_ERROR, UpdateErrorCode, VERSION, decode_acceptance_cursor,
-    decode_authorized_update_request, decode_body, decode_create_document_request,
+    REVOKE_CAPABILITY_RESPONSE, SUBSCRIBE_UPDATES, SUBSCRIBE_UPDATES_ACK, UPDATE_ERROR,
+    UPDATE_NOTIFICATION, UPDATE_SUBSCRIPTION_OVERFLOW, UpdateErrorCode, UpdateNotification,
+    UpdateSubscriptionId, VERSION, decode_acceptance_cursor, decode_authorized_update_request,
+    decode_body, decode_cancel_update_subscription, decode_create_document_request,
     decode_enumerate_request, decode_fetch_request, decode_grant_capability_request,
-    decode_revoke_capability_request, decode_update_record, encode_accept_response,
-    encode_acceptance_cursor, encode_body, encode_capability_error,
-    encode_control_mutation_response, encode_create_document_response, encode_enumerate_response,
-    encode_fetch_response, encode_update_error, enumerate_response_base_length, read_body,
-    write_body,
+    decode_revoke_capability_request, decode_subscribe_updates_request, decode_update_record,
+    encode_accept_response, encode_acceptance_cursor, encode_body,
+    encode_cancel_update_subscription, encode_capability_error, encode_control_mutation_response,
+    encode_create_document_response, encode_enumerate_response, encode_fetch_response,
+    encode_subscribe_updates_ack, encode_update_error, encode_update_notification,
+    encode_update_subscription_overflow, enumerate_response_base_length, read_body, write_body,
 };
 #[cfg(feature = "conformance")]
 use store::StoreError;
 use store::{
     CreateAuthorityProvision, DurableUpdateStore, StoreAcceptOutcome, StoreControlOutcome,
-    StoreCreateOutcome, StoreEnumerateStart, StoreReadOutcome,
+    StoreCreateOutcome, StoreEnumerateStart, StoreReadOutcome, StoreSubscribeOutcome,
 };
+use subscription::{UpdateSubscription, UpdateSubscriptionEnd, UpdateSubscriptionPoll};
 use tokio::io::AsyncReadExt as _;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::net::{TcpListener, TcpStream, tcp::OwnedWriteHalf};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::JoinSet;
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:4434";
+const CONNECTION_EVENT_QUEUE_CAPACITY: usize = 64;
+
+struct ActiveConnectionSubscription {
+    cancellation: oneshot::Sender<()>,
+    finished: oneshot::Receiver<()>,
+}
 
 struct Configuration {
     bind_address: SocketAddr,
@@ -222,17 +231,267 @@ const fn decode_hex_nibble(value: u8) -> Option<u8> {
 }
 
 async fn serve_connection(
-    mut connection: TcpStream,
+    connection: TcpStream,
     store: Arc<Mutex<DurableUpdateStore>>,
 ) -> io::Result<()> {
-    while let Some(body) = read_body(&mut connection).await? {
-        let response_body = match decode_body(&body) {
-            Ok(request) => handle_request(&request, &store).await?,
-            Err(_error) => break,
-        };
-        write_body(&mut connection, &response_body).await?;
+    let broker_channel = store
+        .lock()
+        .await
+        .open_broker_channel()
+        .ok_or_else(|| io::Error::other("broker channel identity exhausted"))?;
+    let (mut input, mut output) = connection.into_split();
+    let (request_sender, mut request_receiver) = mpsc::channel(CONNECTION_EVENT_QUEUE_CAPACITY);
+    let mut request_tasks = JoinSet::new();
+    request_tasks.spawn(async move {
+        loop {
+            let request = read_body(&mut input).await;
+            let terminal = !matches!(&request, Ok(Some(_)));
+            if request_sender.send(request).await.is_err() || terminal {
+                return;
+            }
+        }
+    });
+    let result =
+        serve_connection_with_channel(&mut output, &mut request_receiver, &store, &broker_channel)
+            .await;
+    store.lock().await.close_broker_channel(broker_channel);
+    result
+}
+
+#[expect(
+    clippy::big_endian_bytes,
+    clippy::too_many_lines,
+    reason = "the bounded connection state machine keeps routing and its network-order identity adjacent"
+)]
+async fn serve_connection_with_channel(
+    output: &mut OwnedWriteHalf,
+    requests: &mut mpsc::Receiver<io::Result<Option<Vec<u8>>>>,
+    store: &Mutex<DurableUpdateStore>,
+    broker_channel: &store::BrokerChannel,
+) -> io::Result<()> {
+    let (event_sender, mut event_receiver) =
+        mpsc::channel::<Vec<u8>>(CONNECTION_EVENT_QUEUE_CAPACITY);
+    let mut active_subscriptions =
+        HashMap::<UpdateSubscriptionId, ActiveConnectionSubscription>::new();
+    let mut subscription_tasks = JoinSet::new();
+    let mut next_subscription_id = 1_u128;
+
+    loop {
+        active_subscriptions
+            .retain(|_subscription_id, subscription| !subscription.cancellation.is_closed());
+        tokio::select! {
+            event = event_receiver.recv() => {
+                let Some(event) = event else {
+                    return Err(io::Error::other("connection event queue closed"));
+                };
+                write_body(output, &event).await?;
+            }
+            body = requests.recv() => {
+                let Some(body) = body else {
+                    return Err(io::Error::other("connection request queue closed"));
+                };
+                let Some(body) = body? else {
+                    break;
+                };
+                let Ok(request) = decode_body(&body) else {
+                    break;
+                };
+                if request.message_type == SUBSCRIBE_UPDATES && request.version == VERSION {
+                    let subscribe = match decode_subscribe_updates_request(&request.payload) {
+                        Ok(subscribe) => subscribe,
+                        Err(_error) => {
+                            let malformed = response(
+                                &request,
+                                UPDATE_ERROR,
+                                encode_update_error(UpdateErrorCode::Malformed),
+                            )?;
+                            write_body(output, &malformed).await?;
+                            continue;
+                        }
+                    };
+                    let subscription_id =
+                        UpdateSubscriptionId::from_bytes(next_subscription_id.to_be_bytes());
+                    let Some(following_subscription_id) = next_subscription_id.checked_add(1) else {
+                        let backpressure = response(
+                            &request,
+                            UPDATE_ERROR,
+                            encode_update_error(UpdateErrorCode::Backpressure),
+                        )?;
+                        write_body(output, &backpressure).await?;
+                        continue;
+                    };
+                    let outcome = store.lock().await.subscribe_updates(
+                        broker_channel,
+                        subscribe.document_id,
+                        subscribe.authority.capability_id,
+                        &subscribe.authority.authenticator,
+                    ).map_err(store_error)?;
+                    let subscription = match outcome {
+                        StoreSubscribeOutcome::Acknowledged(subscription) => subscription,
+                        StoreSubscribeOutcome::AuthorizationDenied => {
+                            let denied = response(
+                                &request,
+                                UPDATE_ERROR,
+                                encode_update_error(UpdateErrorCode::AuthorizationDenied),
+                            )?;
+                            write_body(output, &denied).await?;
+                            continue;
+                        }
+                        StoreSubscribeOutcome::Backpressure => {
+                            let backpressure = response(
+                                &request,
+                                UPDATE_ERROR,
+                                encode_update_error(UpdateErrorCode::Backpressure),
+                            )?;
+                            write_body(output, &backpressure).await?;
+                            continue;
+                        }
+                    };
+                    next_subscription_id = following_subscription_id;
+                    let acknowledgement = response(
+                        &request,
+                        SUBSCRIBE_UPDATES_ACK,
+                        encode_subscribe_updates_ack(subscription_id),
+                    )?;
+                    #[cfg(feature = "conformance")]
+                    tokio::task::spawn_blocking(|| {
+                        test_barrier::checkpoint("store-subscription-before-ack")
+                    })
+                    .await
+                    .map_err(|error| io::Error::other(error.to_string()))??;
+                    // The broker barrier already exists. Put its acknowledgement
+                    // on the IPC stream before a task can emit any later wakeup.
+                    write_body(output, &acknowledgement).await?;
+                    let (cancellation, cancelled) = oneshot::channel();
+                    let (finished, completion) = oneshot::channel();
+                    active_subscriptions.insert(
+                        subscription_id,
+                        ActiveConnectionSubscription { cancellation, finished: completion },
+                    );
+                    let subscription_event_sender = event_sender.clone();
+                    subscription_tasks.spawn(async move {
+                        forward_subscription(
+                            subscription,
+                            subscription_id,
+                            request.correlation_id,
+                            subscription_event_sender,
+                            cancelled,
+                        )
+                        .await;
+                        let _completion_result = finished.send(());
+                    });
+                    continue;
+                }
+                if request.message_type == CANCEL_UPDATE_SUBSCRIPTION
+                    && request.version == VERSION
+                {
+                    let subscription_id = match decode_cancel_update_subscription(&request.payload) {
+                        Ok(subscription_id) => subscription_id,
+                        Err(_error) => {
+                            let malformed = response(
+                                &request,
+                                UPDATE_ERROR,
+                                encode_update_error(UpdateErrorCode::Malformed),
+                            )?;
+                            write_body(output, &malformed).await?;
+                            continue;
+                        }
+                    };
+                    if let Some(subscription) = active_subscriptions.remove(&subscription_id) {
+                        let _cancellation_result = subscription.cancellation.send(());
+                        let _completion_result = subscription.finished.await;
+                    }
+                    let cancelled = response(
+                        &request,
+                        CANCEL_UPDATE_SUBSCRIPTION_RESPONSE,
+                        encode_cancel_update_subscription(subscription_id),
+                    )?;
+                    write_body(output, &cancelled).await?;
+                    continue;
+                }
+                let response_body = handle_request(&request, store).await?;
+                write_body(output, &response_body).await?;
+            }
+        }
     }
+    subscription_tasks.abort_all();
     Ok(())
+}
+
+async fn forward_subscription(
+    mut subscription: UpdateSubscription,
+    subscription_id: UpdateSubscriptionId,
+    correlation_id: [u8; 16],
+    event_sender: mpsc::Sender<Vec<u8>>,
+    mut cancelled: oneshot::Receiver<()>,
+) {
+    #[cfg(feature = "conformance")]
+    if tokio::task::spawn_blocking(|| test_barrier::checkpoint("store-subscription-before-poll"))
+        .await
+        .map_or(true, |checkpoint| checkpoint.is_err())
+    {
+        return;
+    }
+    loop {
+        let observation = tokio::select! {
+            biased;
+            _cancelled = &mut cancelled => {
+                subscription.cancel();
+                return;
+            }
+            observation = subscription.next() => observation,
+        };
+        let (message_type, payload) = match observation {
+            UpdateSubscriptionPoll::Notification(update_id) => (
+                UPDATE_NOTIFICATION,
+                encode_update_notification(UpdateNotification { subscription_id, update_id }),
+            ),
+            UpdateSubscriptionPoll::Invalidated(UpdateSubscriptionEnd::Overflowed) => {
+                (UPDATE_SUBSCRIPTION_OVERFLOW, encode_update_subscription_overflow(subscription_id))
+            }
+            UpdateSubscriptionPoll::Invalidated(
+                UpdateSubscriptionEnd::Cancelled
+                | UpdateSubscriptionEnd::Revoked
+                | UpdateSubscriptionEnd::Retired
+                | UpdateSubscriptionEnd::ChannelLost
+                | UpdateSubscriptionEnd::BrokerShutdown,
+            ) => return,
+            #[cfg(test)]
+            UpdateSubscriptionPoll::Pending => continue,
+        };
+        let event = match encode_body(&Envelope {
+            correlation_id,
+            message_type,
+            payload,
+            version: VERSION,
+        }) {
+            Ok(event) => event,
+            Err(_error) => return,
+        };
+        match event_sender.try_send(event) {
+            Ok(()) if message_type == UPDATE_NOTIFICATION => {}
+            Ok(()) => return,
+            Err(mpsc::error::TrySendError::Closed(_event)) => return,
+            Err(mpsc::error::TrySendError::Full(_event)) => {
+                subscription.cancel();
+                let overflow = match encode_body(&Envelope {
+                    correlation_id,
+                    message_type: UPDATE_SUBSCRIPTION_OVERFLOW,
+                    payload: encode_update_subscription_overflow(subscription_id),
+                    version: VERSION,
+                }) {
+                    Ok(overflow) => overflow,
+                    Err(_error) => return,
+                };
+                tokio::select! {
+                    biased;
+                    _cancelled = &mut cancelled => {}
+                    _sent = event_sender.send(overflow) => {}
+                }
+                return;
+            }
+        }
+    }
 }
 
 // Keeping the message dispatch in one place makes it visually obvious that

@@ -303,10 +303,6 @@ pub enum StoreReadOutcome<Value> {
 }
 
 /// Authorization-preserving result of creating a broker-local update subscription.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "broker-local subscription IPC is not on the public wire")
-)]
 pub enum StoreSubscribeOutcome {
     /// The subscription is installed and eligible before this acknowledgement returns.
     Acknowledged(UpdateSubscription),
@@ -417,19 +413,11 @@ impl DurableUpdateStore {
     }
 
     /// Opens one unforgeable broker-local channel lease.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "broker-local subscription IPC is not on the public wire")
-    )]
     pub fn open_broker_channel(&mut self) -> Option<BrokerChannel> {
         self.subscriptions.open_channel()
     }
 
     /// Authorizes and installs one document-scoped update subscription.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "broker-local subscription IPC is not on the public wire")
-    )]
     pub fn subscribe_updates(
         &mut self,
         channel: &BrokerChannel,
@@ -487,10 +475,6 @@ impl DurableUpdateStore {
     }
 
     /// Invalidates all subscriptions issued on one lost broker-local channel.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "broker-local subscription IPC is not on the public wire")
-    )]
     pub fn close_broker_channel(&mut self, channel: BrokerChannel) {
         self.subscriptions.close_channel(channel);
     }

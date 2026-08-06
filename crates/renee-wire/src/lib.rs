@@ -35,14 +35,21 @@ pub use capability::{
 };
 pub use update::{
     ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor,
-    ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, EnumerateRequest, EnumerateResponse,
-    EnumerateStart, FETCH_UPDATE, FETCH_UPDATE_RESPONSE, FetchRequest, UPDATE_ERROR,
-    UpdateCodecError, UpdateErrorCode, decode_accept_response, decode_acceptance_cursor,
+    CANCEL_UPDATE_SUBSCRIPTION, CANCEL_UPDATE_SUBSCRIPTION_RESPONSE, ENUMERATE_UPDATES,
+    ENUMERATE_UPDATES_RESPONSE, EnumerateRequest, EnumerateResponse, EnumerateStart, FETCH_UPDATE,
+    FETCH_UPDATE_RESPONSE, FetchRequest, SUBSCRIBE_UPDATES, SUBSCRIBE_UPDATES_ACK,
+    SubscribeUpdatesRequest, UPDATE_ERROR, UPDATE_NOTIFICATION, UPDATE_SUBSCRIPTION_OVERFLOW,
+    UpdateCodecError, UpdateErrorCode, UpdateNotification, UpdateSubscriptionId,
+    decode_accept_response, decode_acceptance_cursor, decode_cancel_update_subscription,
     decode_enumerate_request, decode_enumerate_response, decode_fetch_request,
-    decode_fetch_response, decode_update_error, decode_update_record, encode_accept_response,
-    encode_acceptance_cursor, encode_enumerate_request, encode_enumerate_response,
-    encode_fetch_request, encode_fetch_response, encode_update_error, encode_update_record,
-    enumerate_response_base_length, metadata_encoded_length,
+    decode_fetch_response, decode_subscribe_updates_ack, decode_subscribe_updates_request,
+    decode_update_error, decode_update_notification, decode_update_record,
+    decode_update_subscription_overflow, encode_accept_response, encode_acceptance_cursor,
+    encode_cancel_update_subscription, encode_enumerate_request, encode_enumerate_response,
+    encode_fetch_request, encode_fetch_response, encode_subscribe_updates_ack,
+    encode_subscribe_updates_request, encode_update_error, encode_update_notification,
+    encode_update_record, encode_update_subscription_overflow, enumerate_response_base_length,
+    is_update_subscription_event, metadata_encoded_length,
 };
 
 /// Experimental profile identifier carried by negotiation messages.

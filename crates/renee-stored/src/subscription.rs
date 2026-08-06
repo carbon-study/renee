@@ -55,6 +55,7 @@ pub enum UpdateSubscriptionPoll {
     /// One at-least-once wakeup naming an immutable update.
     Notification(UpdateId),
     /// No wakeup or terminal state is currently available.
+    #[cfg(test)]
     Pending,
     /// The subscription is terminal and cannot support a complete handoff.
     Invalidated(UpdateSubscriptionEnd),
@@ -70,6 +71,7 @@ pub struct UpdateSubscription {
 
 impl UpdateSubscription {
     /// Returns the next queued wakeup, pending state, or explicit invalidation.
+    #[cfg(test)]
     pub fn try_next(&mut self) -> UpdateSubscriptionPoll {
         if let Some(ended) = self.ended() {
             return UpdateSubscriptionPoll::Invalidated(ended);
