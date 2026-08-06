@@ -75,7 +75,28 @@ pub struct UpdateSubscription {
     state: Arc<AtomicU8>,
 }
 
+/// Cloneable final-emission authority checked while the store lock is held.
+#[derive(Clone)]
+pub(crate) struct UpdateSubscriptionEmission {
+    channel: Weak<ChannelLease>,
+    state: Arc<AtomicU8>,
+}
+
+impl UpdateSubscriptionEmission {
+    pub fn is_authorized(&self) -> bool {
+        self.channel.upgrade().is_some() && self.state.load(Ordering::Acquire) == ACTIVE
+    }
+}
+
 impl UpdateSubscription {
+    /// Captures the state needed to authorize the final IPC write.
+    pub(crate) fn emission(&self) -> UpdateSubscriptionEmission {
+        UpdateSubscriptionEmission {
+            channel: Weak::clone(&self.channel),
+            state: Arc::clone(&self.state),
+        }
+    }
+
     /// Returns the next queued wakeup, pending state, or explicit invalidation.
     #[cfg(test)]
     pub fn try_next(&mut self) -> UpdateSubscriptionPoll {

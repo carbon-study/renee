@@ -14,12 +14,11 @@ use renee_subject::{
     EnumerateObservation, FetchObservation, HarnessResult, PermanentDaemon, ServerHarness,
 };
 use renee_types::{
-    AcceptanceSequence, Authenticator, CapabilityId, CreateAuthorityId, DocumentId,
-    ImmutableUpdate, LoroRange, PublicLoroRanges, RequestId, UpdateId, UpdateMetadata,
+    Authenticator, CapabilityId, CreateAuthorityId, DocumentId, ImmutableUpdate, LoroRange,
+    PublicLoroRanges, RequestId, UpdateId, UpdateMetadata,
 };
 use renee_wire::{
-    AcceptanceCursor, CapabilityAuthority, CreateAuthority, CreateDocumentRequest,
-    decode_acceptance_cursor, encode_acceptance_cursor, encode_update_record,
+    CapabilityAuthority, CreateAuthority, CreateDocumentRequest, encode_update_record,
 };
 
 fn update(document: u8, update: u8, payload: &[u8]) -> ImmutableUpdate {
@@ -33,6 +32,21 @@ fn update(document: u8, update: u8, payload: &[u8]) -> ImmutableUpdate {
         UpdateId::from_bytes([update; 16]),
         ranges,
         payload.to_vec(),
+    )
+}
+
+fn wide_update(document: u8, update: u8) -> ImmutableUpdate {
+    let ranges = PublicLoroRanges::new(
+        (0_u64..128)
+            .map(|peer_id| LoroRange::new(peer_id + 1, 0, 1).expect("fixture range must be valid"))
+            .collect(),
+    )
+    .expect("fixture ranges must be canonical");
+    ImmutableUpdate::new(
+        DocumentId::from_bytes([document; 16]),
+        UpdateId::from_bytes([update; 16]),
+        ranges,
+        vec![update],
     )
 }
 
@@ -127,14 +141,8 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
     let first_cursor = first_page
         .next_cursor
         .ok_or_else(|| io::Error::other("nonempty page omitted its cursor"))?;
-    let decoded_first_cursor = decode_acceptance_cursor(first.document_id(), &first_cursor)?;
-    if decoded_first_cursor
-        != (AcceptanceCursor {
-            position: AcceptanceSequence::FIRST,
-            terminal_sequence: AcceptanceSequence::FIRST,
-        })
-    {
-        return Err(io::Error::other("first acceptance received the wrong cursor position").into());
+    if first_cursor.len() != 32 {
+        return Err(io::Error::other("enumeration token did not use the opaque fixed size").into());
     }
 
     let later = update(1, 3, b"later-opaque-update");
@@ -143,6 +151,15 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
             != AcceptObservation::Inserted
     {
         return Err(io::Error::other("second document update was not inserted").into());
+    }
+    let tail_page = connection
+        .enumerate_updates_after_tail(&first_root.root, first.document_id(), first_cursor)
+        .await?;
+    if tail_page.has_more || tail_page.updates != vec![expected_metadata(&later)] {
+        return Err(io::Error::other(
+            "new high-water read after a stable tail did not return only later acceptances",
+        )
+        .into());
     }
 
     let terminal_sequence = model
@@ -160,54 +177,14 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
     if observed_page.updates != vec![expected_metadata(&first), expected_metadata(&later)] {
         return Err(io::Error::other("enumeration exposed wrong public metadata").into());
     }
-    let expected_after = model
-        .enumerate(first.document_id(), Some(terminal_sequence), terminal_sequence)
-        .map(|(_sequence, metadata)| metadata)
-        .collect::<Vec<_>>();
-    let observed_after = connection
-        .enumerate_updates(&first_root.root, first.document_id(), observed_page.next_cursor.clone())
-        .await?;
-    if observed_after.has_more || observed_after.updates != expected_after {
-        return Err(io::Error::other("enumeration cursor was not exclusive").into());
-    }
     let later_cursor = observed_page
         .next_cursor
         .ok_or_else(|| io::Error::other("nonempty finite page omitted its cursor"))?;
-    let expected_later_sequence = AcceptanceSequence::FIRST
-        .checked_next()
-        .ok_or_else(|| io::Error::other("fixture acceptance sequence overflowed"))?;
-    if decode_acceptance_cursor(first.document_id(), &later_cursor)?
-        != (AcceptanceCursor {
-            position: expected_later_sequence,
-            terminal_sequence: expected_later_sequence,
-        })
-    {
-        return Err(io::Error::other("retry or conflict consumed an acceptance sequence").into());
-    }
-    let captured_window = connection
-        .enumerate_updates(&first_root.root, first.document_id(), Some(first_cursor.clone()))
-        .await?;
-    if captured_window.has_more || !captured_window.updates.is_empty() {
-        return Err(io::Error::other(
-            "acceptance after the captured terminal extended a finite read",
-        )
-        .into());
-    }
-    let tail_page = connection
-        .enumerate_updates_after_tail(&first_root.root, first.document_id(), first_cursor.clone())
-        .await?;
-    if tail_page.has_more || tail_page.updates != vec![expected_metadata(&later)] {
-        return Err(io::Error::other(
-            "new high-water read after a stable tail did not return only later acceptances",
-        )
-        .into());
-    }
-
-    let wrong_document = DocumentId::from_bytes([0x77; 16]);
+    let wrong_document = other_document.document_id();
     if connection
-        .enumerate_updates_observation(&first_root.root, wrong_document, Some(later_cursor.clone()))
+        .enumerate_updates_observation(&other_root.root, wrong_document, Some(later_cursor.clone()))
         .await?
-        != EnumerateObservation::InvalidCursor
+        != EnumerateObservation::InvalidContinuation
     {
         return Err(io::Error::other("cross-document cursor was accepted").into());
     }
@@ -219,17 +196,12 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
             Some(malformed_cursor),
         )
         .await?
-        != EnumerateObservation::InvalidCursor
+        != EnumerateObservation::InvalidContinuation
     {
         return Err(io::Error::other("malformed cursor was accepted").into());
     }
-    let impossible_cursor = encode_acceptance_cursor(
-        first.document_id(),
-        AcceptanceCursor {
-            position: AcceptanceSequence::from_be_bytes([0xff; 8]),
-            terminal_sequence: AcceptanceSequence::from_be_bytes([0xff; 8]),
-        },
-    )?;
+    let mut impossible_cursor = later_cursor;
+    impossible_cursor[0] ^= 0x80;
     if connection
         .enumerate_updates_observation(
             &first_root.root,
@@ -237,7 +209,7 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
             Some(impossible_cursor),
         )
         .await?
-        != EnumerateObservation::InvalidCursor
+        != EnumerateObservation::InvalidContinuation
     {
         return Err(io::Error::other("impossible cursor position was accepted").into());
     }
@@ -329,23 +301,91 @@ async fn acknowledged_update_survives_store_restart() -> HarnessResult<()> {
     {
         return Err(io::Error::other("post-restart update was not inserted").into());
     }
-    let resumed = recovered
-        .enumerate_updates(
+    if recovered
+        .enumerate_updates_observation(
             &accepted_root.root,
             accepted.document_id(),
-            Some(durable_cursor.clone()),
+            Some(durable_cursor),
         )
-        .await?;
-    if resumed.has_more || !resumed.updates.is_empty() {
-        return Err(io::Error::other("pre-restart finite cursor changed its terminal").into());
+        .await?
+        != EnumerateObservation::InvalidContinuation
+    {
+        return Err(io::Error::other("pre-restart token survived broker generation loss").into());
     }
-    let refreshed = recovered
-        .enumerate_updates_after_tail(&accepted_root.root, accepted.document_id(), durable_cursor)
-        .await?;
-    if refreshed.updates != vec![expected_metadata(&later)] {
-        return Err(io::Error::other("tail read repeated history or omitted a new update").into());
+    let restarted =
+        recovered.enumerate_updates(&accepted_root.root, accepted.document_id(), None).await?;
+    if restarted.updates != vec![expected_metadata(&accepted), expected_metadata(&later)] {
+        return Err(io::Error::other("origin restart omitted durable history").into());
     }
 
     recovered.close();
     server.shutdown().await
+}
+
+#[tokio::test]
+async fn opaque_enumeration_pass_retries_exact_pages_and_excludes_later_accepts()
+-> HarnessResult<()> {
+    let server = ServerHarness::start().await?;
+    let connection = server.connect_webtransport().await?;
+    connection.negotiate().await?;
+    let authority = root(10);
+    if connection.create_document(&authority).await? != CreateDocumentObservation::Inserted {
+        return Err(io::Error::other("fixture document was not created").into());
+    }
+    let updates = [wide_update(10, 0x11), wide_update(10, 0x12), wide_update(10, 0x13)];
+    for update in &updates {
+        if connection.accept_update(&authority.root, &encode_update_record(update)?).await?
+            != AcceptObservation::Inserted
+        {
+            return Err(io::Error::other("wide fixture update was not accepted").into());
+        }
+    }
+    let first = connection.enumerate_updates(&authority.root, authority.document_id, None).await?;
+    if !first.has_more || first.updates != vec![expected_metadata(&updates[0])] {
+        return Err(io::Error::other("origin did not return one bounded first page").into());
+    }
+    let first_token =
+        first.next_cursor.ok_or_else(|| io::Error::other("first page omitted its opaque token"))?;
+    let later = wide_update(10, 0x14);
+    connection.accept_update(&authority.root, &encode_update_record(&later)?).await?;
+
+    let second = connection
+        .enumerate_updates(&authority.root, authority.document_id, Some(first_token.clone()))
+        .await?;
+    if !second.has_more || second.updates != vec![expected_metadata(&updates[1])] {
+        return Err(io::Error::other("second stable page was incorrect").into());
+    }
+    let second_retry = connection
+        .enumerate_updates(&authority.root, authority.document_id, Some(first_token))
+        .await?;
+    if second_retry != second {
+        return Err(io::Error::other("intermediate exact retry changed bytes or successor").into());
+    }
+    let second_token = second
+        .next_cursor
+        .ok_or_else(|| io::Error::other("second page omitted its opaque token"))?;
+    let terminal = connection
+        .enumerate_updates(&authority.root, authority.document_id, Some(second_token.clone()))
+        .await?;
+    if terminal.has_more || terminal.updates != vec![expected_metadata(&updates[2])] {
+        return Err(io::Error::other("terminal stable page included a later acceptance").into());
+    }
+    let terminal_retry = connection
+        .enumerate_updates(&authority.root, authority.document_id, Some(second_token))
+        .await?;
+    if terminal_retry != terminal {
+        return Err(io::Error::other("terminal exact retry changed bytes or successor").into());
+    }
+    let tail = terminal
+        .next_cursor
+        .ok_or_else(|| io::Error::other("terminal page omitted its after-tail token"))?;
+    let after_tail = connection
+        .enumerate_updates_after_tail(&authority.root, authority.document_id, tail)
+        .await?;
+    if after_tail.updates != vec![expected_metadata(&later)] {
+        return Err(
+            io::Error::other("after-tail pass repeated history or omitted later update").into()
+        );
+    }
+    Ok(())
 }

@@ -47,6 +47,14 @@ const MAX_VECTOR_PASSES_PER_DOCUMENT: usize = 32;
 const MAX_VECTOR_SCAN_RECORDS: usize = 64;
 const VECTOR_CONTINUATION_LENGTH: usize = 32;
 const VECTOR_PASS_IDLE_TTL: Duration = Duration::from_secs(300);
+const MAX_ENUMERATION_PASSES: usize = 1_024;
+const MAX_ENUMERATION_PASSES_PER_AUTHORITY: usize = 8;
+const MAX_ENUMERATION_PASSES_PER_CHANNEL: usize = 32;
+const MAX_ENUMERATION_PASSES_PER_DOCUMENT: usize = 32;
+const MAX_ENUMERATION_SCAN_RECORDS: usize = 64;
+const ENUMERATION_CONTINUATION_LENGTH: usize = 32;
+const ENUMERATION_PASS_IDLE_TTL: Duration = Duration::from_secs(300);
+const STORE_GENERATION_LENGTH: usize = 16;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -331,6 +339,7 @@ pub struct CreateAuthorityProvision {
 }
 
 /// One bounded page in Renee acceptance order.
+#[derive(Clone)]
 pub struct StoredUpdatePage {
     /// Whether another row exists after this page.
     pub has_more: bool,
@@ -352,19 +361,14 @@ pub struct StoredVectorBackfillPage {
 }
 
 /// Store-decoded finite-window start after structural cursor validation.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum StoreEnumerateStart {
     /// Capture the current high water from origin.
     Origin,
     /// Continue the exact captured finite window.
-    Continue {
-        /// Exclusive position already returned.
-        position: AcceptanceSequence,
-        /// Inclusive captured high water.
-        terminal_sequence: AcceptanceSequence,
-    },
+    Continue(Vec<u8>),
     /// Capture a new high water after a completed prior window.
-    AfterTail(AcceptanceSequence),
+    AfterTail(Vec<u8>),
 }
 
 /// Store-decoded start for one stable vector-backfill pass.
@@ -381,8 +385,20 @@ pub enum StoreReadOutcome<Value> {
     Authorized(Value),
     /// Document, capability, secret, ancestry, or read operation was denied.
     AuthorizationDenied,
-    /// Authority was valid but the supplied cursor was not.
-    InvalidCursor,
+}
+
+/// Authorization-preserving enumeration result.
+pub enum StoreEnumerateOutcome<Value> {
+    /// Authority was effective and selection completed.
+    Authorized(Value),
+    /// Document, capability, secret, ancestry, or read operation was denied.
+    AuthorizationDenied,
+    /// Valid read authority named a document that has been retired.
+    RetiredDocument,
+    /// Authority was valid but the stable-pass continuation was unusable.
+    InvalidContinuation,
+    /// The bounded continuation registry could not admit another pass.
+    Backpressure,
 }
 
 /// Authorization-preserving vector-backfill result.
@@ -410,11 +426,12 @@ pub enum StoreSubscribeOutcome {
 }
 
 /// One authorized finite-window page and its captured high water.
+#[derive(Clone)]
 pub struct AuthorizedStoredUpdatePage {
     /// Page selected under the same transaction as authorization.
     pub page: StoredUpdatePage,
-    /// Inclusive high water for the finite window, absent for empty origin.
-    pub terminal_sequence: Option<AcceptanceSequence>,
+    /// Opaque successor or stable-tail token, present for every nonempty page.
+    pub next_cursor: Option<Vec<u8>>,
 }
 
 /// One authorized vector-selected page and its opaque continuation.
@@ -448,9 +465,41 @@ struct VectorPassRetry {
     token: [u8; VECTOR_CONTINUATION_LENGTH],
 }
 
+struct EnumerationPass {
+    capability_id: CapabilityId,
+    channel_id: u64,
+    current: EnumerationPassPosition,
+    document_id: DocumentId,
+    expires_at: Instant,
+    generation: [u8; STORE_GENERATION_LENGTH],
+    retry: Option<EnumerationPassRetry>,
+    terminal_sequence: AcceptanceSequence,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum EnumerationTokenMode {
+    Continue,
+    AfterTail,
+}
+
+#[derive(Clone, Copy)]
+struct EnumerationPassPosition {
+    mode: EnumerationTokenMode,
+    position: AcceptanceSequence,
+    token: [u8; ENUMERATION_CONTINUATION_LENGTH],
+}
+
+struct EnumerationPassRetry {
+    mode: EnumerationTokenMode,
+    response: AuthorizedStoredUpdatePage,
+    token: [u8; ENUMERATION_CONTINUATION_LENGTH],
+}
+
 /// Authoritative capability and immutable-update `SQLite` connection.
 pub struct DurableUpdateStore {
     connection: Connection,
+    enumeration_passes: Vec<EnumerationPass>,
+    generation: [u8; STORE_GENERATION_LENGTH],
     random: SystemRandom,
     subscriptions: UpdateSubscriptionRegistry,
     vector_passes: Vec<VectorBackfillPass>,
@@ -669,9 +718,14 @@ impl DurableUpdateStore {
         connection.pragma_update(None, "wal_autocheckpoint", 1_000_u32)?;
         initialize_or_check_schema(&mut connection)?;
 
+        let random = SystemRandom::new();
+        let mut generation = [0_u8; STORE_GENERATION_LENGTH];
+        random.fill(&mut generation).map_err(|_error| StoreError::EntropyUnavailable)?;
         let mut store = Self {
             connection,
-            random: SystemRandom::new(),
+            enumeration_passes: Vec::new(),
+            generation,
+            random,
             subscriptions: UpdateSubscriptionRegistry::new(),
             vector_passes: Vec::new(),
         };
@@ -749,6 +803,7 @@ impl DurableUpdateStore {
             return;
         }
         let channel_id = channel.id();
+        self.enumeration_passes.retain(|pass| pass.channel_id != channel_id);
         self.vector_passes.retain(|pass| pass.channel_id != channel_id);
         self.subscriptions.close_channel(channel);
     }
@@ -773,10 +828,24 @@ impl DurableUpdateStore {
             .optional()?
             == Some(1);
         if retired {
+            self.enumeration_passes.retain(|pass| pass.document_id != document_id);
             self.vector_passes.retain(|pass| pass.document_id != document_id);
             self.subscriptions.invalidate_document(document_id, UpdateSubscriptionEnd::Retired);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn commit_retirement_for_test(
+        &mut self,
+        document_id: DocumentId,
+    ) -> Result<(), StoreError> {
+        let document_bytes = document_id.into_bytes();
+        self.connection.execute(
+            "UPDATE documents SET state = 1 WHERE document_id = ?1",
+            params![document_bytes.as_slice()],
+        )?;
+        self.publish_committed_retirement(document_id)
     }
 
     /// Creates one active document and its unique full-operation root capability.
@@ -1316,10 +1385,16 @@ impl DurableUpdateStore {
         let normalized_input = target_capability_id.into_bytes();
         let subscription_contexts = self.subscriptions.contexts(document_id);
         let pass_contexts = self
-            .vector_passes
+            .enumeration_passes
             .iter()
             .filter(|pass| pass.document_id == document_id)
             .map(|pass| pass.capability_id)
+            .chain(
+                self.vector_passes
+                    .iter()
+                    .filter(|pass| pass.document_id == document_id)
+                    .map(|pass| pass.capability_id),
+            )
             .collect::<Vec<_>>();
         let transaction =
             self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1422,6 +1497,10 @@ impl DurableUpdateStore {
         #[cfg(feature = "conformance")]
         before_commit()?;
         transaction.commit()?;
+        self.enumeration_passes.retain(|pass| {
+            pass.document_id != document_id
+                || !revoked_pass_capabilities.contains(&pass.capability_id)
+        });
         self.vector_passes.retain(|pass| {
             pass.document_id != document_id
                 || !revoked_pass_capabilities.contains(&pass.capability_id)
@@ -1577,63 +1656,216 @@ impl DurableUpdateStore {
     }
 
     /// Authorizes and selects one finite metadata page in a single snapshot.
+    #[expect(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "authorization, stable-pass recovery, selection, and token chaining form one read operation"
+    )]
     pub fn enumerate_authorized(
         &mut self,
+        channel: &BrokerChannel,
         document_id: DocumentId,
         capability_id: CapabilityId,
         authenticator: &Authenticator,
         start: StoreEnumerateStart,
         metadata_byte_limit: usize,
-    ) -> Result<StoreReadOutcome<AuthorizedStoredUpdatePage>, StoreError> {
+    ) -> Result<StoreEnumerateOutcome<AuthorizedStoredUpdatePage>, StoreError> {
+        if !self.subscriptions.recognizes(channel) {
+            return Ok(StoreEnumerateOutcome::AuthorizationDenied);
+        }
         let transaction =
             self.connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        if !authorize(&transaction, document_id, capability_id, authenticator, Operation::Read)? {
-            return Ok(StoreReadOutcome::AuthorizationDenied);
-        }
-        let high_water = high_water_sequence_in(&transaction, document_id)?;
-        let Some((position, terminal_sequence)) = (match start {
-            StoreEnumerateStart::Origin => {
-                high_water.map(|terminal| (AcceptanceSequence::ORIGIN, terminal))
-            }
-            StoreEnumerateStart::Continue { position, terminal_sequence } => {
-                Some((position, terminal_sequence))
-            }
-            StoreEnumerateStart::AfterTail(position) => {
-                let Some(terminal) = high_water else {
-                    return Ok(StoreReadOutcome::InvalidCursor);
-                };
-                if terminal < position {
-                    return Ok(StoreReadOutcome::InvalidCursor);
-                }
-                Some((position, terminal))
-            }
-        }) else {
-            transaction.commit()?;
-            return Ok(StoreReadOutcome::Authorized(AuthorizedStoredUpdatePage {
-                page: StoredUpdatePage {
-                    has_more: false,
-                    last_sequence: None,
-                    updates: Vec::new(),
-                },
-                terminal_sequence: None,
-            }));
-        };
-        let page = match enumerate_in(
+        match authorize_document(
             &transaction,
             document_id,
-            position,
-            terminal_sequence,
-            metadata_byte_limit,
-        ) {
-            Ok(page) => page,
-            Err(StoreError::InvalidCursor) => return Ok(StoreReadOutcome::InvalidCursor),
-            Err(error) => return Err(error),
+            capability_id,
+            authenticator,
+            Operation::Read,
+        )? {
+            DocumentAuthorization::Authorized => {}
+            DocumentAuthorization::Denied => {
+                return Ok(StoreEnumerateOutcome::AuthorizationDenied);
+            }
+            DocumentAuthorization::Retired => {
+                return Ok(StoreEnumerateOutcome::RetiredDocument);
+            }
+        }
+
+        let now = Instant::now();
+        let channel_id = channel.id();
+        self.enumeration_passes.retain(|pass| pass.expires_at > now);
+        let continuation_mode = match &start {
+            StoreEnumerateStart::Origin => None,
+            StoreEnumerateStart::Continue(_encoded) => Some(EnumerationTokenMode::Continue),
+            StoreEnumerateStart::AfterTail(_encoded) => Some(EnumerationTokenMode::AfterTail),
         };
-        transaction.commit()?;
-        Ok(StoreReadOutcome::Authorized(AuthorizedStoredUpdatePage {
-            page,
-            terminal_sequence: Some(terminal_sequence),
-        }))
+        match start {
+            StoreEnumerateStart::Origin => {
+                self.enumeration_passes.retain(|pass| {
+                    pass.channel_id != channel_id
+                        || pass.document_id != document_id
+                        || pass.capability_id != capability_id
+                });
+                let Some(terminal_sequence) = high_water_sequence_in(&transaction, document_id)?
+                else {
+                    transaction.commit()?;
+                    return Ok(StoreEnumerateOutcome::Authorized(AuthorizedStoredUpdatePage {
+                        next_cursor: None,
+                        page: empty_stored_update_page(),
+                    }));
+                };
+                let page = enumerate_in(
+                    &transaction,
+                    document_id,
+                    AcceptanceSequence::ORIGIN,
+                    terminal_sequence,
+                    metadata_byte_limit,
+                )?;
+                let Some(position) = page.last_sequence else {
+                    return Err(StoreError::Corrupt(
+                        "nonempty enumeration snapshot produced no first record",
+                    ));
+                };
+                if !can_admit_enumeration_pass(
+                    &self.enumeration_passes,
+                    channel_id,
+                    document_id,
+                    capability_id,
+                ) {
+                    return Ok(StoreEnumerateOutcome::Backpressure);
+                }
+                let Some(token) = mint_enumeration_token(&self.random, &self.enumeration_passes)?
+                else {
+                    return Ok(StoreEnumerateOutcome::Backpressure);
+                };
+                let mode = if page.has_more {
+                    EnumerationTokenMode::Continue
+                } else {
+                    EnumerationTokenMode::AfterTail
+                };
+                let response =
+                    AuthorizedStoredUpdatePage { next_cursor: Some(token.to_vec()), page };
+                transaction.commit()?;
+                self.enumeration_passes.push(EnumerationPass {
+                    capability_id,
+                    channel_id,
+                    current: EnumerationPassPosition { mode, position, token },
+                    document_id,
+                    expires_at: now + ENUMERATION_PASS_IDLE_TTL,
+                    generation: self.generation,
+                    retry: None,
+                    terminal_sequence,
+                });
+                Ok(StoreEnumerateOutcome::Authorized(response))
+            }
+            StoreEnumerateStart::Continue(encoded) | StoreEnumerateStart::AfterTail(encoded) => {
+                let Some(requested_mode) = continuation_mode else {
+                    return Err(StoreError::Corrupt(
+                        "enumeration continuation omitted its query mode",
+                    ));
+                };
+                let Ok(token) =
+                    <[u8; ENUMERATION_CONTINUATION_LENGTH]>::try_from(encoded.as_slice())
+                else {
+                    return Ok(StoreEnumerateOutcome::InvalidContinuation);
+                };
+                let Some(pass_index) = self
+                    .enumeration_passes
+                    .iter()
+                    .position(|pass| enumeration_pass_contains_token(pass, token, requested_mode))
+                else {
+                    return Ok(StoreEnumerateOutcome::InvalidContinuation);
+                };
+                let pass = &self.enumeration_passes[pass_index];
+                if pass.document_id != document_id
+                    || pass.capability_id != capability_id
+                    || pass.channel_id != channel_id
+                    || pass.generation != self.generation
+                    || pass.expires_at <= now
+                {
+                    return Ok(StoreEnumerateOutcome::InvalidContinuation);
+                }
+                if let Some(retry) = &pass.retry {
+                    if retry.token == token && retry.mode == requested_mode {
+                        let response = retry.response.clone();
+                        transaction.commit()?;
+                        return Ok(StoreEnumerateOutcome::Authorized(response));
+                    }
+                }
+                let current = pass.current;
+                if current.token != token || current.mode != requested_mode {
+                    return Ok(StoreEnumerateOutcome::InvalidContinuation);
+                }
+                let terminal_sequence = match requested_mode {
+                    EnumerationTokenMode::Continue => pass.terminal_sequence,
+                    EnumerationTokenMode::AfterTail => {
+                        let Some(high_water) = high_water_sequence_in(&transaction, document_id)?
+                        else {
+                            return Ok(StoreEnumerateOutcome::InvalidContinuation);
+                        };
+                        if high_water < current.position {
+                            return Ok(StoreEnumerateOutcome::InvalidContinuation);
+                        }
+                        if high_water == current.position {
+                            transaction.commit()?;
+                            return Ok(StoreEnumerateOutcome::Authorized(
+                                AuthorizedStoredUpdatePage {
+                                    next_cursor: None,
+                                    page: empty_stored_update_page(),
+                                },
+                            ));
+                        }
+                        high_water
+                    }
+                };
+                let page = match enumerate_in(
+                    &transaction,
+                    document_id,
+                    current.position,
+                    terminal_sequence,
+                    metadata_byte_limit,
+                ) {
+                    Ok(page) => page,
+                    Err(StoreError::InvalidCursor) => {
+                        self.enumeration_passes.swap_remove(pass_index);
+                        return Ok(StoreEnumerateOutcome::InvalidContinuation);
+                    }
+                    Err(error) => return Err(error),
+                };
+                let Some(next_position) = page.last_sequence else {
+                    return Err(StoreError::Corrupt(
+                        "advancing enumeration pass produced no record",
+                    ));
+                };
+                let Some(next_token) =
+                    mint_enumeration_token(&self.random, &self.enumeration_passes)?
+                else {
+                    return Ok(StoreEnumerateOutcome::Backpressure);
+                };
+                let next_mode = if page.has_more {
+                    EnumerationTokenMode::Continue
+                } else {
+                    EnumerationTokenMode::AfterTail
+                };
+                let response =
+                    AuthorizedStoredUpdatePage { next_cursor: Some(next_token.to_vec()), page };
+                transaction.commit()?;
+                let mutable_pass = &mut self.enumeration_passes[pass_index];
+                mutable_pass.current = EnumerationPassPosition {
+                    mode: next_mode,
+                    position: next_position,
+                    token: next_token,
+                };
+                mutable_pass.expires_at = Instant::now() + ENUMERATION_PASS_IDLE_TTL;
+                mutable_pass.retry = Some(EnumerationPassRetry {
+                    mode: requested_mode,
+                    response: response.clone(),
+                    token,
+                });
+                mutable_pass.terminal_sequence = terminal_sequence;
+                Ok(StoreEnumerateOutcome::Authorized(response))
+            }
+        }
     }
 
     /// Authorizes and selects one page from a stable vector-backfill pass.
@@ -2054,24 +2286,33 @@ fn enumerate_in(
             return Err(StoreError::InvalidCursor);
         }
     }
+    let row_limit = i64::try_from(MAX_ENUMERATION_SCAN_RECORDS + 1)
+        .map_err(|_error| StoreError::Corrupt("enumeration scan bound cannot fit SQLite"))?;
     let mut statement = connection.prepare(
         "SELECT acceptance_sequence, encoded_record
          FROM updates
          WHERE document_id = ?1
            AND acceptance_sequence > ?2
            AND acceptance_sequence <= ?3
-         ORDER BY acceptance_sequence",
+         ORDER BY acceptance_sequence
+         LIMIT ?4",
     )?;
     let mut rows = statement.query(params![
         document_bytes.as_slice(),
         position.to_be_bytes().as_slice(),
         terminal_sequence.to_be_bytes().as_slice(),
+        row_limit,
     ])?;
     let mut used = 0_usize;
     let mut updates = Vec::new();
     let mut last_sequence = None;
+    let mut scanned = 0_usize;
     let mut has_more = false;
     while let Some(row) = rows.next()? {
+        if scanned == MAX_ENUMERATION_SCAN_RECORDS {
+            has_more = true;
+            break;
+        }
         let sequence = decode_sequence(&row.get::<_, Vec<u8>>(0)?)?;
         let record = row.get::<_, Vec<u8>>(1)?;
         let update = decode_update_record(&record)
@@ -2093,8 +2334,60 @@ fn enumerate_in(
         used = next_used;
         last_sequence = Some(sequence);
         updates.push((sequence, metadata));
+        scanned = scanned
+            .checked_add(1)
+            .ok_or(StoreError::Corrupt("enumeration scan count overflowed"))?;
     }
     Ok(StoredUpdatePage { has_more, last_sequence, updates })
+}
+
+fn empty_stored_update_page() -> StoredUpdatePage {
+    StoredUpdatePage { has_more: false, last_sequence: None, updates: Vec::new() }
+}
+
+fn can_admit_enumeration_pass(
+    passes: &[EnumerationPass],
+    channel_id: u64,
+    document_id: DocumentId,
+    capability_id: CapabilityId,
+) -> bool {
+    let channel_count = passes.iter().filter(|pass| pass.channel_id == channel_id).count();
+    let document_count = passes.iter().filter(|pass| pass.document_id == document_id).count();
+    let authority_count = passes
+        .iter()
+        .filter(|pass| pass.document_id == document_id && pass.capability_id == capability_id)
+        .count();
+    passes.len() < MAX_ENUMERATION_PASSES
+        && channel_count < MAX_ENUMERATION_PASSES_PER_CHANNEL
+        && document_count < MAX_ENUMERATION_PASSES_PER_DOCUMENT
+        && authority_count < MAX_ENUMERATION_PASSES_PER_AUTHORITY
+}
+
+fn enumeration_pass_contains_token(
+    pass: &EnumerationPass,
+    token: [u8; ENUMERATION_CONTINUATION_LENGTH],
+    mode: EnumerationTokenMode,
+) -> bool {
+    (pass.current.token == token && pass.current.mode == mode)
+        || pass.retry.as_ref().is_some_and(|retry| retry.token == token && retry.mode == mode)
+}
+
+fn mint_enumeration_token(
+    random: &SystemRandom,
+    passes: &[EnumerationPass],
+) -> Result<Option<[u8; ENUMERATION_CONTINUATION_LENGTH]>, StoreError> {
+    for _attempt in 0..4 {
+        let mut token = [0_u8; ENUMERATION_CONTINUATION_LENGTH];
+        random.fill(&mut token).map_err(|_error| StoreError::EntropyUnavailable)?;
+        if passes.iter().any(|pass| {
+            pass.current.token == token
+                || pass.retry.as_ref().is_some_and(|retry| retry.token == token)
+        }) {
+            continue;
+        }
+        return Ok(Some(token));
+    }
+    Ok(None)
 }
 
 fn vector_backfill_in(
@@ -3263,6 +3556,318 @@ mod tests {
     use crate::subscription::{UPDATE_NOTIFICATION_QUEUE_CAPACITY, UpdateSubscriptionPoll};
 
     use super::*;
+
+    #[test]
+    #[expect(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "one sequential scenario keeps opaque pass state, retries, and after-tail semantics visible"
+    )]
+    fn enumeration_uses_one_bounded_context_bound_opaque_pass() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let document_id = DocumentId::from_bytes([0x21; IDENTIFIER_LENGTH]);
+        let capability_id = CapabilityId::from_bytes([0x22; IDENTIFIER_LENGTH]);
+        let authenticator = Authenticator::from_bytes([0x23; 32]);
+        let mut store = open_store(&database);
+        create_fixture_document(&mut store, document_id, capability_id, &authenticator, 0x24);
+        let channel = store.open_broker_channel().expect("channel must open");
+        let updates = [
+            fixture_update_for(document_id, 0x25),
+            fixture_update_for(document_id, 0x26),
+            fixture_update_for(document_id, 0x27),
+        ];
+        for update in &updates {
+            let encoded = encode_update_record(update).expect("fixture update must encode");
+            assert_eq!(
+                store
+                    .accept(capability_id, &authenticator, update, &encoded)
+                    .expect("fixture update must commit"),
+                StoreAcceptOutcome::Inserted,
+            );
+        }
+        let one_metadata = metadata_encoded_length(&metadata(&updates[0]).expect("metadata"))
+            .expect("metadata length must fit");
+        let StoreEnumerateOutcome::Authorized(first) = store
+            .enumerate_authorized(
+                &channel,
+                document_id,
+                capability_id,
+                &authenticator,
+                StoreEnumerateStart::Origin,
+                one_metadata,
+            )
+            .expect("origin must resolve")
+        else {
+            panic!("read-authorized origin must succeed");
+        };
+        assert!(first.page.has_more);
+        assert_eq!(first.page.updates[0].1.update_id, updates[0].update_id());
+        let first_token = first.next_cursor.expect("nonempty page must return a token");
+        assert_eq!(first_token.len(), ENUMERATION_CONTINUATION_LENGTH);
+        assert_eq!(store.enumeration_passes.len(), 1);
+
+        let other_channel = store.open_broker_channel().expect("channel must open");
+        assert!(matches!(
+            store
+                .enumerate_authorized(
+                    &other_channel,
+                    document_id,
+                    capability_id,
+                    &authenticator,
+                    StoreEnumerateStart::Continue(first_token.clone()),
+                    one_metadata,
+                )
+                .expect("cross-channel token must resolve"),
+            StoreEnumerateOutcome::InvalidContinuation,
+        ));
+        let child_id = CapabilityId::from_bytes([0x28; IDENTIFIER_LENGTH]);
+        let child_authenticator = Authenticator::from_bytes([0x29; 32]);
+        assert_eq!(
+            store
+                .grant_capability(
+                    document_id,
+                    capability_id,
+                    &authenticator,
+                    RequestId::from_bytes([0x2a; IDENTIFIER_LENGTH]),
+                    child_id,
+                    &child_authenticator,
+                    OperationSet::one(Operation::Read),
+                )
+                .expect("reader grant must commit"),
+            StoreControlOutcome::Inserted,
+        );
+        assert!(matches!(
+            store
+                .enumerate_authorized(
+                    &channel,
+                    document_id,
+                    child_id,
+                    &child_authenticator,
+                    StoreEnumerateStart::Continue(first_token.clone()),
+                    one_metadata,
+                )
+                .expect("wrong-authority token must resolve"),
+            StoreEnumerateOutcome::InvalidContinuation,
+        ));
+        for token in [vec![0x31; 31], vec![0x33; 33], vec![0x44; 32]] {
+            assert!(matches!(
+                store
+                    .enumerate_authorized(
+                        &channel,
+                        document_id,
+                        capability_id,
+                        &authenticator,
+                        StoreEnumerateStart::Continue(token),
+                        one_metadata,
+                    )
+                    .expect("unknown token must resolve"),
+                StoreEnumerateOutcome::InvalidContinuation,
+            ));
+        }
+        assert!(matches!(
+            store
+                .enumerate_authorized(
+                    &channel,
+                    document_id,
+                    capability_id,
+                    &authenticator,
+                    StoreEnumerateStart::AfterTail(first_token.clone()),
+                    one_metadata,
+                )
+                .expect("wrong token mode must resolve"),
+            StoreEnumerateOutcome::InvalidContinuation,
+        ));
+
+        let accepted_after_snapshot = fixture_update_for(document_id, 0x2b);
+        let encoded =
+            encode_update_record(&accepted_after_snapshot).expect("later fixture must encode");
+        assert_eq!(
+            store
+                .accept(capability_id, &authenticator, &accepted_after_snapshot, &encoded)
+                .expect("later update must commit"),
+            StoreAcceptOutcome::Inserted,
+        );
+        let StoreEnumerateOutcome::Authorized(second) = store
+            .enumerate_authorized(
+                &channel,
+                document_id,
+                capability_id,
+                &authenticator,
+                StoreEnumerateStart::Continue(first_token.clone()),
+                one_metadata,
+            )
+            .expect("continuation must resolve")
+        else {
+            panic!("continuation must remain authorized");
+        };
+        assert_eq!(second.page.updates[0].1.update_id, updates[1].update_id());
+        let second_token = second.next_cursor.clone().expect("second page must return a token");
+        let StoreEnumerateOutcome::Authorized(second_retry) = store
+            .enumerate_authorized(
+                &channel,
+                document_id,
+                capability_id,
+                &authenticator,
+                StoreEnumerateStart::Continue(first_token),
+                one_metadata,
+            )
+            .expect("exact retry must resolve")
+        else {
+            panic!("exact retry must remain authorized");
+        };
+        assert_eq!(second_retry.next_cursor, second.next_cursor);
+        assert_eq!(second_retry.page.updates[0].1.update_id, updates[1].update_id());
+        assert_eq!(store.enumeration_passes.len(), 1);
+
+        let StoreEnumerateOutcome::Authorized(terminal) = store
+            .enumerate_authorized(
+                &channel,
+                document_id,
+                capability_id,
+                &authenticator,
+                StoreEnumerateStart::Continue(second_token.clone()),
+                one_metadata,
+            )
+            .expect("terminal continuation must resolve")
+        else {
+            panic!("terminal continuation must remain authorized");
+        };
+        assert!(!terminal.page.has_more);
+        assert_eq!(terminal.page.updates[0].1.update_id, updates[2].update_id());
+        let tail_token = terminal.next_cursor.clone().expect("terminal page must return a tail");
+        let StoreEnumerateOutcome::Authorized(terminal_retry) = store
+            .enumerate_authorized(
+                &channel,
+                document_id,
+                capability_id,
+                &authenticator,
+                StoreEnumerateStart::Continue(second_token),
+                one_metadata,
+            )
+            .expect("terminal retry must resolve")
+        else {
+            panic!("terminal retry must remain authorized");
+        };
+        assert_eq!(terminal_retry.next_cursor, terminal.next_cursor);
+        assert_eq!(terminal_retry.page.updates[0].1.update_id, updates[2].update_id());
+
+        let StoreEnumerateOutcome::Authorized(after_tail) = store
+            .enumerate_authorized(
+                &channel,
+                document_id,
+                capability_id,
+                &authenticator,
+                StoreEnumerateStart::AfterTail(tail_token),
+                one_metadata,
+            )
+            .expect("after-tail pass must resolve")
+        else {
+            panic!("after-tail pass must remain authorized");
+        };
+        assert_eq!(after_tail.page.updates[0].1.update_id, accepted_after_snapshot.update_id(),);
+        assert!(!after_tail.page.has_more);
+        assert_eq!(store.enumeration_passes.len(), 1);
+    }
+
+    #[test]
+    fn enumeration_pass_expiry_restart_and_channel_cleanup_are_bounded() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let document_id = DocumentId::from_bytes([0x31; IDENTIFIER_LENGTH]);
+        let capability_id = CapabilityId::from_bytes([0x32; IDENTIFIER_LENGTH]);
+        let authenticator = Authenticator::from_bytes([0x33; 32]);
+        let mut store = open_store(&database);
+        create_fixture_document(&mut store, document_id, capability_id, &authenticator, 0x34);
+        let update = fixture_update_for(document_id, 0x35);
+        let encoded = encode_update_record(&update).expect("fixture must encode");
+        assert_eq!(
+            store
+                .accept(capability_id, &authenticator, &update, &encoded)
+                .expect("fixture must commit"),
+            StoreAcceptOutcome::Inserted,
+        );
+        let channel = store.open_broker_channel().expect("channel must open");
+        let origin = || StoreEnumerateStart::Origin;
+        let StoreEnumerateOutcome::Authorized(first) = store
+            .enumerate_authorized(
+                &channel,
+                document_id,
+                capability_id,
+                &authenticator,
+                origin(),
+                usize::MAX,
+            )
+            .expect("origin must resolve")
+        else {
+            panic!("origin must remain authorized");
+        };
+        let mut token = first.next_cursor.expect("nonempty origin must return a tail");
+        for _attempt in 0..(MAX_ENUMERATION_PASSES_PER_AUTHORITY * 2) {
+            let StoreEnumerateOutcome::Authorized(repeated) = store
+                .enumerate_authorized(
+                    &channel,
+                    document_id,
+                    capability_id,
+                    &authenticator,
+                    origin(),
+                    usize::MAX,
+                )
+                .expect("repeated origin must resolve")
+            else {
+                panic!("repeated origin must remain authorized");
+            };
+            token = repeated.next_cursor.expect("repeated origin must return a tail");
+        }
+        assert_eq!(store.enumeration_passes.len(), 1);
+        store.enumeration_passes[0].expires_at = Instant::now();
+        assert!(matches!(
+            store
+                .enumerate_authorized(
+                    &channel,
+                    document_id,
+                    capability_id,
+                    &authenticator,
+                    StoreEnumerateStart::AfterTail(token),
+                    usize::MAX,
+                )
+                .expect("expired token must resolve"),
+            StoreEnumerateOutcome::InvalidContinuation,
+        ));
+        let StoreEnumerateOutcome::Authorized(restarted) = store
+            .enumerate_authorized(
+                &channel,
+                document_id,
+                capability_id,
+                &authenticator,
+                origin(),
+                usize::MAX,
+            )
+            .expect("restart must resolve")
+        else {
+            panic!("restart must remain authorized");
+        };
+        let restart_token = restarted.next_cursor.expect("restart must return a tail");
+        store.close_broker_channel(channel);
+        assert!(store.enumeration_passes.is_empty());
+        drop(store);
+
+        let mut recovered = open_store(&database);
+        let recovered_channel = recovered.open_broker_channel().expect("channel must open");
+        assert!(matches!(
+            recovered
+                .enumerate_authorized(
+                    &recovered_channel,
+                    document_id,
+                    capability_id,
+                    &authenticator,
+                    StoreEnumerateStart::AfterTail(restart_token),
+                    usize::MAX,
+                )
+                .expect("restart token must resolve"),
+            StoreEnumerateOutcome::InvalidContinuation,
+        ));
+    }
 
     #[test]
     #[expect(
@@ -4874,6 +5479,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario verifies both post-commit invalidation reasons and their pass cleanup"
+    )]
     fn committed_revocation_and_retirement_invalidate_affected_subscriptions() {
         let directory = TestDirectory::create();
         let database = directory.path.join("renee.sqlite3");
@@ -4905,6 +5514,28 @@ mod tests {
             StoreControlOutcome::Inserted
         );
         let channel = store.open_broker_channel().expect("channel id must remain available");
+        let update = fixture_update_for(document_id, 0xbc);
+        let encoded = encode_update_record(&update).expect("fixture must encode");
+        assert_eq!(
+            store
+                .accept(root_capability, &root_authenticator, &update, &encoded)
+                .expect("fixture update must commit"),
+            StoreAcceptOutcome::Inserted,
+        );
+        assert!(matches!(
+            store
+                .enumerate_authorized(
+                    &channel,
+                    document_id,
+                    child_capability,
+                    &child_authenticator,
+                    StoreEnumerateStart::Origin,
+                    usize::MAX,
+                )
+                .expect("child enumeration must resolve"),
+            StoreEnumerateOutcome::Authorized(_),
+        ));
+        assert_eq!(store.enumeration_passes.len(), 1);
         let StoreSubscribeOutcome::Acknowledged(mut revoked) = store
             .subscribe_updates(&channel, document_id, child_capability, &child_authenticator)
             .expect("child subscription must resolve")
@@ -4927,7 +5558,21 @@ mod tests {
             revoked.try_next(),
             UpdateSubscriptionPoll::Invalidated(UpdateSubscriptionEnd::Revoked)
         );
+        assert!(store.enumeration_passes.is_empty());
 
+        assert!(matches!(
+            store
+                .enumerate_authorized(
+                    &channel,
+                    document_id,
+                    root_capability,
+                    &root_authenticator,
+                    StoreEnumerateStart::Origin,
+                    usize::MAX,
+                )
+                .expect("root enumeration must resolve"),
+            StoreEnumerateOutcome::Authorized(_),
+        ));
         let StoreSubscribeOutcome::Acknowledged(mut retired) = store
             .subscribe_updates(&channel, document_id, root_capability, &root_authenticator)
             .expect("root subscription must resolve")
@@ -4947,6 +5592,7 @@ mod tests {
             retired.try_next(),
             UpdateSubscriptionPoll::Invalidated(UpdateSubscriptionEnd::Retired)
         );
+        assert!(store.enumeration_passes.is_empty());
     }
 
     #[test]
@@ -5004,6 +5650,7 @@ mod tests {
         drop(store);
 
         let mut recovered = open_store(&database);
+        let channel = recovered.open_broker_channel().expect("channel must open");
         assert_eq!(
             recovered
                 .accept(capability, &authenticator, &update, &encoded)
@@ -5012,6 +5659,7 @@ mod tests {
         );
         let read = recovered
             .enumerate_authorized(
+                &channel,
                 update.document_id(),
                 capability,
                 &authenticator,
@@ -5019,7 +5667,7 @@ mod tests {
                 usize::MAX,
             )
             .expect("recovered row must enumerate");
-        let StoreReadOutcome::Authorized(page) = read else {
+        let StoreEnumerateOutcome::Authorized(page) = read else {
             panic!("root read authority must succeed");
         };
         assert_eq!(page.page.updates.len(), 1);

@@ -17,41 +17,41 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use renee_types::CreateAuthorityId;
 use renee_wire::{
-    ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor,
-    CANCEL_UPDATE_SUBSCRIPTION, CANCEL_UPDATE_SUBSCRIPTION_RESPONSE, CAPABILITY_ERROR,
-    CREATE_DOCUMENT, CREATE_DOCUMENT_RESPONSE, CapabilityErrorCode, ControlMutationOutcome,
-    CreateDocumentOutcome, ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, EnumerateResponse,
-    EnumerateStart, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE, GRANT_CAPABILITY,
-    GRANT_CAPABILITY_RESPONSE, MAX_APPLICATION_PAYLOAD_LENGTH, REVOKE_CAPABILITY,
+    ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, CANCEL_UPDATE_SUBSCRIPTION,
+    CANCEL_UPDATE_SUBSCRIPTION_RESPONSE, CAPABILITY_ERROR, CREATE_DOCUMENT,
+    CREATE_DOCUMENT_RESPONSE, CapabilityErrorCode, ControlMutationOutcome, CreateDocumentOutcome,
+    ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, ENUMERATION_CONTINUATION_LENGTH,
+    EnumerateResponse, EnumerateStart, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE,
+    GRANT_CAPABILITY, GRANT_CAPABILITY_RESPONSE, MAX_APPLICATION_PAYLOAD_LENGTH, REVOKE_CAPABILITY,
     REVOKE_CAPABILITY_RESPONSE, SUBSCRIBE_UPDATES, SUBSCRIBE_UPDATES_ACK, UPDATE_ERROR,
     UPDATE_NOTIFICATION, UPDATE_SUBSCRIPTION_INVALIDATED, UPDATE_SUBSCRIPTION_OVERFLOW,
     UpdateCodecError, UpdateErrorCode, UpdateNotification, UpdateSubscriptionId, VECTOR_BACKFILL,
     VECTOR_BACKFILL_RESPONSE, VERSION, VectorBackfillResponse, VectorBackfillStart,
-    decode_acceptance_cursor, decode_authorized_update_request, decode_body,
-    decode_cancel_update_subscription, decode_create_document_request, decode_enumerate_request,
-    decode_fetch_request, decode_grant_capability_request, decode_revoke_capability_request,
+    decode_authorized_update_request, decode_body, decode_cancel_update_subscription,
+    decode_create_document_request, decode_enumerate_request, decode_fetch_request,
+    decode_grant_capability_request, decode_revoke_capability_request,
     decode_subscribe_updates_request, decode_update_record, decode_vector_backfill_request,
-    encode_accept_response, encode_acceptance_cursor, encode_body,
-    encode_cancel_update_subscription, encode_capability_error, encode_control_mutation_response,
-    encode_create_document_response, encode_enumerate_response, encode_fetch_response,
-    encode_subscribe_updates_ack, encode_update_error, encode_update_notification,
-    encode_update_subscription_invalidated, encode_update_subscription_overflow,
-    encode_vector_backfill_response, enumerate_response_base_length, read_body,
-    vector_backfill_response_base_length, write_body,
+    encode_accept_response, encode_body, encode_cancel_update_subscription,
+    encode_capability_error, encode_control_mutation_response, encode_create_document_response,
+    encode_enumerate_response, encode_fetch_response, encode_subscribe_updates_ack,
+    encode_update_error, encode_update_notification, encode_update_subscription_invalidated,
+    encode_update_subscription_overflow, encode_vector_backfill_response,
+    enumerate_response_base_length, read_body, vector_backfill_response_base_length, write_body,
 };
 #[cfg(feature = "conformance")]
 use store::StoreError;
 use store::{
     CreateAuthorityProvision, DurableUpdateStore, StoreAcceptOutcome, StoreControlOutcome,
-    StoreCreateOutcome, StoreEnumerateStart, StoreReadOutcome, StoreSubscribeOutcome,
-    StoreVectorBackfillOutcome, StoreVectorBackfillStart,
+    StoreCreateOutcome, StoreEnumerateOutcome, StoreEnumerateStart, StoreReadOutcome,
+    StoreSubscribeOutcome, StoreVectorBackfillOutcome, StoreVectorBackfillStart,
 };
 use subscription::{
-    MAX_UPDATE_SUBSCRIPTIONS_PER_CHANNEL, UpdateSubscription, UpdateSubscriptionEnd,
-    UpdateSubscriptionPoll,
+    MAX_UPDATE_SUBSCRIPTIONS_PER_CHANNEL, UpdateSubscription, UpdateSubscriptionEmission,
+    UpdateSubscriptionEnd, UpdateSubscriptionPoll,
 };
 use tokio::io::AsyncReadExt as _;
 use tokio::net::{TcpListener, TcpStream, tcp::OwnedWriteHalf};
@@ -60,6 +60,12 @@ use tokio::task::JoinSet;
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:4434";
 const CONNECTION_EVENT_QUEUE_CAPACITY: usize = 64;
+const SUBSCRIPTION_EMISSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct ConnectionEvent {
+    body: Vec<u8>,
+    emission: Option<UpdateSubscriptionEmission>,
+}
 
 struct ActiveConnectionSubscription {
     cancellation: oneshot::Sender<()>,
@@ -278,7 +284,7 @@ async fn serve_connection_with_channel(
     broker_channel: &store::BrokerChannel,
 ) -> io::Result<()> {
     let (event_sender, mut event_receiver) =
-        mpsc::channel::<Vec<u8>>(CONNECTION_EVENT_QUEUE_CAPACITY);
+        mpsc::channel::<ConnectionEvent>(CONNECTION_EVENT_QUEUE_CAPACITY);
     let mut active_subscriptions =
         HashMap::<UpdateSubscriptionId, ActiveConnectionSubscription>::new();
     let mut subscription_tasks = JoinSet::new();
@@ -303,7 +309,7 @@ async fn serve_connection_with_channel(
                 let Some(event) = event else {
                     return Err(io::Error::other("connection event queue closed"));
                 };
-                write_body(output, &event).await?;
+                write_connection_event(output, store, event).await?;
             }
             body = requests.recv() => {
                 let Some(body) = body else {
@@ -450,9 +456,10 @@ async fn forward_subscription(
     mut subscription: UpdateSubscription,
     subscription_id: UpdateSubscriptionId,
     correlation_id: [u8; 16],
-    event_sender: mpsc::Sender<Vec<u8>>,
+    event_sender: mpsc::Sender<ConnectionEvent>,
     mut cancelled: oneshot::Receiver<()>,
 ) {
+    let emission = subscription.emission();
     #[cfg(feature = "conformance")]
     if tokio::task::spawn_blocking(|| test_barrier::checkpoint("store-subscription-before-poll"))
         .await
@@ -483,6 +490,16 @@ async fn forward_subscription(
             #[cfg(test)]
             UpdateSubscriptionPoll::Pending => continue,
         };
+        #[cfg(feature = "conformance")]
+        if message_type == UPDATE_NOTIFICATION
+            && tokio::task::spawn_blocking(|| {
+                test_barrier::checkpoint("store-subscription-after-select-before-write")
+            })
+            .await
+            .map_or(true, |checkpoint| checkpoint.is_err())
+        {
+            return;
+        }
         let event = match encode_body(&Envelope {
             correlation_id,
             message_type,
@@ -491,6 +508,10 @@ async fn forward_subscription(
         }) {
             Ok(event) => event,
             Err(_error) => return,
+        };
+        let event = ConnectionEvent {
+            body: event,
+            emission: (message_type == UPDATE_NOTIFICATION).then(|| emission.clone()),
         };
         match event_sender.try_send(event) {
             Ok(()) if message_type == UPDATE_NOTIFICATION => {}
@@ -504,7 +525,7 @@ async fn forward_subscription(
                     payload: encode_update_subscription_overflow(subscription_id),
                     version: VERSION,
                 }) {
-                    Ok(overflow) => overflow,
+                    Ok(overflow) => ConnectionEvent { body: overflow, emission: None },
                     Err(_error) => return,
                 };
                 tokio::select! {
@@ -516,6 +537,25 @@ async fn forward_subscription(
             }
         }
     }
+}
+
+async fn write_connection_event(
+    output: &mut OwnedWriteHalf,
+    store: &Mutex<DurableUpdateStore>,
+    event: ConnectionEvent,
+) -> io::Result<()> {
+    let Some(emission) = event.emission else {
+        return write_body(output, &event.body).await;
+    };
+    let _store_guard = store.lock().await;
+    if !emission.is_authorized() {
+        return Ok(());
+    }
+    tokio::time::timeout(SUBSCRIPTION_EMISSION_TIMEOUT, write_body(output, &event.body))
+        .await
+        .map_err(|_elapsed| {
+            io::Error::new(io::ErrorKind::TimedOut, "subscription emission stalled")
+        })?
 }
 
 fn terminal_subscription_event(
@@ -846,52 +886,20 @@ async fn handle_request(
             };
             let start = match enumerate.start {
                 EnumerateStart::Origin => StoreEnumerateStart::Origin,
-                EnumerateStart::Continue(encoded) => {
-                    match decode_acceptance_cursor(enumerate.document_id, &encoded) {
-                        Ok(cursor) => StoreEnumerateStart::Continue {
-                            position: cursor.position,
-                            terminal_sequence: cursor.terminal_sequence,
-                        },
-                        Err(_error) => {
-                            return response(
-                                request,
-                                UPDATE_ERROR,
-                                encode_update_error(UpdateErrorCode::InvalidCursor),
-                            );
-                        }
-                    }
-                }
-                EnumerateStart::AfterTail(encoded) => {
-                    let previous = match decode_acceptance_cursor(enumerate.document_id, &encoded) {
-                        Ok(cursor) if cursor.position == cursor.terminal_sequence => cursor,
-                        Ok(_) | Err(_) => {
-                            return response(
-                                request,
-                                UPDATE_ERROR,
-                                encode_update_error(UpdateErrorCode::InvalidCursor),
-                            );
-                        }
-                    };
-                    StoreEnumerateStart::AfterTail(previous.position)
-                }
+                EnumerateStart::Continue(encoded) => StoreEnumerateStart::Continue(encoded),
+                EnumerateStart::AfterTail(encoded) => StoreEnumerateStart::AfterTail(encoded),
             };
             // Reserve the complete response prefix including a next cursor.
             // This makes every nonempty page encodable without revisiting the
             // database result or trusting a rough framing estimate.
-            let example_cursor = encode_acceptance_cursor(
-                enumerate.document_id,
-                AcceptanceCursor {
-                    position: renee_types::AcceptanceSequence::FIRST,
-                    terminal_sequence: renee_types::AcceptanceSequence::FIRST,
-                },
-            )
-            .map_err(codec_error)?;
+            let example_cursor = [0_u8; ENUMERATION_CONTINUATION_LENGTH];
             let response_overhead =
                 enumerate_response_base_length(Some(&example_cursor)).map_err(codec_error)?;
             let metadata_byte_limit = MAX_APPLICATION_PAYLOAD_LENGTH
                 .checked_sub(response_overhead)
                 .ok_or_else(|| io::Error::other("enumeration response overhead exceeds frame"))?;
             let read = store.lock().await.enumerate_authorized(
+                broker_channel,
                 enumerate.document_id,
                 enumerate.authority.capability_id,
                 &enumerate.authority.authenticator,
@@ -899,46 +907,45 @@ async fn handle_request(
                 metadata_byte_limit,
             );
             let authorized = match read {
-                Ok(StoreReadOutcome::Authorized(page)) => page,
-                Ok(StoreReadOutcome::AuthorizationDenied) => {
+                Ok(StoreEnumerateOutcome::Authorized(page)) => page,
+                Ok(StoreEnumerateOutcome::AuthorizationDenied) => {
                     return response(
                         request,
                         UPDATE_ERROR,
                         encode_update_error(UpdateErrorCode::AuthorizationDenied),
                     );
                 }
-                Ok(StoreReadOutcome::InvalidCursor) => {
+                Ok(StoreEnumerateOutcome::RetiredDocument) => {
                     return response(
                         request,
                         UPDATE_ERROR,
-                        encode_update_error(UpdateErrorCode::InvalidCursor),
+                        encode_update_error(UpdateErrorCode::RetiredDocument),
+                    );
+                }
+                Ok(StoreEnumerateOutcome::InvalidContinuation) => {
+                    return response(
+                        request,
+                        UPDATE_ERROR,
+                        encode_update_error(UpdateErrorCode::InvalidOrExpiredContinuation),
+                    );
+                }
+                Ok(StoreEnumerateOutcome::Backpressure) => {
+                    return response(
+                        request,
+                        UPDATE_ERROR,
+                        encode_update_error(UpdateErrorCode::Backpressure),
                     );
                 }
                 Err(error) => return Err(store_error(error)),
             };
             let page = authorized.page;
-            let next_cursor = match page.last_sequence {
-                Some(position) => {
-                    let terminal_sequence = authorized.terminal_sequence.ok_or_else(|| {
-                        io::Error::other("nonempty authorized page omitted its terminal sequence")
-                    })?;
-                    Some(
-                        encode_acceptance_cursor(
-                            enumerate.document_id,
-                            AcceptanceCursor { position, terminal_sequence },
-                        )
-                        .map_err(codec_error)?,
-                    )
-                }
-                None => None,
-            };
             let updates = page.updates.into_iter().map(|(_sequence, metadata)| metadata).collect();
             response(
                 request,
                 ENUMERATE_UPDATES_RESPONSE,
                 encode_enumerate_response(&EnumerateResponse {
                     has_more: page.has_more,
-                    next_cursor,
+                    next_cursor: authorized.next_cursor,
                     updates,
                 })
                 .map_err(codec_error)?,
@@ -1059,9 +1066,6 @@ async fn handle_request(
                     UPDATE_ERROR,
                     encode_update_error(UpdateErrorCode::AuthorizationDenied),
                 ),
-                StoreReadOutcome::InvalidCursor => {
-                    Err(io::Error::other("fetch returned an enumeration cursor error"))
-                }
             }
         }
         _unknown => {
@@ -1140,6 +1144,16 @@ fn emit_readiness(record: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use renee_types::{
+        Authenticator, CapabilityId, DocumentId, ImmutableUpdate, LoroRange, PublicLoroRanges,
+        RequestId, UpdateId,
+    };
+    use renee_wire::encode_update_record;
+    use tokio::io::AsyncReadExt as _;
+
     use super::*;
 
     #[test]
@@ -1157,5 +1171,116 @@ mod tests {
             terminal_subscription_event(UpdateSubscriptionEnd::Retired, subscription_id),
             expected
         );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the transport-boundary retirement race keeps selected state and socket observation visible"
+    )]
+    async fn selected_notification_does_not_write_after_retirement_commits() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock must follow epoch")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("renee-emission-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&directory).expect("test directory must be created");
+        let database = directory.join("renee.sqlite3");
+        let create_authority_id = CreateAuthorityId::from_bytes([0xa1; 16]);
+        let create_authenticator = Authenticator::from_bytes([0xa2; 32]);
+        let create_verifiers = verifier::derive_create(create_authority_id, &create_authenticator);
+        let mut store = DurableUpdateStore::open(
+            &database,
+            CreateAuthorityProvision {
+                create_authority_id,
+                live_verifier: create_verifiers.live,
+                receipt_verifier: create_verifiers.receipt,
+            },
+        )
+        .expect("store must open");
+        let document_id = DocumentId::from_bytes([0xb1; 16]);
+        let capability_id = CapabilityId::from_bytes([0xb2; 16]);
+        let authenticator = Authenticator::from_bytes([0xb3; 32]);
+        assert_eq!(
+            store
+                .create_document(
+                    create_authority_id,
+                    &create_authenticator,
+                    RequestId::from_bytes([0xb4; 16]),
+                    document_id,
+                    capability_id,
+                    &authenticator,
+                )
+                .expect("document must be created"),
+            StoreCreateOutcome::Inserted,
+        );
+        let channel = store.open_broker_channel().expect("channel must open");
+        let StoreSubscribeOutcome::Acknowledged(mut subscription) = store
+            .subscribe_updates(&channel, document_id, capability_id, &authenticator)
+            .expect("subscription must resolve")
+        else {
+            panic!("root read authority must subscribe");
+        };
+        let emission = subscription.emission();
+        let update_id = UpdateId::from_bytes([0xb5; 16]);
+        let update = ImmutableUpdate::new(
+            document_id,
+            update_id,
+            PublicLoroRanges::new(vec![
+                LoroRange::new(7, 0, 1).expect("fixture range must be valid"),
+            ])
+            .expect("fixture ranges must be canonical"),
+            vec![0xb5],
+        );
+        let encoded = encode_update_record(&update).expect("fixture must encode");
+        assert_eq!(
+            store
+                .accept(capability_id, &authenticator, &update, &encoded)
+                .expect("update must commit"),
+            StoreAcceptOutcome::Inserted,
+        );
+        assert_eq!(subscription.next().await, UpdateSubscriptionPoll::Notification(update_id),);
+        store.commit_retirement_for_test(document_id).expect("retirement must commit and publish");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener must bind");
+        let mut client = TcpStream::connect(listener.local_addr().expect("address must exist"))
+            .await
+            .expect("client must connect");
+        let (server_stream, _address) = listener.accept().await.expect("server must accept");
+        let (_input, mut output) = server_stream.into_split();
+        let body = encode_body(&Envelope {
+            correlation_id: [0xc1; 16],
+            message_type: UPDATE_NOTIFICATION,
+            payload: encode_update_notification(UpdateNotification {
+                subscription_id: UpdateSubscriptionId::from_bytes([0xc2; 16]),
+                update_id,
+            }),
+            version: VERSION,
+        })
+        .expect("notification must encode");
+        let store = Mutex::new(store);
+        write_connection_event(
+            &mut output,
+            &store,
+            ConnectionEvent { body, emission: Some(emission) },
+        )
+        .await
+        .expect("discarding an invalidated event must succeed");
+        let mut observed = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), client.read_exact(&mut observed))
+                .await
+                .is_err(),
+            "retired notification crossed the transport boundary",
+        );
+        assert_eq!(
+            subscription.next().await,
+            UpdateSubscriptionPoll::Invalidated(UpdateSubscriptionEnd::Retired),
+        );
+        drop(store);
+        drop(output);
+        drop(client);
+        fs::remove_dir_all(&directory).expect("test directory must be removed");
     }
 }

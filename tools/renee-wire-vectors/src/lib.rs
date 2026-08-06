@@ -9,17 +9,17 @@
 use core::fmt;
 
 use renee_types::{
-    AcceptanceSequence, Authenticator, CapabilityId, CreateAuthorityId, DocumentId,
-    ImmutableUpdate, LoroOplogVersion, LoroOplogVersionEntry, LoroRange, Operation, OperationSet,
-    PublicLoroRanges, RequestId, UpdateId, UpdateMetadata,
+    Authenticator, CapabilityId, CreateAuthorityId, DocumentId, IDENTIFIER_LENGTH, ImmutableUpdate,
+    LoroOplogVersion, LoroOplogVersionEntry, LoroRange, Operation, OperationSet, PublicLoroRanges,
+    RequestId, UpdateId, UpdateMetadata,
 };
 use renee_wire::{
-    ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AcceptanceCursor,
-    AuthorizedUpdateRequest, CANCEL_UPDATE_SUBSCRIPTION, CANCEL_UPDATE_SUBSCRIPTION_RESPONSE,
-    CAPABILITY_ERROR, CERTIFICATE_MANIFEST, CERTIFICATE_MANIFEST_RESPONSE, CLIENT_HELLO,
-    CREATE_DOCUMENT, CREATE_DOCUMENT_RESPONSE, CapabilityAuthority, CapabilityErrorCode,
-    ControlMutationOutcome, CreateAuthority, CreateDocumentOutcome, CreateDocumentRequest,
-    ENUMERATE_UPDATES, ENUMERATE_UPDATES_RESPONSE, ERROR_ALREADY_NEGOTIATED, ERROR_EXPECTED_HELLO,
+    ACCEPT_UPDATE, ACCEPT_UPDATE_RESPONSE, AcceptUpdateOutcome, AuthorizedUpdateRequest,
+    CANCEL_UPDATE_SUBSCRIPTION, CANCEL_UPDATE_SUBSCRIPTION_RESPONSE, CAPABILITY_ERROR,
+    CERTIFICATE_MANIFEST, CERTIFICATE_MANIFEST_RESPONSE, CLIENT_HELLO, CREATE_DOCUMENT,
+    CREATE_DOCUMENT_RESPONSE, CapabilityAuthority, CapabilityErrorCode, ControlMutationOutcome,
+    CreateAuthority, CreateDocumentOutcome, CreateDocumentRequest, ENUMERATE_UPDATES,
+    ENUMERATE_UPDATES_RESPONSE, ERROR_ALREADY_NEGOTIATED, ERROR_EXPECTED_HELLO,
     ERROR_MALFORMED_HELLO, ERROR_UNSUPPORTED_PROFILE, ERROR_UNSUPPORTED_VERSION, EnumerateRequest,
     EnumerateResponse, EnumerateStart, Envelope, FETCH_UPDATE, FETCH_UPDATE_RESPONSE, FetchRequest,
     GRANT_CAPABILITY, GRANT_CAPABILITY_RESPONSE, GrantCapabilityRequest,
@@ -29,8 +29,8 @@ use renee_wire::{
     UPDATE_SUBSCRIPTION_INVALIDATED, UPDATE_SUBSCRIPTION_OVERFLOW, UpdateErrorCode,
     UpdateNotification, UpdateSubscriptionId, VECTOR_BACKFILL, VECTOR_BACKFILL_RESPONSE, VERSION,
     VectorBackfillRequest, VectorBackfillResponse, VectorBackfillStart, encode_accept_response,
-    encode_acceptance_cursor, encode_authorized_update_request, encode_cancel_update_subscription,
-    encode_capability_error, encode_control_mutation_response, encode_create_document_request,
+    encode_authorized_update_request, encode_cancel_update_subscription, encode_capability_error,
+    encode_control_mutation_response, encode_create_document_request,
     encode_create_document_response, encode_enumerate_request, encode_enumerate_response,
     encode_fetch_request, encode_fetch_response, encode_frame, encode_grant_capability_request,
     encode_greeting, encode_revoke_capability_request, encode_subscribe_updates_ack,
@@ -44,6 +44,80 @@ use ring::signature::{Ed25519KeyPair, KeyPair as _};
 const CARBON_BANNER: &str = "I couldn't stay away";
 const RENEE_BANNER: &str = "I've been expecting you";
 const SCHEMA: &str = "renee-wire-golden-v1";
+const CARBON_UPDATE_V0_PROFILE: &[&str] = &[
+    "hello.client",
+    "hello.server",
+    "certificate-manifest.request",
+    "certificate-manifest.response",
+    "document.create.request",
+    "document.create.response.inserted",
+    "document.create.response.already-present",
+    "capability.grant.request",
+    "capability.grant.response.inserted",
+    "capability.grant.response.already-present",
+    "capability.revoke.request",
+    "capability.revoke.response.inserted",
+    "capability.revoke.response.already-present",
+    "accept.request.authorized",
+    "accept.response.inserted",
+    "accept.response.already-present",
+    "enumerate.request.origin",
+    "enumerate.request.continue",
+    "enumerate.request.after-tail",
+    "enumerate.response.page",
+    "enumerate.response.empty",
+    "fetch.request",
+    "fetch.response",
+    "subscription.request",
+    "subscription.acknowledgement",
+    "subscription.notification",
+    "subscription.overflow",
+    "subscription.invalidated",
+    "subscription.cancel.request",
+    "subscription.cancel.response",
+    "error.protocol.unsupported-version",
+    "error.protocol.unsupported-profile",
+    "error.protocol.expected-hello",
+    "error.protocol.already-negotiated",
+    "error.protocol.malformed-hello",
+    "error.update.malformed",
+    "error.update.identifier-conflict",
+    "error.update.not-found",
+    "error.update.not-negotiated",
+    "error.update.invalid-cursor",
+    "error.update.counter-exhausted",
+    "error.update.authorization-denied",
+    "error.update.backpressure",
+    "error.update.invalid-loro-metadata",
+    "error.update.invalid-or-expired-continuation",
+    "error.update.limit-exceeded",
+    "error.update.retired-document",
+    "error.capability.malformed",
+    "error.capability.authorization-denied",
+    "error.capability.identifier-conflict",
+    "error.capability.request-conflict",
+    "error.capability.counter-exhausted",
+    "error.capability.limit-exceeded",
+    "limit.maximum-greeting-fields",
+    "limit.maximum-application-payload",
+];
+const CARBON_UPDATE_V0_INVALID_PAYLOADS: &[&str] = &[
+    "limit.oversized-greeting-field",
+    "subscription.request.truncated",
+    "subscription.cancel.wrong-version",
+];
+const CARBON_UPDATE_V0_INVALID_FRAMES: &[&str] = &[
+    "malformed.empty-stream",
+    "malformed.partial-prefix-1",
+    "malformed.partial-prefix-2",
+    "malformed.partial-prefix-3",
+    "malformed.zero-length-body",
+    "malformed.short-envelope",
+    "malformed.truncated-body",
+    "malformed.oversized-length",
+    "malformed.invalid-magic",
+    "malformed.trailing-byte",
+];
 
 struct FrameVector {
     category: &'static str,
@@ -87,13 +161,14 @@ pub fn generate() -> Result<String, GenerateError> {
         create_authority_id: CreateAuthorityId::from_bytes([0x53; 16]),
         authenticator: Authenticator::from_bytes([0x54; 32]),
     };
-    let cursor = encode_acceptance_cursor(
-        document_id,
-        AcceptanceCursor {
-            position: AcceptanceSequence::FIRST,
-            terminal_sequence: AcceptanceSequence::from_be_bytes([0, 0, 0, 0, 0, 0, 0, 3]),
-        },
-    )?;
+    let cursor = vec![0x69; 32];
+    if cursor.windows(IDENTIFIER_LENGTH).any(|bytes| bytes == document_id.into_bytes())
+        || cursor.windows(8).any(|bytes| bytes == [0, 0, 0, 0, 0, 0, 0, 3])
+    {
+        return Err(GenerateError::new(
+            "opaque golden cursor embeds a document or acceptance position",
+        ));
+    }
     let metadata = UpdateMetadata {
         encrypted_payload_length: u32::try_from(update.encrypted_payload().len())
             .map_err(|error| GenerateError::new(error.to_string()))?,
@@ -517,6 +592,27 @@ pub fn generate() -> Result<String, GenerateError> {
     let invalid_frames = invalid_frame_vectors(frames.first().ok_or_else(|| {
         GenerateError::new("golden frame corpus unexpectedly has no first vector")
     })?)?;
+    for profile_name in CARBON_UPDATE_V0_PROFILE {
+        if !frames.iter().any(|frame| frame.name == *profile_name) {
+            return Err(GenerateError::new(format!(
+                "Carbon golden profile names absent frame {profile_name}"
+            )));
+        }
+    }
+    for profile_name in CARBON_UPDATE_V0_INVALID_PAYLOADS {
+        if !invalid_payloads.iter().any(|vector| vector.frame.name == *profile_name) {
+            return Err(GenerateError::new(format!(
+                "Carbon golden profile names absent invalid payload {profile_name}"
+            )));
+        }
+    }
+    for profile_name in CARBON_UPDATE_V0_INVALID_FRAMES {
+        if !invalid_frames.iter().any(|vector| vector.name == *profile_name) {
+            return Err(GenerateError::new(format!(
+                "Carbon golden profile names absent invalid frame {profile_name}"
+            )));
+        }
+    }
 
     Ok(render(
         &frames,
@@ -679,6 +775,13 @@ fn render(
     output.push_str("\",\n  \"certificate_manifest_hex\": \"");
     output.push_str(&hex(certificate_manifest));
     output.push_str("\",\n");
+    output.push_str("  \"profiles\": {\n    \"carbon-update-v0\": {\n      \"frames\": [\n");
+    render_name_list(&mut output, CARBON_UPDATE_V0_PROFILE, "        ");
+    output.push_str("      ],\n      \"invalid_payloads\": [\n");
+    render_name_list(&mut output, CARBON_UPDATE_V0_INVALID_PAYLOADS, "        ");
+    output.push_str("      ],\n      \"invalid_frames\": [\n");
+    render_name_list(&mut output, CARBON_UPDATE_V0_INVALID_FRAMES, "        ");
+    output.push_str("      ]\n    }\n  },\n");
     output.push_str("  \"frames\": [\n");
     for (index, vector) in frames.iter().enumerate() {
         render_frame(&mut output, vector, "    ");
@@ -710,6 +813,16 @@ fn render(
     }
     output.push_str("  ]\n}\n");
     output
+}
+
+fn render_name_list(output: &mut String, names: &[&str], indent: &str) {
+    for (index, name) in names.iter().enumerate() {
+        output.push_str(indent);
+        output.push('"');
+        output.push_str(name);
+        output.push('"');
+        output.push_str(if index == names.len().saturating_sub(1) { "\n" } else { ",\n" });
+    }
 }
 
 fn render_frame(output: &mut String, vector: &FrameVector, indent: &str) {

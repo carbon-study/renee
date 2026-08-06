@@ -22,6 +22,7 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 const QUIET_TIMEOUT: Duration = Duration::from_millis(250);
 const ACK_BARRIER: &str = "store-subscription-before-ack";
 const POLL_BARRIER: &str = "store-subscription-before-poll";
+const SELECT_BARRIER: &str = "store-subscription-after-select-before-write";
 
 fn root(document: u8) -> CreateDocumentRequest {
     CreateDocumentRequest {
@@ -262,6 +263,183 @@ async fn committed_revocation_emits_generic_terminal_invalidation() -> HarnessRe
     }
     let replacement = connection.subscribe_updates(&root.root, root.document_id).await?;
     connection.cancel_update_subscription(replacement.subscription_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn selected_notification_is_discarded_when_revocation_commits_before_emission()
+-> HarnessResult<()> {
+    let server = ServerHarness::start().await?;
+    let subscriber = server.connect_webtransport().await?;
+    subscriber.negotiate().await?;
+    let root = create_root(&subscriber, 0x17).await?;
+    let reader = CapabilityAuthority {
+        capability_id: CapabilityId::from_bytes([0x79; 16]),
+        authenticator: Authenticator::from_bytes([0x7a; 32]),
+    };
+    if subscriber
+        .grant_capability(&GrantCapabilityRequest {
+            document_id: root.document_id,
+            issuer: root.root.clone(),
+            request_id: RequestId::from_bytes([0x7b; 16]),
+            descendant: reader.clone(),
+            operations: OperationSet::one(Operation::Read),
+        })
+        .await?
+        != ControlMutationObservation::Inserted
+    {
+        return Err(io::Error::other("reader capability was not granted").into());
+    }
+    let subscription = subscriber.subscribe_updates(&reader, root.document_id).await?;
+    server.arm_store_barrier(SELECT_BARRIER)?;
+    let controller = server.connect_webtransport().await?;
+    controller.negotiate().await?;
+    let selected = update(0x17, 0x41);
+    controller.accept_update(&root.root, &encode_update_record(&selected)?).await?;
+    server.wait_for_store_barrier(SELECT_BARRIER).await?;
+    if controller
+        .revoke_capability(&RevokeCapabilityRequest {
+            document_id: root.document_id,
+            issuer: root.root,
+            request_id: RequestId::from_bytes([0x7c; 16]),
+            target_capability_id: reader.capability_id,
+        })
+        .await?
+        != ControlMutationObservation::Inserted
+    {
+        return Err(io::Error::other("reader revocation was not committed").into());
+    }
+    server.release_store_barrier(SELECT_BARRIER)?;
+    let event =
+        tokio::time::timeout(EVENT_TIMEOUT, subscriber.next_update_subscription_event()).await??;
+    if event
+        != (UpdateSubscriptionEvent::Invalidated {
+            correlation_id: subscription.correlation_id,
+            subscription_id: subscription.subscription_id,
+        })
+    {
+        return Err(io::Error::other("selected notification crossed after revocation").into());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn notification_emitted_before_revocation_is_followed_by_terminal_invalidation()
+-> HarnessResult<()> {
+    let server = ServerHarness::start().await?;
+    let connection = server.connect_webtransport().await?;
+    connection.negotiate().await?;
+    let root = create_root(&connection, 0x18).await?;
+    let reader = CapabilityAuthority {
+        capability_id: CapabilityId::from_bytes([0x7d; 16]),
+        authenticator: Authenticator::from_bytes([0x7e; 32]),
+    };
+    connection
+        .grant_capability(&GrantCapabilityRequest {
+            document_id: root.document_id,
+            issuer: root.root.clone(),
+            request_id: RequestId::from_bytes([0x7f; 16]),
+            descendant: reader.clone(),
+            operations: OperationSet::one(Operation::Read),
+        })
+        .await?;
+    let subscription = connection.subscribe_updates(&reader, root.document_id).await?;
+    let emitted = update(0x18, 0x42);
+    connection.accept_update(&root.root, &encode_update_record(&emitted)?).await?;
+    let notification =
+        tokio::time::timeout(EVENT_TIMEOUT, connection.next_update_subscription_event()).await??;
+    if notification
+        != (UpdateSubscriptionEvent::Notification {
+            correlation_id: subscription.correlation_id,
+            subscription_id: subscription.subscription_id,
+            update_id: emitted.update_id(),
+        })
+    {
+        return Err(io::Error::other("pre-revocation notification was not emitted").into());
+    }
+    connection
+        .revoke_capability(&RevokeCapabilityRequest {
+            document_id: root.document_id,
+            issuer: root.root,
+            request_id: RequestId::from_bytes([0x80; 16]),
+            target_capability_id: reader.capability_id,
+        })
+        .await?;
+    let invalidated =
+        tokio::time::timeout(EVENT_TIMEOUT, connection.next_update_subscription_event()).await??;
+    if invalidated
+        != (UpdateSubscriptionEvent::Invalidated {
+            correlation_id: subscription.correlation_id,
+            subscription_id: subscription.subscription_id,
+        })
+    {
+        return Err(io::Error::other("revocation did not terminate emitted subscription").into());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn descendant_revocation_discards_a_selected_notification_before_emission()
+-> HarnessResult<()> {
+    let server = ServerHarness::start().await?;
+    let subscriber = server.connect_webtransport().await?;
+    subscriber.negotiate().await?;
+    let root = create_root(&subscriber, 0x19).await?;
+    let parent = CapabilityAuthority {
+        capability_id: CapabilityId::from_bytes([0x81; 16]),
+        authenticator: Authenticator::from_bytes([0x82; 32]),
+    };
+    let child = CapabilityAuthority {
+        capability_id: CapabilityId::from_bytes([0x83; 16]),
+        authenticator: Authenticator::from_bytes([0x84; 32]),
+    };
+    subscriber
+        .grant_capability(&GrantCapabilityRequest {
+            document_id: root.document_id,
+            issuer: root.root.clone(),
+            request_id: RequestId::from_bytes([0x85; 16]),
+            descendant: parent.clone(),
+            operations: OperationSet::one(Operation::Grant)
+                .union(OperationSet::one(Operation::Read)),
+        })
+        .await?;
+    subscriber
+        .grant_capability(&GrantCapabilityRequest {
+            document_id: root.document_id,
+            issuer: parent.clone(),
+            request_id: RequestId::from_bytes([0x86; 16]),
+            descendant: child.clone(),
+            operations: OperationSet::one(Operation::Read),
+        })
+        .await?;
+    let subscription = subscriber.subscribe_updates(&child, root.document_id).await?;
+    server.arm_store_barrier(SELECT_BARRIER)?;
+    let controller = server.connect_webtransport().await?;
+    controller.negotiate().await?;
+    let selected = update(0x19, 0x43);
+    controller.accept_update(&root.root, &encode_update_record(&selected)?).await?;
+    server.wait_for_store_barrier(SELECT_BARRIER).await?;
+    controller
+        .revoke_capability(&RevokeCapabilityRequest {
+            document_id: root.document_id,
+            issuer: root.root,
+            request_id: RequestId::from_bytes([0x87; 16]),
+            target_capability_id: parent.capability_id,
+        })
+        .await?;
+    server.release_store_barrier(SELECT_BARRIER)?;
+    let event =
+        tokio::time::timeout(EVENT_TIMEOUT, subscriber.next_update_subscription_event()).await??;
+    if event
+        != (UpdateSubscriptionEvent::Invalidated {
+            correlation_id: subscription.correlation_id,
+            subscription_id: subscription.subscription_id,
+        })
+    {
+        return Err(
+            io::Error::other("descendant notification crossed after parent revocation").into()
+        );
+    }
     Ok(())
 }
 

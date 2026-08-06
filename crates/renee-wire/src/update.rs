@@ -6,8 +6,8 @@
 use core::fmt;
 
 use renee_types::{
-    AcceptanceSequence, DocumentId, IDENTIFIER_LENGTH, ImmutableUpdate, LoroOplogVersion,
-    LoroOplogVersionEntry, LoroRange, MAX_LORO_PEERS, PublicLoroRanges, UpdateId, UpdateMetadata,
+    DocumentId, IDENTIFIER_LENGTH, ImmutableUpdate, LoroOplogVersion, LoroOplogVersionEntry,
+    LoroRange, MAX_LORO_PEERS, PublicLoroRanges, UpdateId, UpdateMetadata,
 };
 
 use crate::{
@@ -53,10 +53,9 @@ const RECORD_VERSION: u16 = 1;
 const LORO_PROFILE_CODE: u16 = 1;
 const RANGE_LENGTH: usize = 16;
 const RECORD_FIXED_LENGTH: usize = 50;
-const CURSOR_MAGIC: [u8; 8] = *b"RNECUR\0\0";
-const CURSOR_VERSION: u16 = 2;
-const CURSOR_LENGTH: usize = 8 + 2 + IDENTIFIER_LENGTH + 8 + 8;
-const ENUMERATE_RESPONSE_WITH_CURSOR_LENGTH: usize = 1 + 2 + CURSOR_LENGTH + 2;
+/// Fixed bytes in one opaque server-owned enumeration continuation.
+pub const ENUMERATION_CONTINUATION_LENGTH: usize = 32;
+const ENUMERATE_RESPONSE_WITH_CURSOR_LENGTH: usize = 1 + 2 + ENUMERATION_CONTINUATION_LENGTH + 2;
 const MAX_ENUMERABLE_METADATA_LENGTH: usize =
     MAX_APPLICATION_PAYLOAD_LENGTH - ENUMERATE_RESPONSE_WITH_CURSOR_LENGTH;
 const SUBSCRIPTION_PAYLOAD_VERSION: u16 = 1;
@@ -214,15 +213,6 @@ pub struct VectorBackfillResponse {
     pub next_cursor: Option<Vec<u8>>,
     /// Selected public metadata with no causal or acceptance-order claim.
     pub updates: Vec<UpdateMetadata>,
-}
-
-/// Renee-owned finite-read bounds recovered from an opaque cursor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AcceptanceCursor {
-    /// Exclusive position already returned to the client.
-    pub position: AcceptanceSequence,
-    /// Inclusive high-water sequence captured by the first request.
-    pub terminal_sequence: AcceptanceSequence,
 }
 
 /// Frozen update payload codec failure.
@@ -409,11 +399,12 @@ pub fn decode_enumerate_request(payload: &[u8]) -> Result<EnumerateRequest, Upda
     let document_id = DocumentId::from_bytes(decoder.take_array()?);
     let mode = decoder.take_byte()?;
     let cursor_length = usize::from(u16::from_be_bytes(decoder.take_array()?));
-    let cursor = match (mode, cursor_length) {
-        (0, 0) => EnumerateStart::Origin,
-        (1, CURSOR_LENGTH) => EnumerateStart::Continue(decoder.take(cursor_length)?.to_vec()),
-        (2, CURSOR_LENGTH) => EnumerateStart::AfterTail(decoder.take(cursor_length)?.to_vec()),
-        _invalid => return Err(UpdateCodecError::InvalidCursor),
+    let cursor = match mode {
+        0 if cursor_length == 0 => EnumerateStart::Origin,
+        0 => return Err(UpdateCodecError::InvalidCursor),
+        1 => EnumerateStart::Continue(decoder.take(cursor_length)?.to_vec()),
+        2 => EnumerateStart::AfterTail(decoder.take(cursor_length)?.to_vec()),
+        _invalid => return Err(UpdateCodecError::InvalidDiscriminant),
     };
     decoder.finish()?;
     Ok(EnumerateRequest { authority, document_id, start: cursor })
@@ -566,53 +557,6 @@ pub fn decode_vector_backfill_request(
     Ok(VectorBackfillRequest { authority, document_id, oplog_version, start })
 }
 
-/// Encodes an opaque cursor after one accepted update.
-pub fn encode_acceptance_cursor(
-    document_id: DocumentId,
-    cursor: AcceptanceCursor,
-) -> Result<Vec<u8>, UpdateCodecError> {
-    if cursor.position == AcceptanceSequence::ORIGIN
-        || cursor.terminal_sequence == AcceptanceSequence::ORIGIN
-        || cursor.position > cursor.terminal_sequence
-    {
-        return Err(UpdateCodecError::InvalidCursor);
-    }
-    let mut encoded = Vec::with_capacity(CURSOR_LENGTH);
-    encoded.extend_from_slice(&CURSOR_MAGIC);
-    encoded.extend_from_slice(&CURSOR_VERSION.to_be_bytes());
-    encoded.extend_from_slice(&document_id.into_bytes());
-    encoded.extend_from_slice(&cursor.position.to_be_bytes());
-    encoded.extend_from_slice(&cursor.terminal_sequence.to_be_bytes());
-    Ok(encoded)
-}
-
-/// Validates and opens a cursor for the named document.
-pub fn decode_acceptance_cursor(
-    document_id: DocumentId,
-    encoded: &[u8],
-) -> Result<AcceptanceCursor, UpdateCodecError> {
-    let mut decoder = Decoder::new(encoded);
-    if decoder.take_array()? != CURSOR_MAGIC {
-        return Err(UpdateCodecError::InvalidCursor);
-    }
-    if u16::from_be_bytes(decoder.take_array()?) != CURSOR_VERSION {
-        return Err(UpdateCodecError::InvalidCursor);
-    }
-    if DocumentId::from_bytes(decoder.take_array()?) != document_id {
-        return Err(UpdateCodecError::InvalidCursor);
-    }
-    let position = AcceptanceSequence::from_be_bytes(decoder.take_array()?);
-    let terminal_sequence = AcceptanceSequence::from_be_bytes(decoder.take_array()?);
-    if position == AcceptanceSequence::ORIGIN
-        || terminal_sequence == AcceptanceSequence::ORIGIN
-        || position > terminal_sequence
-    {
-        return Err(UpdateCodecError::InvalidCursor);
-    }
-    decoder.finish()?;
-    Ok(AcceptanceCursor { position, terminal_sequence })
-}
-
 /// Returns the exact bytes required by one metadata entry.
 pub fn metadata_encoded_length(metadata: &UpdateMetadata) -> Result<usize, UpdateCodecError> {
     let ranges_length = metadata
@@ -688,7 +632,7 @@ pub fn decode_enumerate_response(payload: &[u8]) -> Result<EnumerateResponse, Up
     let cursor_length = usize::from(u16::from_be_bytes(decoder.take_array()?));
     let next_cursor = match cursor_length {
         0 => None,
-        CURSOR_LENGTH => Some(decoder.take(cursor_length)?.to_vec()),
+        ENUMERATION_CONTINUATION_LENGTH => Some(decoder.take(cursor_length)?.to_vec()),
         _invalid => return Err(UpdateCodecError::InvalidCursor),
     };
     let count = usize::from(u16::from_be_bytes(decoder.take_array()?));
@@ -1029,7 +973,9 @@ pub fn decode_update_error(payload: &[u8]) -> Result<UpdateErrorCode, UpdateCode
 
 fn cursor_length(cursor: Option<&[u8]>) -> Result<usize, UpdateCodecError> {
     match cursor {
-        Some(cursor) if cursor.len() == CURSOR_LENGTH => Ok(CURSOR_LENGTH),
+        Some(cursor) if cursor.len() == ENUMERATION_CONTINUATION_LENGTH => {
+            Ok(ENUMERATION_CONTINUATION_LENGTH)
+        }
         Some(_invalid) => Err(UpdateCodecError::InvalidCursor),
         None => Ok(0),
     }
@@ -1193,7 +1139,7 @@ mod tests {
             })
             .expect("metadata length must encode")
                 + ENUMERATE_RESPONSE_WITH_CURSOR_LENGTH,
-            4_037
+            4_027
         );
         assert_eq!(
             encode_update_record(&maximum).expect("largest enumerable range set must encode").len(),
@@ -1209,7 +1155,7 @@ mod tests {
             })
             .expect("metadata length must encode")
                 + ENUMERATE_RESPONSE_WITH_CURSOR_LENGTH,
-            4_053
+            4_043
         );
         assert_eq!(encode_update_record(&poison), Err(UpdateCodecError::RecordTooLong));
 
@@ -1228,56 +1174,10 @@ mod tests {
     }
 
     #[test]
-    fn acceptance_cursor_is_document_bound_and_versioned() {
-        let document_id = DocumentId::from_bytes([0x21; IDENTIFIER_LENGTH]);
-        let other_document = DocumentId::from_bytes([0x22; IDENTIFIER_LENGTH]);
-        let position = AcceptanceSequence::from_be_bytes([0, 0, 0, 0, 0, 0, 0, 37]);
-        let terminal_sequence = AcceptanceSequence::from_be_bytes([0, 0, 0, 0, 0, 0, 0, 41]);
-        let decoded = AcceptanceCursor { position, terminal_sequence };
-        let cursor =
-            encode_acceptance_cursor(document_id, decoded).expect("valid cursor must encode");
-
-        assert_eq!(cursor.len(), CURSOR_LENGTH);
-        assert_eq!(decode_acceptance_cursor(document_id, &cursor), Ok(decoded));
-        assert_eq!(
-            decode_acceptance_cursor(other_document, &cursor),
-            Err(UpdateCodecError::InvalidCursor)
-        );
-
-        let mut wrong_version = cursor;
-        wrong_version[CURSOR_MAGIC.len() + 1] ^= 1;
-        assert_eq!(
-            decode_acceptance_cursor(document_id, &wrong_version),
-            Err(UpdateCodecError::InvalidCursor)
-        );
-        assert_eq!(
-            encode_acceptance_cursor(
-                document_id,
-                AcceptanceCursor { position: AcceptanceSequence::ORIGIN, terminal_sequence },
-            ),
-            Err(UpdateCodecError::InvalidCursor)
-        );
-        assert_eq!(
-            encode_acceptance_cursor(
-                document_id,
-                AcceptanceCursor { position: terminal_sequence, terminal_sequence: position },
-            ),
-            Err(UpdateCodecError::InvalidCursor)
-        );
-    }
-
-    #[test]
     fn enumeration_request_and_response_preserve_opaque_cursor() {
         let record =
             decode_update_record(&decode_hex(FIXED_RECORD_HEX)).expect("Carbon vector must decode");
-        let cursor = encode_acceptance_cursor(
-            record.document_id(),
-            AcceptanceCursor {
-                position: AcceptanceSequence::FIRST,
-                terminal_sequence: AcceptanceSequence::FIRST,
-            },
-        )
-        .expect("valid cursor must encode");
+        let cursor = vec![0x73; ENUMERATION_CONTINUATION_LENGTH];
         for start in [
             EnumerateStart::Origin,
             EnumerateStart::Continue(cursor.clone()),
@@ -1315,6 +1215,34 @@ mod tests {
             ),
             Ok(response)
         );
+    }
+
+    #[test]
+    fn enumeration_decoder_preserves_well_framed_invalid_token_lengths() {
+        let authority = CapabilityAuthority {
+            capability_id: renee_types::CapabilityId::from_bytes([0x71; 16]),
+            authenticator: renee_types::Authenticator::from_bytes([0x72; 32]),
+        };
+        for cursor in [vec![0x31; 31], vec![0x33; 33]] {
+            let mut payload = Vec::new();
+            encode_authority(&mut payload, &authority);
+            payload.extend_from_slice(&[0x21; IDENTIFIER_LENGTH]);
+            payload.push(1);
+            payload.extend_from_slice(
+                &u16::try_from(cursor.len()).expect("fixture length fits").to_be_bytes(),
+            );
+            payload.extend_from_slice(&cursor);
+            let decoded = decode_enumerate_request(&payload)
+                .expect("well-framed token reaches the broker for uniform rejection");
+            assert_eq!(decoded.start, EnumerateStart::Continue(cursor));
+        }
+
+        let request = EnumerateRequest {
+            authority,
+            document_id: DocumentId::from_bytes([0x21; IDENTIFIER_LENGTH]),
+            start: EnumerateStart::Continue(vec![0x31; 31]),
+        };
+        assert_eq!(encode_enumerate_request(&request), Err(UpdateCodecError::InvalidCursor));
     }
 
     #[test]

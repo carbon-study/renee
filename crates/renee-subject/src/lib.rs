@@ -181,10 +181,12 @@ pub enum FetchObservation {
 pub enum EnumerateObservation {
     /// Renee returned a bounded page and an opaque continuation cursor.
     Page(EnumerateResponse),
-    /// The cursor was malformed or bound to another document.
-    InvalidCursor,
+    /// The opaque continuation was invalid, expired, or context-mismatched.
+    InvalidContinuation,
     /// Read authority was denied without document disclosure.
     AuthorizationDenied,
+    /// Valid authority named a document that has been retired.
+    RetiredDocument,
 }
 
 /// Subject observation for one authenticated vector-backfill page.
@@ -684,16 +686,20 @@ impl WebTransportConnection {
     ) -> HarnessResult<EnumerateResponse> {
         match self.enumerate_updates_observation(authority, document_id, cursor).await? {
             EnumerateObservation::Page(page) => Ok(page),
-            EnumerateObservation::InvalidCursor => {
-                Err(io::Error::other("valid enumerate request received invalid-cursor").into())
+            EnumerateObservation::InvalidContinuation => {
+                Err(io::Error::other("valid enumerate request received invalid continuation")
+                    .into())
             }
             EnumerateObservation::AuthorizationDenied => {
                 Err(io::Error::other("valid enumerate request was denied").into())
             }
+            EnumerateObservation::RetiredDocument => {
+                Err(io::Error::other("valid enumerate request named a retired document").into())
+            }
         }
     }
 
-    /// Enumerates while preserving an invalid-cursor protocol observation.
+    /// Enumerates while preserving an invalid-continuation protocol observation.
     pub async fn enumerate_updates_observation(
         &self,
         authority: &CapabilityAuthority,
@@ -720,11 +726,14 @@ impl WebTransportConnection {
             .await?
         {
             EnumerateObservation::Page(page) => Ok(page),
-            EnumerateObservation::InvalidCursor => {
-                Err(io::Error::other("valid tail cursor received invalid-cursor").into())
+            EnumerateObservation::InvalidContinuation => {
+                Err(io::Error::other("valid tail token received invalid continuation").into())
             }
             EnumerateObservation::AuthorizationDenied => {
                 Err(io::Error::other("valid tail request was denied").into())
+            }
+            EnumerateObservation::RetiredDocument => {
+                Err(io::Error::other("valid tail request named a retired document").into())
             }
         }
     }
@@ -735,30 +744,37 @@ impl WebTransportConnection {
         document_id: DocumentId,
         start: EnumerateStart,
     ) -> HarnessResult<EnumerateObservation> {
-        let response = self
-            .exchange(
-                ENUMERATE_UPDATES,
-                encode_enumerate_request(&EnumerateRequest {
-                    authority: authority.clone(),
-                    document_id,
-                    start,
-                })?,
-            )
-            .await?;
+        let request = encode_enumerate_request(&EnumerateRequest {
+            authority: authority.clone(),
+            document_id,
+            start,
+        })
+        .map_err(|error| {
+            io::Error::other(format!("could not encode enumeration request: {error}"))
+        })?;
+        let response = self.exchange(ENUMERATE_UPDATES, request).await?;
         match response.message_type {
-            ENUMERATE_UPDATES_RESPONSE => {
-                Ok(EnumerateObservation::Page(decode_enumerate_response(&response.payload)?))
-            }
+            ENUMERATE_UPDATES_RESPONSE => Ok(EnumerateObservation::Page(
+                decode_enumerate_response(&response.payload).map_err(|error| {
+                    io::Error::other(format!("could not decode enumeration response: {error}"))
+                })?,
+            )),
             UPDATE_ERROR
-                if decode_update_error(&response.payload)? == UpdateErrorCode::InvalidCursor =>
+                if decode_update_error(&response.payload)?
+                    == UpdateErrorCode::InvalidOrExpiredContinuation =>
             {
-                Ok(EnumerateObservation::InvalidCursor)
+                Ok(EnumerateObservation::InvalidContinuation)
             }
             UPDATE_ERROR
                 if decode_update_error(&response.payload)?
                     == UpdateErrorCode::AuthorizationDenied =>
             {
                 Ok(EnumerateObservation::AuthorizationDenied)
+            }
+            UPDATE_ERROR
+                if decode_update_error(&response.payload)? == UpdateErrorCode::RetiredDocument =>
+            {
+                Ok(EnumerateObservation::RetiredDocument)
             }
             _unexpected => Err(io::Error::other("unexpected enumerate response").into()),
         }
