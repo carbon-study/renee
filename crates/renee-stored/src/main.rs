@@ -48,7 +48,8 @@ use store::StoreError;
 use store::{
     CreateAuthorityProvision, DurableUpdateStore, StoreAcceptOutcome, StoreControlOutcome,
     StoreCreateOutcome, StoreEnumerateOutcome, StoreEnumerateStart, StoreReadOutcome,
-    StoreSubscribeOutcome, StoreVectorBackfillOutcome, StoreVectorBackfillStart,
+    StoreRevokePreflight, StoreSubscribeOutcome, StoreVectorBackfillOutcome,
+    StoreVectorBackfillStart,
 };
 use subscription::{
     MAX_UPDATE_SUBSCRIPTIONS_PER_CHANNEL, UpdateSubscription, UpdateSubscriptionEmission,
@@ -56,11 +57,12 @@ use subscription::{
 };
 use tokio::io::AsyncReadExt as _;
 use tokio::net::{TcpListener, TcpStream, tcp::OwnedWriteHalf};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:4434";
 const CONNECTION_EVENT_QUEUE_CAPACITY: usize = 64;
+const MAX_CONNECTIONS: usize = 1_024;
 const SUBSCRIPTION_EMISSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct ConnectionEvent {
@@ -92,14 +94,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     emit_readiness(&format!("READY stored address={local_address}"))?;
 
     let store = Arc::new(Mutex::new(store));
+    // This also bounds connection-owned document-control gate waiters and
+    // temporary gates, rather than letting the accept loop create them without limit.
+    let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut stdin = tokio::io::stdin();
     let mut parent_byte = [0_u8; 1];
     loop {
         tokio::select! {
             connection = listener.accept() => {
                 let (connection, _peer_address) = connection?;
+                let Ok(connection_slot) = Arc::clone(&connection_slots).try_acquire_owned() else {
+                    drop(connection);
+                    continue;
+                };
                 let store = Arc::clone(&store);
                 tokio::spawn(async move {
+                    let _connection_slot = connection_slot;
                     let _connection_result = serve_connection(connection, store).await;
                 });
             }
@@ -576,11 +586,16 @@ async fn with_document_emission_exclusion<Result>(
     store: &Mutex<DurableUpdateStore>,
     document_id: renee_types::DocumentId,
     operation: impl FnOnce(&mut DurableUpdateStore) -> Result,
-) -> Result {
+) -> io::Result<Result> {
     let gate = store.lock().await.document_emission_gate(document_id);
-    let _emission_exclusion = gate.exclude().await;
+    let _emission_exclusion = gate.exclude().await.map_err(|()| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "document control emission exclusion is saturated",
+        )
+    })?;
     let mut locked_store = store.lock().await;
-    operation(&mut locked_store)
+    Ok(operation(&mut locked_store))
 }
 
 fn terminal_subscription_event(
@@ -768,43 +783,64 @@ async fn handle_request(
                     );
                 }
             };
-            let outcome =
-                with_document_emission_exclusion(store, revoke.document_id, |locked_store| {
-                    #[cfg(feature = "conformance")]
-                    {
-                        locked_store.revoke_capability_with_test_barriers(
-                            revoke.document_id,
-                            revoke.issuer.capability_id,
-                            &revoke.issuer.authenticator,
-                            revoke.request_id,
-                            revoke.target_capability_id,
-                            || {
-                                test_barrier::checkpoint("store-revoke-after-authorization")
-                                    .map_err(StoreError::from)
-                            },
-                            || {
-                                test_barrier::checkpoint("store-revoke-before-commit")
-                                    .map_err(StoreError::from)
-                            },
-                            || {
-                                test_barrier::checkpoint("store-revoke-exact-retry")
-                                    .map_err(StoreError::from)
-                            },
-                        )
-                    }
-                    #[cfg(not(feature = "conformance"))]
-                    {
-                        locked_store.revoke_capability(
-                            revoke.document_id,
-                            revoke.issuer.capability_id,
-                            &revoke.issuer.authenticator,
-                            revoke.request_id,
-                            revoke.target_capability_id,
-                        )
-                    }
-                })
+            let preflight = store
+                .lock()
                 .await
+                .preflight_revoke_capability(
+                    revoke.document_id,
+                    revoke.issuer.capability_id,
+                    &revoke.issuer.authenticator,
+                    revoke.request_id,
+                    revoke.target_capability_id,
+                )
                 .map_err(store_error)?;
+            let outcome = match preflight {
+                StoreRevokePreflight::Resolved(outcome) => {
+                    #[cfg(feature = "conformance")]
+                    if outcome == StoreControlOutcome::AlreadyPresent {
+                        test_barrier::checkpoint("store-revoke-exact-retry")?;
+                    }
+                    outcome
+                }
+                StoreRevokePreflight::RequiresMutation => {
+                    with_document_emission_exclusion(store, revoke.document_id, |locked_store| {
+                        #[cfg(feature = "conformance")]
+                        {
+                            locked_store.revoke_capability_with_test_barriers(
+                                revoke.document_id,
+                                revoke.issuer.capability_id,
+                                &revoke.issuer.authenticator,
+                                revoke.request_id,
+                                revoke.target_capability_id,
+                                || {
+                                    test_barrier::checkpoint("store-revoke-after-authorization")
+                                        .map_err(StoreError::from)
+                                },
+                                || {
+                                    test_barrier::checkpoint("store-revoke-before-commit")
+                                        .map_err(StoreError::from)
+                                },
+                                || {
+                                    test_barrier::checkpoint("store-revoke-exact-retry")
+                                        .map_err(StoreError::from)
+                                },
+                            )
+                        }
+                        #[cfg(not(feature = "conformance"))]
+                        {
+                            locked_store.revoke_capability(
+                                revoke.document_id,
+                                revoke.issuer.capability_id,
+                                &revoke.issuer.authenticator,
+                                revoke.request_id,
+                                revoke.target_capability_id,
+                            )
+                        }
+                    })
+                    .await?
+                    .map_err(store_error)?
+                }
+            };
             #[cfg(feature = "conformance")]
             if outcome == StoreControlOutcome::Inserted {
                 test_barrier::checkpoint("store-revoke-after-commit-before-response")?;
@@ -967,14 +1003,13 @@ async fn handle_request(
                 Err(error) => return Err(store_error(error)),
             };
             let page = authorized.page;
-            let updates = page.updates.into_iter().map(|(_sequence, metadata)| metadata).collect();
             response(
                 request,
                 ENUMERATE_UPDATES_RESPONSE,
                 encode_enumerate_response(&EnumerateResponse {
                     has_more: page.has_more,
                     next_cursor: authorized.next_cursor,
-                    updates,
+                    updates: page.updates,
                 })
                 .map_err(codec_error)?,
             )
@@ -1179,7 +1214,10 @@ mod tests {
         Authenticator, CapabilityId, DocumentId, ImmutableUpdate, LoroRange, PublicLoroRanges,
         RequestId, UpdateId,
     };
-    use renee_wire::encode_update_record;
+    use renee_wire::{
+        CapabilityAuthority, RevokeCapabilityRequest, decode_capability_error,
+        encode_revoke_capability_request, encode_update_record,
+    };
     use tokio::io::AsyncReadExt as _;
 
     use super::*;
@@ -1271,12 +1309,41 @@ mod tests {
         assert_eq!(subscription.next().await, UpdateSubscriptionPoll::Notification(update_id),);
         let store = Arc::new(Mutex::new(store));
         let stalled_emission = emission.enter().await;
+        let unauthorized_revoke = Envelope {
+            correlation_id: [0xc0; 16],
+            message_type: REVOKE_CAPABILITY,
+            payload: encode_revoke_capability_request(&RevokeCapabilityRequest {
+                document_id,
+                issuer: CapabilityAuthority {
+                    capability_id,
+                    authenticator: Authenticator::from_bytes([0xff; 32]),
+                },
+                request_id: RequestId::from_bytes([0xc1; 16]),
+                target_capability_id: capability_id,
+            }),
+            version: VERSION,
+        };
+        let unauthorized_response = tokio::time::timeout(
+            Duration::from_millis(50),
+            handle_request(&unauthorized_revoke, &store, &channel),
+        )
+        .await
+        .expect("unauthorized revoke must not wait for document emission")
+        .expect("unauthorized revoke must produce a response");
+        let unauthorized_response =
+            decode_body(&unauthorized_response).expect("response body must decode");
+        assert_eq!(unauthorized_response.message_type, CAPABILITY_ERROR);
+        assert_eq!(
+            decode_capability_error(&unauthorized_response.payload)
+                .expect("capability error must decode"),
+            CapabilityErrorCode::AuthorizationDenied,
+        );
         let waiting_store = Arc::clone(&store);
         let (exclusion_started, exclusion_ready) = oneshot::channel();
         let waiting_exclusion = tokio::spawn(async move {
             let gate = waiting_store.lock().await.document_emission_gate(document_id);
             let _started = exclusion_started.send(());
-            let _exclusion = gate.exclude().await;
+            let _exclusion = gate.exclude().await.expect("control exclusion must be admitted");
         });
         exclusion_ready.await.expect("control task must reach the emission gate");
         let unrelated_document = DocumentId::from_bytes([0xd1; 16]);
@@ -1287,7 +1354,8 @@ mod tests {
             }),
         )
         .await
-        .expect("a stalled document emission must not hold the global store lock");
+        .expect("a stalled document emission must not hold the global store lock")
+        .expect("unrelated exclusion must be admitted");
         assert!(unrelated_channel.is_some(), "unrelated broker work must complete");
         drop(stalled_emission);
         waiting_exclusion.await.expect("waiting exclusion task must finish");
@@ -1329,6 +1397,7 @@ mod tests {
             locked_store.commit_retirement_for_test(document_id)
         })
         .await
+        .expect("retirement exclusion must be admitted")
         .expect("retirement must commit and publish");
         resume_writer.send(()).expect("writer must remain paused");
         let (finished_output, write_result) = writer.await.expect("writer task must finish");

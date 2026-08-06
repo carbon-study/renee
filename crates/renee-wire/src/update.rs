@@ -176,9 +176,9 @@ pub enum EnumerateStart {
 pub struct EnumerateResponse {
     /// Whether another request after the returned cursor can continue.
     pub has_more: bool,
-    /// Opaque cursor after the last returned acceptance.
+    /// Opaque continuation or after-tail token returned with a nonempty page.
     pub next_cursor: Option<Vec<u8>>,
-    /// Public metadata in Renee acceptance order.
+    /// Public metadata in deterministic update-ID order, with no causal or acceptance-order claim.
     pub updates: Vec<UpdateMetadata>,
 }
 

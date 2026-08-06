@@ -1,15 +1,20 @@
 //! Bounded broker-local update notification subscriptions.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 
 use renee_types::{CapabilityId, DocumentId, UpdateId};
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mpsc, watch};
+use tokio::sync::{
+    OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock, Semaphore, mpsc,
+    watch,
+};
 
 pub(crate) const UPDATE_NOTIFICATION_QUEUE_CAPACITY: usize = 8;
 const MAX_UPDATE_SUBSCRIPTIONS: usize = 1_024;
 pub(crate) const MAX_UPDATE_SUBSCRIPTIONS_PER_CHANNEL: usize = 32;
 const MAX_UPDATE_SUBSCRIPTIONS_PER_DOCUMENT: usize = 128;
+const MAX_CONTROL_WAITERS_PER_DOCUMENT: usize = 8;
 
 const ACTIVE: u8 = 0;
 const OVERFLOWED: u8 = 1;
@@ -97,16 +102,29 @@ impl UpdateSubscriptionEmission {
 /// Per-document exclusion shared by final notification writes and control mutations.
 #[derive(Clone)]
 pub(crate) struct DocumentEmissionGate {
+    state: Arc<DocumentEmissionGateState>,
+}
+
+struct DocumentEmissionGateState {
+    control_admission: Arc<Semaphore>,
     lock: Arc<RwLock<()>>,
 }
 
+pub(crate) struct DocumentEmissionExclusion {
+    _admission: OwnedSemaphorePermit,
+    _guard: OwnedRwLockWriteGuard<()>,
+}
+
 impl DocumentEmissionGate {
-    pub async fn exclude(&self) -> OwnedRwLockWriteGuard<()> {
-        Arc::clone(&self.lock).write_owned().await
+    pub async fn exclude(&self) -> Result<DocumentEmissionExclusion, ()> {
+        let admission =
+            Arc::clone(&self.state.control_admission).try_acquire_owned().map_err(|_error| ())?;
+        let guard = Arc::clone(&self.state.lock).write_owned().await;
+        Ok(DocumentEmissionExclusion { _admission: admission, _guard: guard })
     }
 
     async fn read(&self) -> OwnedRwLockReadGuard<()> {
-        Arc::clone(&self.lock).read_owned().await
+        Arc::clone(&self.state.lock).read_owned().await
     }
 }
 
@@ -206,14 +224,9 @@ struct SubscriptionEntry {
     subscription_id: u64,
 }
 
-struct EmissionGateEntry {
-    document_id: DocumentId,
-    gate: Weak<RwLock<()>>,
-}
-
 pub(crate) struct UpdateSubscriptionRegistry {
     broker: Arc<BrokerIdentity>,
-    emission_gates: Vec<EmissionGateEntry>,
+    emission_gates: HashMap<DocumentId, Weak<DocumentEmissionGateState>>,
     next_channel_id: u64,
     next_subscription_id: u64,
     subscriptions: Vec<SubscriptionEntry>,
@@ -223,7 +236,7 @@ impl UpdateSubscriptionRegistry {
     pub fn new() -> Self {
         Self {
             broker: Arc::new(BrokerIdentity),
-            emission_gates: Vec::new(),
+            emission_gates: HashMap::new(),
             next_channel_id: 1,
             next_subscription_id: 1,
             subscriptions: Vec::new(),
@@ -292,18 +305,16 @@ impl UpdateSubscriptionRegistry {
     }
 
     pub fn emission_gate(&mut self, document_id: DocumentId) -> DocumentEmissionGate {
-        self.emission_gates.retain(|entry| entry.gate.strong_count() != 0);
-        if let Some(lock) = self
-            .emission_gates
-            .iter()
-            .find(|entry| entry.document_id == document_id)
-            .and_then(|entry| entry.gate.upgrade())
-        {
-            return DocumentEmissionGate { lock };
+        self.emission_gates.retain(|_document_id, gate| gate.strong_count() != 0);
+        if let Some(state) = self.emission_gates.get(&document_id).and_then(Weak::upgrade) {
+            return DocumentEmissionGate { state };
         }
-        let lock = Arc::new(RwLock::new(()));
-        self.emission_gates.push(EmissionGateEntry { document_id, gate: Arc::downgrade(&lock) });
-        DocumentEmissionGate { lock }
+        let state = Arc::new(DocumentEmissionGateState {
+            control_admission: Arc::new(Semaphore::new(MAX_CONTROL_WAITERS_PER_DOCUMENT)),
+            lock: Arc::new(RwLock::new(())),
+        });
+        self.emission_gates.insert(document_id, Arc::downgrade(&state));
+        DocumentEmissionGate { state }
     }
 
     pub fn contexts(&self, document_id: DocumentId) -> Vec<SubscriptionContext> {
@@ -461,5 +472,23 @@ mod tests {
             subscription.next().await,
             UpdateSubscriptionPoll::Invalidated(UpdateSubscriptionEnd::ChannelLost)
         );
+    }
+
+    #[tokio::test]
+    async fn document_control_exclusion_admission_is_bounded() {
+        let mut registry = UpdateSubscriptionRegistry::new();
+        let gate = registry.emission_gate(DocumentId::from_bytes([3; 16]));
+        let mut permits = Vec::new();
+        for _ in 0..MAX_CONTROL_WAITERS_PER_DOCUMENT {
+            permits.push(
+                Arc::clone(&gate.state.control_admission)
+                    .try_acquire_owned()
+                    .expect("configured control admission must be available"),
+            );
+        }
+
+        assert!(gate.exclude().await.is_err(), "one document must reject excess waiters");
+        drop(permits);
+        let _exclusion = gate.exclude().await.expect("released admission must be reusable");
     }
 }

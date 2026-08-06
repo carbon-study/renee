@@ -131,8 +131,9 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
         return Err(io::Error::other("document-scoped identity was not preserved").into());
     }
 
-    // Capture the cursor before accepting a lexically lower update ID. This
-    // is the case update-ID pagination skipped permanently.
+    // Capture the terminal anchor before accepting a lexically lower update
+    // ID. Snapshot membership is acceptance-bounded even though each pass is
+    // publicly paginated in deterministic, non-semantic update-ID order.
     let first_page =
         connection.enumerate_updates(&first_root.root, first.document_id(), None).await?;
     if first_page.updates != vec![expected_metadata(&first)] {
@@ -162,20 +163,15 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
         .into());
     }
 
-    let terminal_sequence = model
-        .high_water_sequence(first.document_id())
-        .ok_or_else(|| io::Error::other("model omitted the enumeration high-water sequence"))?;
-    let expected_page = model
-        .enumerate(first.document_id(), None, terminal_sequence)
-        .map(|(_sequence, metadata)| metadata)
-        .collect::<Vec<_>>();
+    let expected_page = vec![expected_metadata(&later), expected_metadata(&first)];
     let observed_page =
         connection.enumerate_updates(&first_root.root, first.document_id(), None).await?;
     if observed_page.has_more || observed_page.updates != expected_page {
-        return Err(io::Error::other("model and subject disagreed on enumeration").into());
-    }
-    if observed_page.updates != vec![expected_metadata(&first), expected_metadata(&later)] {
-        return Err(io::Error::other("enumeration exposed wrong public metadata").into());
+        return Err(io::Error::other(format!(
+            "subject enumeration did not use update-ID order: expected {expected_page:?}, observed {:?}",
+            observed_page.updates,
+        ))
+        .into());
     }
     let later_cursor = observed_page
         .next_cursor
@@ -314,7 +310,7 @@ async fn acknowledged_update_survives_store_restart() -> HarnessResult<()> {
     }
     let restarted =
         recovered.enumerate_updates(&accepted_root.root, accepted.document_id(), None).await?;
-    if restarted.updates != vec![expected_metadata(&accepted), expected_metadata(&later)] {
+    if restarted.updates != vec![expected_metadata(&later), expected_metadata(&accepted)] {
         return Err(io::Error::other("origin restart omitted durable history").into());
     }
 

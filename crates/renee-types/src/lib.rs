@@ -55,8 +55,9 @@ identifier!(CheckpointId, "An opaque checkpoint identifier scoped to one documen
 
 /// Renee-owned document-scoped first-acceptance position.
 ///
-/// This value exists only for finite-read pagination. It is not Loro, causal,
-/// authored, or application order and is never exposed as update metadata.
+/// This value exists only in private storage and reference-model indexing. It
+/// is not Loro, causal, authored, or application order and is never exposed by
+/// the wire protocol or as update metadata.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AcceptanceSequence(u64);
 
@@ -66,19 +67,19 @@ impl AcceptanceSequence {
     /// First accepted update in one document.
     pub const FIRST: Self = Self(1);
 
-    /// Reconstructs a sequence from its canonical network-order storage representation.
+    /// Reconstructs a sequence from its canonical big-endian storage representation.
     #[expect(
         clippy::big_endian_bytes,
-        reason = "acceptance sequences use canonical network order in storage and on the wire"
+        reason = "acceptance sequences use canonical big-endian order in private storage"
     )]
     pub const fn from_be_bytes(bytes: [u8; 8]) -> Self {
         Self(u64::from_be_bytes(bytes))
     }
 
-    /// Returns the canonical network-order `SQLite`/wire representation.
+    /// Returns the canonical big-endian `SQLite` representation.
     #[expect(
         clippy::big_endian_bytes,
-        reason = "acceptance sequences use canonical network order in storage and on the wire"
+        reason = "acceptance sequences use canonical big-endian order in private storage"
     )]
     pub const fn to_be_bytes(self) -> [u8; 8] {
         self.0.to_be_bytes()

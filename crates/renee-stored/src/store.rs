@@ -327,6 +327,15 @@ pub enum StoreControlOutcome {
     LimitExceeded,
 }
 
+/// Read-only classification used before entering document emission exclusion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreRevokePreflight {
+    /// Authentication, retry, conflict, or limit state already determines the response.
+    Resolved(StoreControlOutcome),
+    /// The request may insert a revocation and must be revalidated under exclusion.
+    RequiresMutation,
+}
+
 /// Operator-provisioned deployment creation verifier material.
 #[derive(Clone, Copy)]
 pub struct CreateAuthorityProvision {
@@ -338,15 +347,15 @@ pub struct CreateAuthorityProvision {
     pub receipt_verifier: [u8; verifier::VERIFIER_LENGTH],
 }
 
-/// One bounded page in Renee acceptance order.
+/// One bounded page in deterministic, non-semantic update-ID order.
 #[derive(Clone)]
 pub struct StoredUpdatePage {
     /// Whether another row exists after this page.
     pub has_more: bool,
-    /// Last returned sequence, if any.
-    pub last_sequence: Option<AcceptanceSequence>,
-    /// Public metadata paired with internal sequence positions.
-    pub updates: Vec<(AcceptanceSequence, UpdateMetadata)>,
+    /// Last returned update ID, if any, retained only in server-side pass state.
+    pub last_update_id: Option<UpdateId>,
+    /// Public metadata in deterministic update-ID order.
+    pub updates: Vec<UpdateMetadata>,
 }
 
 /// One bounded scan window from a stable vector-backfill pass.
@@ -472,6 +481,7 @@ struct EnumerationPass {
     document_id: DocumentId,
     expires_at: Instant,
     generation: [u8; STORE_GENERATION_LENGTH],
+    lower_sequence_exclusive: AcceptanceSequence,
     retry: Option<EnumerationPassRetry>,
     terminal_sequence: AcceptanceSequence,
 }
@@ -485,7 +495,7 @@ enum EnumerationTokenMode {
 #[derive(Clone, Copy)]
 struct EnumerationPassPosition {
     mode: EnumerationTokenMode,
-    position: AcceptanceSequence,
+    last_update_id: UpdateId,
     token: [u8; ENUMERATION_CONTINUATION_LENGTH],
 }
 
@@ -1342,6 +1352,66 @@ impl DurableUpdateStore {
         )
     }
 
+    /// Classifies a revoke without taking the document's final-emission gate.
+    ///
+    /// `RequiresMutation` is deliberately only a hint. The caller must invoke
+    /// `revoke_capability` while holding document emission exclusion, which
+    /// repeats every authorization, conflict, and limit check atomically.
+    pub fn preflight_revoke_capability(
+        &mut self,
+        document_id: DocumentId,
+        issuer_capability_id: CapabilityId,
+        issuer_authenticator: &Authenticator,
+        request_id: RequestId,
+        target_capability_id: CapabilityId,
+    ) -> Result<StoreRevokePreflight, StoreError> {
+        let normalized_input = target_capability_id.into_bytes();
+        let transaction =
+            self.connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        if let Some(outcome) = resolve_control_receipt(
+            &transaction,
+            document_id,
+            issuer_capability_id,
+            issuer_authenticator,
+            request_id,
+            1,
+            &normalized_input,
+        )? {
+            return Ok(StoreRevokePreflight::Resolved(outcome));
+        }
+        if !authorize(
+            &transaction,
+            document_id,
+            issuer_capability_id,
+            issuer_authenticator,
+            Operation::Revoke,
+        )? {
+            return Ok(StoreRevokePreflight::Resolved(StoreControlOutcome::AuthorizationDenied));
+        }
+        if next_control_revision(&transaction, document_id)?.is_none() {
+            return Ok(StoreRevokePreflight::Resolved(StoreControlOutcome::CounterExhausted));
+        }
+        if !is_active_descendant(
+            &transaction,
+            document_id,
+            issuer_capability_id,
+            target_capability_id,
+        )? {
+            return Ok(StoreRevokePreflight::Resolved(StoreControlOutcome::AuthorizationDenied));
+        }
+        if control_limits_exceeded(
+            &transaction,
+            document_id,
+            None,
+            false,
+            0,
+            normalized_input.len(),
+        )? {
+            return Ok(StoreRevokePreflight::Resolved(StoreControlOutcome::LimitExceeded));
+        }
+        Ok(StoreRevokePreflight::RequiresMutation)
+    }
+
     /// Exposes daemon-owned barriers around revoke authorization and commit.
     #[cfg(feature = "conformance")]
     #[expect(
@@ -1391,19 +1461,6 @@ impl DurableUpdateStore {
         #[cfg(feature = "conformance")] before_exact_retry: impl FnOnce() -> Result<(), StoreError>,
     ) -> Result<StoreControlOutcome, StoreError> {
         let normalized_input = target_capability_id.into_bytes();
-        let subscription_contexts = self.subscriptions.contexts(document_id);
-        let pass_contexts = self
-            .enumeration_passes
-            .iter()
-            .filter(|pass| pass.document_id == document_id)
-            .map(|pass| pass.capability_id)
-            .chain(
-                self.vector_passes
-                    .iter()
-                    .filter(|pass| pass.document_id == document_id)
-                    .map(|pass| pass.capability_id),
-            )
-            .collect::<Vec<_>>();
         let transaction =
             self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(outcome) = resolve_control_receipt(
@@ -1453,6 +1510,19 @@ impl DurableUpdateStore {
         )? {
             return Ok(StoreControlOutcome::LimitExceeded);
         }
+        let subscription_contexts = self.subscriptions.contexts(document_id);
+        let pass_contexts = self
+            .enumeration_passes
+            .iter()
+            .filter(|pass| pass.document_id == document_id)
+            .map(|pass| pass.capability_id)
+            .chain(
+                self.vector_passes
+                    .iter()
+                    .filter(|pass| pass.document_id == document_id)
+                    .map(|pass| pass.capability_id),
+            )
+            .collect::<Vec<_>>();
         let mut revoked_subscription_ids = Vec::new();
         for context in subscription_contexts {
             if is_descendant_or_self(
@@ -1727,9 +1797,10 @@ impl DurableUpdateStore {
                     document_id,
                     AcceptanceSequence::ORIGIN,
                     terminal_sequence,
+                    None,
                     metadata_byte_limit,
                 )?;
-                let Some(position) = page.last_sequence else {
+                let Some(last_update_id) = page.last_update_id else {
                     return Err(StoreError::Corrupt(
                         "nonempty enumeration snapshot produced no first record",
                     ));
@@ -1757,10 +1828,11 @@ impl DurableUpdateStore {
                 self.enumeration_passes.push(EnumerationPass {
                     capability_id,
                     channel_id,
-                    current: EnumerationPassPosition { mode, position, token },
+                    current: EnumerationPassPosition { mode, last_update_id, token },
                     document_id,
                     expires_at: now + ENUMERATION_PASS_IDLE_TTL,
                     generation: self.generation,
+                    lower_sequence_exclusive: AcceptanceSequence::ORIGIN,
                     retry: None,
                     terminal_sequence,
                 });
@@ -1804,33 +1876,40 @@ impl DurableUpdateStore {
                 if current.token != token || current.mode != requested_mode {
                     return Ok(StoreEnumerateOutcome::InvalidContinuation);
                 }
-                let terminal_sequence = match requested_mode {
-                    EnumerationTokenMode::Continue => pass.terminal_sequence,
-                    EnumerationTokenMode::AfterTail => {
-                        let Some(high_water) = high_water_sequence_in(&transaction, document_id)?
-                        else {
-                            return Ok(StoreEnumerateOutcome::InvalidContinuation);
-                        };
-                        if high_water < current.position {
-                            return Ok(StoreEnumerateOutcome::InvalidContinuation);
+                let (lower_sequence_exclusive, terminal_sequence, last_update_id) =
+                    match requested_mode {
+                        EnumerationTokenMode::Continue => (
+                            pass.lower_sequence_exclusive,
+                            pass.terminal_sequence,
+                            Some(current.last_update_id),
+                        ),
+                        EnumerationTokenMode::AfterTail => {
+                            let Some(high_water) =
+                                high_water_sequence_in(&transaction, document_id)?
+                            else {
+                                return Ok(StoreEnumerateOutcome::InvalidContinuation);
+                            };
+                            if high_water < pass.terminal_sequence {
+                                return Ok(StoreEnumerateOutcome::InvalidContinuation);
+                            }
+                            if high_water == pass.terminal_sequence {
+                                transaction.commit()?;
+                                return Ok(StoreEnumerateOutcome::Authorized(
+                                    AuthorizedStoredUpdatePage {
+                                        next_cursor: None,
+                                        page: empty_stored_update_page(),
+                                    },
+                                ));
+                            }
+                            (pass.terminal_sequence, high_water, None)
                         }
-                        if high_water == current.position {
-                            transaction.commit()?;
-                            return Ok(StoreEnumerateOutcome::Authorized(
-                                AuthorizedStoredUpdatePage {
-                                    next_cursor: None,
-                                    page: empty_stored_update_page(),
-                                },
-                            ));
-                        }
-                        high_water
-                    }
-                };
+                    };
                 let page = match enumerate_in(
                     &transaction,
                     document_id,
-                    current.position,
+                    lower_sequence_exclusive,
                     terminal_sequence,
+                    last_update_id,
                     metadata_byte_limit,
                 ) {
                     Ok(page) => page,
@@ -1840,7 +1919,7 @@ impl DurableUpdateStore {
                     }
                     Err(error) => return Err(error),
                 };
-                let Some(next_position) = page.last_sequence else {
+                let Some(next_update_id) = page.last_update_id else {
                     return Err(StoreError::Corrupt(
                         "advancing enumeration pass produced no record",
                     ));
@@ -1861,10 +1940,11 @@ impl DurableUpdateStore {
                 let mutable_pass = &mut self.enumeration_passes[pass_index];
                 mutable_pass.current = EnumerationPassPosition {
                     mode: next_mode,
-                    position: next_position,
+                    last_update_id: next_update_id,
                     token: next_token,
                 };
                 mutable_pass.expires_at = Instant::now() + ENUMERATION_PASS_IDLE_TTL;
+                mutable_pass.lower_sequence_exclusive = lower_sequence_exclusive;
                 mutable_pass.retry = Some(EnumerationPassRetry {
                     mode: requested_mode,
                     response: response.clone(),
@@ -2269,15 +2349,94 @@ fn high_water_sequence_in(
 fn enumerate_in(
     connection: &Connection,
     document_id: DocumentId,
-    position: AcceptanceSequence,
+    lower_sequence_exclusive: AcceptanceSequence,
     terminal_sequence: AcceptanceSequence,
+    after_update_id: Option<UpdateId>,
     metadata_byte_limit: usize,
 ) -> Result<StoredUpdatePage, StoreError> {
     let document_bytes = document_id.into_bytes();
-    if terminal_sequence == AcceptanceSequence::ORIGIN || position > terminal_sequence {
+    let after_update_bytes = validate_enumeration_window(
+        connection,
+        document_id,
+        lower_sequence_exclusive,
+        terminal_sequence,
+        after_update_id,
+    )?;
+    let row_limit = i64::try_from(MAX_ENUMERATION_SCAN_RECORDS + 1)
+        .map_err(|_error| StoreError::Corrupt("enumeration scan bound cannot fit SQLite"))?;
+    let mut statement = connection.prepare(
+        "SELECT update_id, encoded_record
+         FROM updates
+         WHERE document_id = ?1
+           AND acceptance_sequence > ?2
+           AND acceptance_sequence <= ?3
+           AND (?4 IS NULL OR update_id > ?4)
+         ORDER BY update_id
+         LIMIT ?5",
+    )?;
+    let mut rows = statement.query(params![
+        document_bytes.as_slice(),
+        lower_sequence_exclusive.to_be_bytes().as_slice(),
+        terminal_sequence.to_be_bytes().as_slice(),
+        after_update_bytes.as_ref().map(<[u8; IDENTIFIER_LENGTH]>::as_slice),
+        row_limit,
+    ])?;
+    let mut used = 0_usize;
+    let mut updates = Vec::new();
+    let mut page_last_update_id = None;
+    let mut scanned = 0_usize;
+    let mut has_more = false;
+    while let Some(row) = rows.next()? {
+        if scanned == MAX_ENUMERATION_SCAN_RECORDS {
+            has_more = true;
+            break;
+        }
+        let indexed_update_id =
+            UpdateId::from_bytes(decode_identifier(&row.get::<_, Vec<u8>>(0)?)?);
+        let record = row.get::<_, Vec<u8>>(1)?;
+        let update = decode_update_record(&record)
+            .map_err(|_error| StoreError::Corrupt("stored update record is invalid"))?;
+        if update.document_id() != document_id {
+            return Err(StoreError::Corrupt("stored update document disagrees with index"));
+        }
+        if update.update_id() != indexed_update_id {
+            return Err(StoreError::Corrupt("stored update identifier disagrees with index"));
+        }
+        let metadata = metadata(&update)?;
+        let encoded_length = metadata_encoded_length(&metadata)
+            .map_err(|_error| StoreError::Corrupt("stored metadata cannot be encoded"))?;
+        let Some(next_used) = used.checked_add(encoded_length) else {
+            has_more = true;
+            break;
+        };
+        if next_used > metadata_byte_limit {
+            has_more = true;
+            break;
+        }
+        used = next_used;
+        page_last_update_id = Some(indexed_update_id);
+        updates.push(metadata);
+        scanned = scanned
+            .checked_add(1)
+            .ok_or(StoreError::Corrupt("enumeration scan count overflowed"))?;
+    }
+    Ok(StoredUpdatePage { has_more, last_update_id: page_last_update_id, updates })
+}
+
+fn validate_enumeration_window(
+    connection: &Connection,
+    document_id: DocumentId,
+    lower_sequence_exclusive: AcceptanceSequence,
+    terminal_sequence: AcceptanceSequence,
+    after_update_id: Option<UpdateId>,
+) -> Result<Option<[u8; IDENTIFIER_LENGTH]>, StoreError> {
+    let document_bytes = document_id.into_bytes();
+    if terminal_sequence == AcceptanceSequence::ORIGIN
+        || lower_sequence_exclusive > terminal_sequence
+    {
         return Err(StoreError::InvalidCursor);
     }
-    for sequence in [position, terminal_sequence] {
+    for sequence in [lower_sequence_exclusive, terminal_sequence] {
         if sequence == AcceptanceSequence::ORIGIN {
             continue;
         }
@@ -2294,63 +2453,34 @@ fn enumerate_in(
             return Err(StoreError::InvalidCursor);
         }
     }
-    let row_limit = i64::try_from(MAX_ENUMERATION_SCAN_RECORDS + 1)
-        .map_err(|_error| StoreError::Corrupt("enumeration scan bound cannot fit SQLite"))?;
-    let mut statement = connection.prepare(
-        "SELECT acceptance_sequence, encoded_record
-         FROM updates
-         WHERE document_id = ?1
-           AND acceptance_sequence > ?2
-           AND acceptance_sequence <= ?3
-         ORDER BY acceptance_sequence
-         LIMIT ?4",
-    )?;
-    let mut rows = statement.query(params![
-        document_bytes.as_slice(),
-        position.to_be_bytes().as_slice(),
-        terminal_sequence.to_be_bytes().as_slice(),
-        row_limit,
-    ])?;
-    let mut used = 0_usize;
-    let mut updates = Vec::new();
-    let mut last_sequence = None;
-    let mut scanned = 0_usize;
-    let mut has_more = false;
-    while let Some(row) = rows.next()? {
-        if scanned == MAX_ENUMERATION_SCAN_RECORDS {
-            has_more = true;
-            break;
+    let after_update_bytes = after_update_id.map(UpdateId::into_bytes);
+    if let Some(after_update_bytes) = after_update_bytes {
+        let position_exists = connection
+            .query_row(
+                "SELECT 1 FROM updates
+                 WHERE document_id = ?1
+                   AND acceptance_sequence > ?2
+                   AND acceptance_sequence <= ?3
+                   AND update_id = ?4",
+                params![
+                    document_bytes.as_slice(),
+                    lower_sequence_exclusive.to_be_bytes().as_slice(),
+                    terminal_sequence.to_be_bytes().as_slice(),
+                    after_update_bytes.as_slice(),
+                ],
+                |_row| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !position_exists {
+            return Err(StoreError::InvalidCursor);
         }
-        let sequence = decode_sequence(&row.get::<_, Vec<u8>>(0)?)?;
-        let record = row.get::<_, Vec<u8>>(1)?;
-        let update = decode_update_record(&record)
-            .map_err(|_error| StoreError::Corrupt("stored update record is invalid"))?;
-        if update.document_id() != document_id {
-            return Err(StoreError::Corrupt("stored update document disagrees with index"));
-        }
-        let metadata = metadata(&update)?;
-        let encoded_length = metadata_encoded_length(&metadata)
-            .map_err(|_error| StoreError::Corrupt("stored metadata cannot be encoded"))?;
-        let Some(next_used) = used.checked_add(encoded_length) else {
-            has_more = true;
-            break;
-        };
-        if next_used > metadata_byte_limit {
-            has_more = true;
-            break;
-        }
-        used = next_used;
-        last_sequence = Some(sequence);
-        updates.push((sequence, metadata));
-        scanned = scanned
-            .checked_add(1)
-            .ok_or(StoreError::Corrupt("enumeration scan count overflowed"))?;
     }
-    Ok(StoredUpdatePage { has_more, last_sequence, updates })
+    Ok(after_update_bytes)
 }
 
 fn empty_stored_update_page() -> StoredUpdatePage {
-    StoredUpdatePage { has_more: false, last_sequence: None, updates: Vec::new() }
+    StoredUpdatePage { has_more: false, last_update_id: None, updates: Vec::new() }
 }
 
 fn can_admit_enumeration_pass(
@@ -3585,7 +3715,9 @@ mod tests {
             fixture_update_for(document_id, 0x26),
             fixture_update_for(document_id, 0x27),
         ];
-        for update in &updates {
+        // Acceptance order deliberately differs from the public, non-semantic
+        // update-ID order used inside this stable snapshot.
+        for update in [&updates[2], &updates[0], &updates[1]] {
             let encoded = encode_update_record(update).expect("fixture update must encode");
             assert_eq!(
                 store
@@ -3610,7 +3742,7 @@ mod tests {
             panic!("read-authorized origin must succeed");
         };
         assert!(first.page.has_more);
-        assert_eq!(first.page.updates[0].1.update_id, updates[0].update_id());
+        assert_eq!(first.page.updates[0].update_id, updates[0].update_id());
         let first_token = first.next_cursor.expect("nonempty page must return a token");
         assert_eq!(first_token.len(), ENUMERATION_CONTINUATION_LENGTH);
         assert_eq!(store.enumeration_passes.len(), 1);
@@ -3709,7 +3841,7 @@ mod tests {
         else {
             panic!("continuation must remain authorized");
         };
-        assert_eq!(second.page.updates[0].1.update_id, updates[1].update_id());
+        assert_eq!(second.page.updates[0].update_id, updates[1].update_id());
         let second_token = second.next_cursor.clone().expect("second page must return a token");
         let StoreEnumerateOutcome::Authorized(second_retry) = store
             .enumerate_authorized(
@@ -3725,7 +3857,7 @@ mod tests {
             panic!("exact retry must remain authorized");
         };
         assert_eq!(second_retry.next_cursor, second.next_cursor);
-        assert_eq!(second_retry.page.updates[0].1.update_id, updates[1].update_id());
+        assert_eq!(second_retry.page.updates[0].update_id, updates[1].update_id());
         assert_eq!(store.enumeration_passes.len(), 1);
 
         let StoreEnumerateOutcome::Authorized(terminal) = store
@@ -3742,7 +3874,7 @@ mod tests {
             panic!("terminal continuation must remain authorized");
         };
         assert!(!terminal.page.has_more);
-        assert_eq!(terminal.page.updates[0].1.update_id, updates[2].update_id());
+        assert_eq!(terminal.page.updates[0].update_id, updates[2].update_id());
         let tail_token = terminal.next_cursor.clone().expect("terminal page must return a tail");
         let StoreEnumerateOutcome::Authorized(terminal_retry) = store
             .enumerate_authorized(
@@ -3758,7 +3890,7 @@ mod tests {
             panic!("terminal retry must remain authorized");
         };
         assert_eq!(terminal_retry.next_cursor, terminal.next_cursor);
-        assert_eq!(terminal_retry.page.updates[0].1.update_id, updates[2].update_id());
+        assert_eq!(terminal_retry.page.updates[0].update_id, updates[2].update_id());
 
         let StoreEnumerateOutcome::Authorized(after_tail) = store
             .enumerate_authorized(
@@ -3773,7 +3905,7 @@ mod tests {
         else {
             panic!("after-tail pass must remain authorized");
         };
-        assert_eq!(after_tail.page.updates[0].1.update_id, accepted_after_snapshot.update_id(),);
+        assert_eq!(after_tail.page.updates[0].update_id, accepted_after_snapshot.update_id(),);
         assert!(!after_tail.page.has_more);
         assert_eq!(store.enumeration_passes.len(), 1);
     }
@@ -4276,6 +4408,101 @@ mod tests {
                 .expect("revoked continuation must resolve"),
             StoreVectorBackfillOutcome::AuthorizationDenied,
         ));
+    }
+
+    #[test]
+    fn revoke_preflight_rejects_non_mutations_before_emission_exclusion() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let document_id = DocumentId::from_bytes([0x31; IDENTIFIER_LENGTH]);
+        let root_capability = CapabilityId::from_bytes([0x32; IDENTIFIER_LENGTH]);
+        let root_authenticator = Authenticator::from_bytes([0x33; 32]);
+        let child_capability = CapabilityId::from_bytes([0x34; IDENTIFIER_LENGTH]);
+        let child_authenticator = Authenticator::from_bytes([0x35; 32]);
+        let request_id = RequestId::from_bytes([0x36; IDENTIFIER_LENGTH]);
+        let mut store = open_store(&database);
+        create_fixture_document(
+            &mut store,
+            document_id,
+            root_capability,
+            &root_authenticator,
+            0x37,
+        );
+        assert_eq!(
+            store
+                .grant_capability(
+                    document_id,
+                    root_capability,
+                    &root_authenticator,
+                    RequestId::from_bytes([0x38; IDENTIFIER_LENGTH]),
+                    child_capability,
+                    &child_authenticator,
+                    OperationSet::one(Operation::Read),
+                )
+                .expect("child grant must commit"),
+            StoreControlOutcome::Inserted,
+        );
+
+        assert_eq!(
+            store
+                .preflight_revoke_capability(
+                    document_id,
+                    root_capability,
+                    &Authenticator::from_bytes([0xff; 32]),
+                    request_id,
+                    child_capability,
+                )
+                .expect("unauthorized preflight must resolve"),
+            StoreRevokePreflight::Resolved(StoreControlOutcome::AuthorizationDenied),
+        );
+        assert_eq!(
+            store
+                .preflight_revoke_capability(
+                    DocumentId::from_bytes([0xee; IDENTIFIER_LENGTH]),
+                    root_capability,
+                    &root_authenticator,
+                    request_id,
+                    child_capability,
+                )
+                .expect("unknown-document preflight must resolve"),
+            StoreRevokePreflight::Resolved(StoreControlOutcome::AuthorizationDenied),
+        );
+        assert_eq!(
+            store
+                .preflight_revoke_capability(
+                    document_id,
+                    root_capability,
+                    &root_authenticator,
+                    request_id,
+                    child_capability,
+                )
+                .expect("authorized preflight must resolve"),
+            StoreRevokePreflight::RequiresMutation,
+        );
+        assert_eq!(
+            store
+                .revoke_capability(
+                    document_id,
+                    root_capability,
+                    &root_authenticator,
+                    request_id,
+                    child_capability,
+                )
+                .expect("revocation must commit"),
+            StoreControlOutcome::Inserted,
+        );
+        assert_eq!(
+            store
+                .preflight_revoke_capability(
+                    document_id,
+                    root_capability,
+                    &root_authenticator,
+                    request_id,
+                    child_capability,
+                )
+                .expect("exact retry preflight must resolve"),
+            StoreRevokePreflight::Resolved(StoreControlOutcome::AlreadyPresent),
+        );
     }
 
     #[test]
