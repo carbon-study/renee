@@ -25,7 +25,7 @@ use rusqlite::{
 };
 
 pub use crate::subscription::{BrokerChannel, UpdateSubscription, UpdateSubscriptionEnd};
-use crate::subscription::{RegisterError, UpdateSubscriptionRegistry};
+use crate::subscription::{DocumentEmissionGate, RegisterError, UpdateSubscriptionRegistry};
 use crate::verifier;
 
 const SCHEMA_VERSION: u32 = 4;
@@ -738,6 +738,14 @@ impl DurableUpdateStore {
     /// Opens one unforgeable broker-local channel lease.
     pub fn open_broker_channel(&mut self) -> Option<BrokerChannel> {
         self.subscriptions.open_channel()
+    }
+
+    /// Returns the stable per-document gate used to exclude final notification emission.
+    pub(crate) fn document_emission_gate(
+        &mut self,
+        document_id: DocumentId,
+    ) -> DocumentEmissionGate {
+        self.subscriptions.emission_gate(document_id)
     }
 
     /// Authorizes and installs one document-scoped update subscription.

@@ -403,7 +403,7 @@ pub fn generate() -> Result<String, GenerateError> {
             encode_vector_backfill_response(&VectorBackfillResponse {
                 has_more: true,
                 next_cursor: Some(vector_cursor),
-                updates: vec![metadata],
+                updates: vec![metadata.clone()],
             })?,
         )?,
         frame(
@@ -567,12 +567,39 @@ pub fn generate() -> Result<String, GenerateError> {
         )?,
     });
     invalid_payloads.push(InvalidPayloadVector {
+        expected_error: "enumeration-pagination-state",
+        frame: frame(
+            "enumerate.response.more-without-cursor",
+            "enumerate",
+            ENUMERATE_UPDATES_RESPONSE,
+            0x66,
+            vec![1, 0, 0, 0, 0],
+        )?,
+    });
+    let valid_terminal = encode_enumerate_response(&EnumerateResponse {
+        has_more: false,
+        next_cursor: Some(vec![0x69; 32]),
+        updates: vec![metadata],
+    })?;
+    let mut nonempty_terminal_without_cursor = vec![0, 0, 0];
+    nonempty_terminal_without_cursor.extend_from_slice(&valid_terminal[35..]);
+    invalid_payloads.push(InvalidPayloadVector {
+        expected_error: "enumeration-pagination-state",
+        frame: frame(
+            "enumerate.response.nonempty-terminal-without-cursor",
+            "enumerate",
+            ENUMERATE_UPDATES_RESPONSE,
+            0x67,
+            nonempty_terminal_without_cursor,
+        )?,
+    });
+    invalid_payloads.push(InvalidPayloadVector {
         expected_error: "vector-pagination-state",
         frame: frame(
             "vector-backfill.response.more-without-cursor",
             "vector-backfill",
             VECTOR_BACKFILL_RESPONSE,
-            0x66,
+            0x68,
             vec![1, 0, 0, 0, 0],
         )?,
     });
@@ -585,7 +612,7 @@ pub fn generate() -> Result<String, GenerateError> {
             "vector-backfill.response.terminal-with-cursor",
             "vector-backfill",
             VECTOR_BACKFILL_RESPONSE,
-            0x67,
+            0x69,
             terminal_with_cursor,
         )?,
     });

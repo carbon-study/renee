@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 
 use renee_types::{CapabilityId, DocumentId, UpdateId};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mpsc, watch};
 
 pub(crate) const UPDATE_NOTIFICATION_QUEUE_CAPACITY: usize = 8;
 const MAX_UPDATE_SUBSCRIPTIONS: usize = 1_024;
@@ -71,20 +71,42 @@ pub enum UpdateSubscriptionPoll {
 pub struct UpdateSubscription {
     channel: Weak<ChannelLease>,
     channel_loss: watch::Receiver<()>,
+    emission_gate: DocumentEmissionGate,
     receiver: mpsc::Receiver<UpdateId>,
     state: Arc<AtomicU8>,
 }
 
-/// Cloneable final-emission authority checked while the store lock is held.
+/// Cloneable final-emission authority checked at the actual boundary write.
 #[derive(Clone)]
 pub(crate) struct UpdateSubscriptionEmission {
     channel: Weak<ChannelLease>,
+    gate: DocumentEmissionGate,
     state: Arc<AtomicU8>,
 }
 
 impl UpdateSubscriptionEmission {
+    pub async fn enter(&self) -> OwnedRwLockReadGuard<()> {
+        self.gate.read().await
+    }
+
     pub fn is_authorized(&self) -> bool {
         self.channel.upgrade().is_some() && self.state.load(Ordering::Acquire) == ACTIVE
+    }
+}
+
+/// Per-document exclusion shared by final notification writes and control mutations.
+#[derive(Clone)]
+pub(crate) struct DocumentEmissionGate {
+    lock: Arc<RwLock<()>>,
+}
+
+impl DocumentEmissionGate {
+    pub async fn exclude(&self) -> OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.lock).write_owned().await
+    }
+
+    async fn read(&self) -> OwnedRwLockReadGuard<()> {
+        Arc::clone(&self.lock).read_owned().await
     }
 }
 
@@ -93,6 +115,7 @@ impl UpdateSubscription {
     pub(crate) fn emission(&self) -> UpdateSubscriptionEmission {
         UpdateSubscriptionEmission {
             channel: Weak::clone(&self.channel),
+            gate: self.emission_gate.clone(),
             state: Arc::clone(&self.state),
         }
     }
@@ -183,8 +206,14 @@ struct SubscriptionEntry {
     subscription_id: u64,
 }
 
+struct EmissionGateEntry {
+    document_id: DocumentId,
+    gate: Weak<RwLock<()>>,
+}
+
 pub(crate) struct UpdateSubscriptionRegistry {
     broker: Arc<BrokerIdentity>,
+    emission_gates: Vec<EmissionGateEntry>,
     next_channel_id: u64,
     next_subscription_id: u64,
     subscriptions: Vec<SubscriptionEntry>,
@@ -194,6 +223,7 @@ impl UpdateSubscriptionRegistry {
     pub fn new() -> Self {
         Self {
             broker: Arc::new(BrokerIdentity),
+            emission_gates: Vec::new(),
             next_channel_id: 1,
             next_subscription_id: 1,
             subscriptions: Vec::new(),
@@ -243,6 +273,7 @@ impl UpdateSubscriptionRegistry {
             self.next_subscription_id.checked_add(1).ok_or(RegisterError::Backpressure)?;
         let (sender, receiver) = mpsc::channel(UPDATE_NOTIFICATION_QUEUE_CAPACITY);
         let state = Arc::new(AtomicU8::new(ACTIVE));
+        let emission_gate = self.emission_gate(document_id);
         self.subscriptions.push(SubscriptionEntry {
             capability_id,
             channel: Arc::downgrade(&channel.lease),
@@ -254,9 +285,25 @@ impl UpdateSubscriptionRegistry {
         Ok(UpdateSubscription {
             channel: Arc::downgrade(&channel.lease),
             channel_loss: channel.lease.loss.subscribe(),
+            emission_gate,
             receiver,
             state,
         })
+    }
+
+    pub fn emission_gate(&mut self, document_id: DocumentId) -> DocumentEmissionGate {
+        self.emission_gates.retain(|entry| entry.gate.strong_count() != 0);
+        if let Some(lock) = self
+            .emission_gates
+            .iter()
+            .find(|entry| entry.document_id == document_id)
+            .and_then(|entry| entry.gate.upgrade())
+        {
+            return DocumentEmissionGate { lock };
+        }
+        let lock = Arc::new(RwLock::new(()));
+        self.emission_gates.push(EmissionGateEntry { document_id, gate: Arc::downgrade(&lock) });
+        DocumentEmissionGate { lock }
     }
 
     pub fn contexts(&self, document_id: DocumentId) -> Vec<SubscriptionContext> {

@@ -22,7 +22,7 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 const QUIET_TIMEOUT: Duration = Duration::from_millis(250);
 const ACK_BARRIER: &str = "store-subscription-before-ack";
 const POLL_BARRIER: &str = "store-subscription-before-poll";
-const SELECT_BARRIER: &str = "store-subscription-after-select-before-write";
+const EMISSION_BARRIER: &str = "store-subscription-after-dequeue-before-emission";
 
 fn root(document: u8) -> CreateDocumentRequest {
     CreateDocumentRequest {
@@ -291,12 +291,12 @@ async fn selected_notification_is_discarded_when_revocation_commits_before_emiss
         return Err(io::Error::other("reader capability was not granted").into());
     }
     let subscription = subscriber.subscribe_updates(&reader, root.document_id).await?;
-    server.arm_store_barrier(SELECT_BARRIER)?;
+    server.arm_store_barrier(EMISSION_BARRIER)?;
     let controller = server.connect_webtransport().await?;
     controller.negotiate().await?;
     let selected = update(0x17, 0x41);
     controller.accept_update(&root.root, &encode_update_record(&selected)?).await?;
-    server.wait_for_store_barrier(SELECT_BARRIER).await?;
+    server.wait_for_store_barrier(EMISSION_BARRIER).await?;
     if controller
         .revoke_capability(&RevokeCapabilityRequest {
             document_id: root.document_id,
@@ -309,7 +309,7 @@ async fn selected_notification_is_discarded_when_revocation_commits_before_emiss
     {
         return Err(io::Error::other("reader revocation was not committed").into());
     }
-    server.release_store_barrier(SELECT_BARRIER)?;
+    server.release_store_barrier(EMISSION_BARRIER)?;
     let event =
         tokio::time::timeout(EVENT_TIMEOUT, subscriber.next_update_subscription_event()).await??;
     if event
@@ -413,12 +413,12 @@ async fn descendant_revocation_discards_a_selected_notification_before_emission(
         })
         .await?;
     let subscription = subscriber.subscribe_updates(&child, root.document_id).await?;
-    server.arm_store_barrier(SELECT_BARRIER)?;
+    server.arm_store_barrier(EMISSION_BARRIER)?;
     let controller = server.connect_webtransport().await?;
     controller.negotiate().await?;
     let selected = update(0x19, 0x43);
     controller.accept_update(&root.root, &encode_update_record(&selected)?).await?;
-    server.wait_for_store_barrier(SELECT_BARRIER).await?;
+    server.wait_for_store_barrier(EMISSION_BARRIER).await?;
     controller
         .revoke_capability(&RevokeCapabilityRequest {
             document_id: root.document_id,
@@ -427,7 +427,7 @@ async fn descendant_revocation_discards_a_selected_notification_before_emission(
             target_capability_id: parent.capability_id,
         })
         .await?;
-    server.release_store_barrier(SELECT_BARRIER)?;
+    server.release_store_barrier(EMISSION_BARRIER)?;
     let event =
         tokio::time::timeout(EVENT_TIMEOUT, subscriber.next_update_subscription_event()).await??;
     if event

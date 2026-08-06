@@ -590,6 +590,10 @@ fn ensure_metadata_is_enumerable(update: &ImmutableUpdate) -> Result<(), UpdateC
 pub fn encode_enumerate_response(
     response: &EnumerateResponse,
 ) -> Result<Vec<u8>, UpdateCodecError> {
+    let has_updates = !response.updates.is_empty();
+    if (response.has_more && !has_updates) || response.next_cursor.is_some() != has_updates {
+        return Err(UpdateCodecError::InvalidCursor);
+    }
     let count = u16::try_from(response.updates.len())
         .map_err(|_error| UpdateCodecError::IntegerOutOfRange)?;
     let cursor_length = cursor_length(response.next_cursor.as_deref())?;
@@ -636,6 +640,10 @@ pub fn decode_enumerate_response(payload: &[u8]) -> Result<EnumerateResponse, Up
         _invalid => return Err(UpdateCodecError::InvalidCursor),
     };
     let count = usize::from(u16::from_be_bytes(decoder.take_array()?));
+    let has_updates = count != 0;
+    if (has_more && !has_updates) || next_cursor.is_some() != has_updates {
+        return Err(UpdateCodecError::InvalidCursor);
+    }
     let mut updates = Vec::new();
     for _entry_index in 0..count {
         let update_id = UpdateId::from_bytes(decoder.take_array()?);
@@ -1214,6 +1222,53 @@ mod tests {
                 &encode_enumerate_response(&response).expect("response must encode")
             ),
             Ok(response)
+        );
+    }
+
+    #[test]
+    fn enumeration_response_rejects_impossible_pagination_states() {
+        let record =
+            decode_update_record(&decode_hex(FIXED_RECORD_HEX)).expect("Carbon vector must decode");
+        let metadata = UpdateMetadata {
+            encrypted_payload_length: u32::try_from(record.encrypted_payload().len())
+                .expect("fixture payload length must fit"),
+            public_loro_ranges: record.public_loro_ranges().clone(),
+            update_id: record.update_id(),
+        };
+        let more_without_cursor = EnumerateResponse {
+            has_more: true,
+            next_cursor: None,
+            updates: vec![metadata.clone()],
+        };
+        let terminal_without_cursor = EnumerateResponse {
+            has_more: false,
+            next_cursor: None,
+            updates: vec![metadata.clone()],
+        };
+        assert_eq!(
+            encode_enumerate_response(&more_without_cursor),
+            Err(UpdateCodecError::InvalidCursor),
+        );
+        assert_eq!(
+            encode_enumerate_response(&terminal_without_cursor),
+            Err(UpdateCodecError::InvalidCursor),
+        );
+        assert_eq!(
+            decode_enumerate_response(&[1, 0, 0, 0, 0]),
+            Err(UpdateCodecError::InvalidCursor),
+        );
+
+        let valid_terminal = encode_enumerate_response(&EnumerateResponse {
+            has_more: false,
+            next_cursor: Some(vec![0x73; ENUMERATION_CONTINUATION_LENGTH]),
+            updates: vec![metadata],
+        })
+        .expect("nonempty terminal response must carry its after-tail token");
+        let mut missing_terminal = vec![0, 0, 0];
+        missing_terminal.extend_from_slice(&valid_terminal[3 + ENUMERATION_CONTINUATION_LENGTH..]);
+        assert_eq!(
+            decode_enumerate_response(&missing_terminal),
+            Err(UpdateCodecError::InvalidCursor),
         );
     }
 

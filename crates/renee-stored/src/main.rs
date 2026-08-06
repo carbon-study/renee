@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
+use std::future::Future;
 use std::io;
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -309,7 +310,7 @@ async fn serve_connection_with_channel(
                 let Some(event) = event else {
                     return Err(io::Error::other("connection event queue closed"));
                 };
-                write_connection_event(output, store, event).await?;
+                write_connection_event(output, event).await?;
             }
             body = requests.recv() => {
                 let Some(body) = body else {
@@ -490,16 +491,6 @@ async fn forward_subscription(
             #[cfg(test)]
             UpdateSubscriptionPoll::Pending => continue,
         };
-        #[cfg(feature = "conformance")]
-        if message_type == UPDATE_NOTIFICATION
-            && tokio::task::spawn_blocking(|| {
-                test_barrier::checkpoint("store-subscription-after-select-before-write")
-            })
-            .await
-            .map_or(true, |checkpoint| checkpoint.is_err())
-        {
-            return;
-        }
         let event = match encode_body(&Envelope {
             correlation_id,
             message_type,
@@ -541,13 +532,36 @@ async fn forward_subscription(
 
 async fn write_connection_event(
     output: &mut OwnedWriteHalf,
-    store: &Mutex<DurableUpdateStore>,
     event: ConnectionEvent,
 ) -> io::Result<()> {
+    let before_emission = async {
+        #[cfg(feature = "conformance")]
+        if tokio::task::spawn_blocking(|| {
+            test_barrier::checkpoint("store-subscription-after-dequeue-before-emission")
+        })
+        .await
+        .map_or(true, |checkpoint| checkpoint.is_err())
+        {
+            return Err(io::Error::other("subscription emission barrier failed"));
+        }
+        Ok(())
+    };
+    write_connection_event_after_dequeue(output, event, before_emission).await
+}
+
+async fn write_connection_event_after_dequeue<BeforeEmission>(
+    output: &mut OwnedWriteHalf,
+    event: ConnectionEvent,
+    before_emission: BeforeEmission,
+) -> io::Result<()>
+where
+    BeforeEmission: Future<Output = io::Result<()>>,
+{
     let Some(emission) = event.emission else {
         return write_body(output, &event.body).await;
     };
-    let _store_guard = store.lock().await;
+    before_emission.await?;
+    let _emission_guard = emission.enter().await;
     if !emission.is_authorized() {
         return Ok(());
     }
@@ -556,6 +570,17 @@ async fn write_connection_event(
         .map_err(|_elapsed| {
             io::Error::new(io::ErrorKind::TimedOut, "subscription emission stalled")
         })?
+}
+
+async fn with_document_emission_exclusion<Result>(
+    store: &Mutex<DurableUpdateStore>,
+    document_id: renee_types::DocumentId,
+    operation: impl FnOnce(&mut DurableUpdateStore) -> Result,
+) -> Result {
+    let gate = store.lock().await.document_emission_gate(document_id);
+    let _emission_exclusion = gate.exclude().await;
+    let mut locked_store = store.lock().await;
+    operation(&mut locked_store)
 }
 
 fn terminal_subscription_event(
@@ -743,40 +768,43 @@ async fn handle_request(
                     );
                 }
             };
-            let mut locked_store = store.lock().await;
-            #[cfg(feature = "conformance")]
-            let outcome = locked_store
-                .revoke_capability_with_test_barriers(
-                    revoke.document_id,
-                    revoke.issuer.capability_id,
-                    &revoke.issuer.authenticator,
-                    revoke.request_id,
-                    revoke.target_capability_id,
-                    || {
-                        test_barrier::checkpoint("store-revoke-after-authorization")
-                            .map_err(StoreError::from)
-                    },
-                    || {
-                        test_barrier::checkpoint("store-revoke-before-commit")
-                            .map_err(StoreError::from)
-                    },
-                    || {
-                        test_barrier::checkpoint("store-revoke-exact-retry")
-                            .map_err(StoreError::from)
-                    },
-                )
+            let outcome =
+                with_document_emission_exclusion(store, revoke.document_id, |locked_store| {
+                    #[cfg(feature = "conformance")]
+                    {
+                        locked_store.revoke_capability_with_test_barriers(
+                            revoke.document_id,
+                            revoke.issuer.capability_id,
+                            &revoke.issuer.authenticator,
+                            revoke.request_id,
+                            revoke.target_capability_id,
+                            || {
+                                test_barrier::checkpoint("store-revoke-after-authorization")
+                                    .map_err(StoreError::from)
+                            },
+                            || {
+                                test_barrier::checkpoint("store-revoke-before-commit")
+                                    .map_err(StoreError::from)
+                            },
+                            || {
+                                test_barrier::checkpoint("store-revoke-exact-retry")
+                                    .map_err(StoreError::from)
+                            },
+                        )
+                    }
+                    #[cfg(not(feature = "conformance"))]
+                    {
+                        locked_store.revoke_capability(
+                            revoke.document_id,
+                            revoke.issuer.capability_id,
+                            &revoke.issuer.authenticator,
+                            revoke.request_id,
+                            revoke.target_capability_id,
+                        )
+                    }
+                })
+                .await
                 .map_err(store_error)?;
-            #[cfg(not(feature = "conformance"))]
-            let outcome = locked_store
-                .revoke_capability(
-                    revoke.document_id,
-                    revoke.issuer.capability_id,
-                    &revoke.issuer.authenticator,
-                    revoke.request_id,
-                    revoke.target_capability_id,
-                )
-                .map_err(store_error)?;
-            drop(locked_store);
             #[cfg(feature = "conformance")]
             if outcome == StoreControlOutcome::Inserted {
                 test_barrier::checkpoint("store-revoke-after-commit-before-response")?;
@@ -1178,7 +1206,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "the transport-boundary retirement race keeps selected state and socket observation visible"
     )]
-    async fn selected_notification_does_not_write_after_retirement_commits() {
+    async fn retirement_at_writer_seam_discards_notification_without_global_blocking() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("test clock must follow epoch")
@@ -1241,7 +1269,28 @@ mod tests {
             StoreAcceptOutcome::Inserted,
         );
         assert_eq!(subscription.next().await, UpdateSubscriptionPoll::Notification(update_id),);
-        store.commit_retirement_for_test(document_id).expect("retirement must commit and publish");
+        let store = Arc::new(Mutex::new(store));
+        let stalled_emission = emission.enter().await;
+        let waiting_store = Arc::clone(&store);
+        let (exclusion_started, exclusion_ready) = oneshot::channel();
+        let waiting_exclusion = tokio::spawn(async move {
+            let gate = waiting_store.lock().await.document_emission_gate(document_id);
+            let _started = exclusion_started.send(());
+            let _exclusion = gate.exclude().await;
+        });
+        exclusion_ready.await.expect("control task must reach the emission gate");
+        let unrelated_document = DocumentId::from_bytes([0xd1; 16]);
+        let unrelated_channel = tokio::time::timeout(
+            Duration::from_millis(50),
+            with_document_emission_exclusion(&store, unrelated_document, |locked_store| {
+                locked_store.open_broker_channel()
+            }),
+        )
+        .await
+        .expect("a stalled document emission must not hold the global store lock");
+        assert!(unrelated_channel.is_some(), "unrelated broker work must complete");
+        drop(stalled_emission);
+        waiting_exclusion.await.expect("waiting exclusion task must finish");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener must bind");
         let mut client = TcpStream::connect(listener.local_addr().expect("address must exist"))
@@ -1259,14 +1308,31 @@ mod tests {
             version: VERSION,
         })
         .expect("notification must encode");
-        let store = Mutex::new(store);
-        write_connection_event(
-            &mut output,
-            &store,
-            ConnectionEvent { body, emission: Some(emission) },
-        )
+        let (writer_reached, wait_for_writer) = oneshot::channel();
+        let (resume_writer, writer_resumed) = oneshot::channel();
+        let writer = tokio::spawn(async move {
+            let result = write_connection_event_after_dequeue(
+                &mut output,
+                ConnectionEvent { body, emission: Some(emission) },
+                async move {
+                    let _reached = writer_reached.send(());
+                    writer_resumed.await.map_err(|_closed| {
+                        io::Error::other("retirement test did not resume the writer")
+                    })
+                },
+            )
+            .await;
+            (output, result)
+        });
+        wait_for_writer.await.expect("writer must reach its final emission seam");
+        with_document_emission_exclusion(&store, document_id, |locked_store| {
+            locked_store.commit_retirement_for_test(document_id)
+        })
         .await
-        .expect("discarding an invalidated event must succeed");
+        .expect("retirement must commit and publish");
+        resume_writer.send(()).expect("writer must remain paused");
+        let (finished_output, write_result) = writer.await.expect("writer task must finish");
+        write_result.expect("discarding an invalidated event must succeed");
         let mut observed = [0_u8; 1];
         assert!(
             tokio::time::timeout(Duration::from_millis(50), client.read_exact(&mut observed))
@@ -1278,9 +1344,9 @@ mod tests {
             subscription.next().await,
             UpdateSubscriptionPoll::Invalidated(UpdateSubscriptionEnd::Retired),
         );
-        drop(store);
-        drop(output);
+        drop(finished_output);
         drop(client);
+        drop(store);
         fs::remove_dir_all(&directory).expect("test directory must be removed");
     }
 }
