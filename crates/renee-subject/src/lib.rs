@@ -119,8 +119,8 @@ pub enum AcceptObservation {
     IdentifierConflict,
     /// Renee rejected the record structure.
     Malformed,
-    /// The accepted document would exceed the frozen Loro peer profile.
-    InvalidLoroMetadata,
+    /// The accepted document would exceed a configured count limit.
+    LimitExceeded,
     /// Renee denied the indistinguishable document capability authority.
     AuthorizationDenied,
 }
@@ -200,6 +200,8 @@ pub enum VectorBackfillObservation {
     AuthorizationDenied,
     /// The bounded continuation registry could not admit another page.
     Backpressure,
+    /// Valid read authority named a retired document.
+    RetiredDocument,
 }
 
 /// One acknowledged experimental update subscription.
@@ -652,13 +654,15 @@ impl WebTransportConnection {
             UPDATE_ERROR => match decode_update_error(&response.payload)? {
                 UpdateErrorCode::IdentifierConflict => Ok(AcceptObservation::IdentifierConflict),
                 UpdateErrorCode::Malformed => Ok(AcceptObservation::Malformed),
-                UpdateErrorCode::InvalidLoroMetadata => Ok(AcceptObservation::InvalidLoroMetadata),
+                UpdateErrorCode::LimitExceeded => Ok(AcceptObservation::LimitExceeded),
                 UpdateErrorCode::AuthorizationDenied => Ok(AcceptObservation::AuthorizationDenied),
                 UpdateErrorCode::NotFound
                 | UpdateErrorCode::NotNegotiated
                 | UpdateErrorCode::InvalidCursor
                 | UpdateErrorCode::CounterExhausted
                 | UpdateErrorCode::Backpressure
+                | UpdateErrorCode::RetiredDocument
+                | UpdateErrorCode::InvalidLoroMetadata
                 | UpdateErrorCode::InvalidOrExpiredContinuation => {
                     Err(io::Error::other("unexpected accept rejection").into())
                 }
@@ -795,12 +799,14 @@ impl WebTransportConnection {
                     Ok(VectorBackfillObservation::AuthorizationDenied)
                 }
                 UpdateErrorCode::Backpressure => Ok(VectorBackfillObservation::Backpressure),
+                UpdateErrorCode::RetiredDocument => Ok(VectorBackfillObservation::RetiredDocument),
                 unexpected @ (UpdateErrorCode::Malformed
                 | UpdateErrorCode::IdentifierConflict
                 | UpdateErrorCode::NotFound
                 | UpdateErrorCode::NotNegotiated
                 | UpdateErrorCode::InvalidCursor
-                | UpdateErrorCode::CounterExhausted) => Err(io::Error::other(format!(
+                | UpdateErrorCode::CounterExhausted
+                | UpdateErrorCode::LimitExceeded) => Err(io::Error::other(format!(
                     "unexpected vector-backfill error: {unexpected:?}"
                 ))
                 .into()),

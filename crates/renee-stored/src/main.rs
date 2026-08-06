@@ -821,10 +821,10 @@ async fn handle_request(
                     UPDATE_ERROR,
                     encode_update_error(UpdateErrorCode::CounterExhausted),
                 ),
-                StoreAcceptOutcome::InvalidLoroMetadata => response(
+                StoreAcceptOutcome::LimitExceeded => response(
                     request,
                     UPDATE_ERROR,
-                    encode_update_error(UpdateErrorCode::InvalidLoroMetadata),
+                    encode_update_error(UpdateErrorCode::LimitExceeded),
                 ),
                 StoreAcceptOutcome::AuthorizationDenied => response(
                     request,
@@ -988,6 +988,13 @@ async fn handle_request(
                         request,
                         UPDATE_ERROR,
                         encode_update_error(UpdateErrorCode::AuthorizationDenied),
+                    );
+                }
+                Ok(StoreVectorBackfillOutcome::RetiredDocument) => {
+                    return response(
+                        request,
+                        UPDATE_ERROR,
+                        encode_update_error(UpdateErrorCode::RetiredDocument),
                     );
                 }
                 Ok(StoreVectorBackfillOutcome::InvalidContinuation) => {

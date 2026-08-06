@@ -44,9 +44,9 @@ async fn accepted_document_peer_union_remains_exactly_vector_representable() -> 
         }
     }
     let excessive = peer_union_update(document.document_id, 0x24, 256..257);
-    if model.accept(excessive.clone()) != AcceptOutcome::InvalidLoroMetadata
+    if model.accept(excessive.clone()) != AcceptOutcome::LimitExceeded
         || connection.accept_update(&document.root, &encode_update_record(&excessive)?).await?
-            != AcceptObservation::InvalidLoroMetadata
+            != AcceptObservation::LimitExceeded
     {
         return Err(io::Error::other("excessive document peer union was not rejected").into());
     }
@@ -127,6 +127,14 @@ async fn authenticated_vector_backfill_is_paginated_stable_and_context_bound() -
     if cursor.len() != 32 {
         return Err(io::Error::other("vector continuation was not the opaque fixed length").into());
     }
+    let changed = LoroOplogVersion::new(vec![LoroOplogVersionEntry::new(100, 1)?])?;
+    if connection
+        .vector_backfill(&document.root, document.document_id, &changed, Some(cursor.clone()))
+        .await?
+        != VectorBackfillObservation::InvalidContinuation
+    {
+        return Err(io::Error::other("continuation accepted a changed vector query").into());
+    }
 
     let accepted_after_snapshot = update(document.document_id, 0x44, 3);
     if model.accept(accepted_after_snapshot.clone()) != AcceptOutcome::Inserted
@@ -153,15 +161,16 @@ async fn authenticated_vector_backfill_is_paginated_stable_and_context_bound() -
     if second.has_more || second.next_cursor.is_some() || observed_stable != expected_stable {
         return Err(io::Error::other("stable vector pass admitted a post-snapshot update").into());
     }
-
-    let changed = LoroOplogVersion::new(vec![LoroOplogVersionEntry::new(100, 1)?])?;
-    if connection
-        .vector_backfill(&document.root, document.document_id, &changed, Some(cursor.clone()))
+    let VectorBackfillObservation::Page(retried_second) = connection
+        .vector_backfill(&document.root, document.document_id, &empty, Some(cursor.clone()))
         .await?
-        != VectorBackfillObservation::InvalidContinuation
-    {
-        return Err(io::Error::other("continuation accepted a changed vector query").into());
+    else {
+        return Err(io::Error::other("lost terminal response was not retryable").into());
+    };
+    if retried_second != second {
+        return Err(io::Error::other("continuation retry changed its response").into());
     }
+
     if connection
         .vector_backfill(&other_document.root, document.document_id, &empty, Some(cursor))
         .await?

@@ -447,8 +447,8 @@ pub enum AcceptOutcome {
     IdentifierConflict,
     /// The document-scoped acceptance sequence cannot advance.
     CounterExhausted,
-    /// The document-wide Loro peer union exceeds the frozen profile.
-    InvalidLoroMetadata,
+    /// The document-wide Loro peer union exceeds the configured count limit.
+    LimitExceeded,
 }
 
 #[derive(Debug)]
@@ -491,7 +491,7 @@ impl UpdateModel {
             .filter(|range| existing_peers.is_none_or(|peers| !peers.contains(&range.peer_id())))
             .count();
         if existing_peers.map_or(0, BTreeSet::len) + additional_peer_count > MAX_LORO_PEERS {
-            return AcceptOutcome::InvalidLoroMetadata;
+            return AcceptOutcome::LimitExceeded;
         }
         self.next_sequences.insert(document_id, next_sequence);
         self.acceptance_order.insert((document_id, sequence), update.update_id());

@@ -422,6 +422,8 @@ pub fn generate() -> Result<String, GenerateError> {
             "error.update.invalid-or-expired-continuation",
             UpdateErrorCode::InvalidOrExpiredContinuation,
         ),
+        ("error.update.limit-exceeded", UpdateErrorCode::LimitExceeded),
+        ("error.update.retired-document", UpdateErrorCode::RetiredDocument),
     ] {
         frames.push(frame(name, "errors", UPDATE_ERROR, 0x51, encode_update_error(error))?);
     }

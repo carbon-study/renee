@@ -99,6 +99,10 @@ pub enum UpdateErrorCode {
     InvalidLoroMetadata,
     /// An opaque stable-pass continuation was invalid, expired, or mismatched.
     InvalidOrExpiredContinuation,
+    /// A finite configured update or document-metadata limit was exceeded.
+    LimitExceeded,
+    /// Valid authority named a document that has been irreversibly retired.
+    RetiredDocument,
 }
 
 /// One server-generated, connection-scoped subscription identity.
@@ -998,6 +1002,8 @@ pub fn encode_update_error(error: UpdateErrorCode) -> Vec<u8> {
         UpdateErrorCode::Backpressure => 7,
         UpdateErrorCode::InvalidLoroMetadata => 8,
         UpdateErrorCode::InvalidOrExpiredContinuation => 9,
+        UpdateErrorCode::LimitExceeded => 10,
+        UpdateErrorCode::RetiredDocument => 11,
     }]
 }
 
@@ -1014,6 +1020,8 @@ pub fn decode_update_error(payload: &[u8]) -> Result<UpdateErrorCode, UpdateCode
         [7] => Ok(UpdateErrorCode::Backpressure),
         [8] => Ok(UpdateErrorCode::InvalidLoroMetadata),
         [9] => Ok(UpdateErrorCode::InvalidOrExpiredContinuation),
+        [10] => Ok(UpdateErrorCode::LimitExceeded),
+        [11] => Ok(UpdateErrorCode::RetiredDocument),
         [_unknown] => Err(UpdateCodecError::InvalidDiscriminant),
         _ => Err(UpdateCodecError::TrailingBytes),
     }
@@ -1420,6 +1428,17 @@ mod tests {
             decode_vector_backfill_response(&terminal_with_cursor),
             Err(UpdateCodecError::InvalidCursor),
         );
+    }
+
+    #[test]
+    fn vector_limit_and_retirement_error_discriminants_are_stable() {
+        for (error, encoded) in [
+            (UpdateErrorCode::LimitExceeded, vec![10]),
+            (UpdateErrorCode::RetiredDocument, vec![11]),
+        ] {
+            assert_eq!(encode_update_error(error), encoded);
+            assert_eq!(decode_update_error(&encoded), Ok(error));
+        }
     }
 
     #[test]
