@@ -48,27 +48,6 @@ const MAX_VECTOR_SCAN_RECORDS: usize = 64;
 const VECTOR_CONTINUATION_LENGTH: usize = 32;
 const VECTOR_PASS_IDLE_TTL: Duration = Duration::from_secs(300);
 
-const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
-    ("table", "schema_meta"),
-    ("table", "create_authorities"),
-    ("table", "documents"),
-    ("table", "capabilities"),
-    ("index", "one_root_capability_per_document"),
-    ("table", "capability_operations"),
-    ("table", "control_receipts"),
-    ("table", "create_receipts"),
-    ("table", "document_acceptance_sequences"),
-    ("table", "updates"),
-    ("table", "update_loro_ranges"),
-    ("table", "document_loro_peers"),
-    ("trigger", "document_loro_peers_are_immutable"),
-    ("trigger", "document_loro_peers_are_retained"),
-    ("trigger", "update_loro_ranges_are_immutable"),
-    ("trigger", "update_loro_ranges_are_retained"),
-    ("trigger", "updates_are_immutable"),
-    ("trigger", "updates_are_retained"),
-];
-
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS schema_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -513,23 +492,45 @@ fn initialize_or_check_schema(connection: &mut Connection) -> Result<(), StoreEr
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
     }
-    validate_required_schema_objects(connection)?;
+    validate_canonical_schema(connection)?;
+    validate_foreign_keys(connection)?;
     Ok(())
 }
 
-fn validate_required_schema_objects(connection: &Connection) -> Result<(), StoreError> {
-    for (object_type, name) in REQUIRED_SCHEMA_OBJECTS {
-        let exists = connection
-            .query_row(
-                "SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2",
-                params![object_type, name],
-                |_row| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !exists {
-            return Err(StoreError::Corrupt("required durable schema object is absent"));
-        }
+type SchemaObject = (String, String, String, Option<String>);
+
+fn validate_canonical_schema(connection: &Connection) -> Result<(), StoreError> {
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(SCHEMA)?;
+    if schema_objects(connection)? != schema_objects(&reference)? {
+        return Err(StoreError::Corrupt(
+            "durable schema objects disagree with the current canonical schema",
+        ));
+    }
+    Ok(())
+}
+
+fn schema_objects(connection: &Connection) -> Result<Vec<SchemaObject>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, tbl_name, sql
+         FROM sqlite_schema
+         WHERE name NOT LIKE 'sqlite_%'
+         ORDER BY type, name",
+    )?;
+    let rows =
+        statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+    rows.collect::<Result<_, _>>().map_err(StoreError::from)
+}
+
+fn validate_foreign_keys(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = statement.query([])?;
+    let mut violation_found = false;
+    while rows.next()?.is_some() {
+        violation_found = true;
+    }
+    if violation_found {
+        return Err(StoreError::Corrupt("SQLite foreign key check failed"));
     }
     Ok(())
 }
@@ -571,8 +572,8 @@ fn insert_update_ranges(
     let document_id = update.document_id().into_bytes();
     let update_id = update.update_id().into_bytes();
     for range in update.public_loro_ranges().as_slice() {
-        transaction.execute(
-            "INSERT OR IGNORE INTO update_loro_ranges(
+        let inserted = transaction.execute(
+            "INSERT INTO update_loro_ranges(
                 document_id, update_id, peer_id, start_counter, end_counter
              ) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -583,6 +584,9 @@ fn insert_update_ranges(
                 range.end_counter().to_be_bytes().as_slice(),
             ],
         )?;
+        if inserted != 1 {
+            return Err(StoreError::Corrupt("Loro range insertion did not affect exactly one row"));
+        }
     }
     Ok(())
 }
@@ -1767,8 +1771,6 @@ impl DurableUpdateStore {
                     if retry.token == token {
                         let response = retry.response.clone();
                         transaction.commit()?;
-                        self.vector_passes[pass_index].expires_at =
-                            Instant::now() + VECTOR_PASS_IDLE_TTL;
                         return Ok(StoreVectorBackfillOutcome::Authorized(response));
                     }
                 }
@@ -3467,7 +3469,7 @@ mod tests {
     }
 
     #[test]
-    fn vector_backfill_refreshes_idle_expiry_on_advancement_and_exact_retry() {
+    fn vector_backfill_refreshes_idle_expiry_only_on_advancement() {
         let directory = TestDirectory::create();
         let database = directory.path.join("renee.sqlite3");
         let document_id = DocumentId::from_bytes([0x71; IDENTIFIER_LENGTH]);
@@ -3541,13 +3543,13 @@ mod tests {
             .expect("advanced pass must remain registered");
         assert!(advanced_pass.expires_at > short_advancement_deadline);
 
-        let short_retry_deadline = Instant::now() + Duration::from_secs(60);
+        let retry_deadline = Instant::now() + Duration::from_secs(60);
         store
             .vector_passes
             .iter_mut()
             .find(|candidate| vector_pass_contains_token(candidate, first_token))
             .expect("retry token must remain registered")
-            .expires_at = short_retry_deadline;
+            .expires_at = retry_deadline;
         let StoreVectorBackfillOutcome::Authorized(retried) = store
             .vector_backfill_authorized(
                 &channel,
@@ -3568,7 +3570,7 @@ mod tests {
             .iter()
             .find(|candidate| vector_pass_contains_token(candidate, second_token))
             .expect("retried pass must remain registered");
-        assert!(retried_pass.expires_at > short_retry_deadline);
+        assert_eq!(retried_pass.expires_at, retry_deadline);
     }
 
     #[test]
@@ -3799,7 +3801,7 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_requires_every_durable_loro_index_object() {
+    fn current_schema_requires_the_exact_canonical_object_set() {
         let directory = TestDirectory::create();
         let database = directory.path.join("renee.sqlite3");
         let _fixture = create_loro_index_recovery_fixture(&database);
@@ -3811,8 +3813,182 @@ mod tests {
 
         assert!(matches!(
             DurableUpdateStore::open(&database, create_authority_provision()),
-            Err(StoreError::Corrupt("required durable schema object is absent")),
+            Err(StoreError::Corrupt(
+                "durable schema objects disagree with the current canonical schema"
+            )),
         ));
+    }
+
+    #[test]
+    fn current_schema_rejects_a_same_named_trigger_replacement() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        drop(open_store(&database));
+        let connection = Connection::open(&database).expect("fixture database must reopen");
+        connection
+            .execute_batch(
+                "DROP TRIGGER update_loro_ranges_are_retained;
+                 CREATE TRIGGER update_loro_ranges_are_retained
+                 BEFORE INSERT ON update_loro_ranges
+                 BEGIN
+                     SELECT RAISE(IGNORE);
+                 END;",
+            )
+            .expect("canonical trigger must be replaceable for corruption fixture");
+        drop(connection);
+
+        assert!(matches!(
+            DurableUpdateStore::open(&database, create_authority_provision()),
+            Err(StoreError::Corrupt(
+                "durable schema objects disagree with the current canonical schema"
+            )),
+        ));
+    }
+
+    #[test]
+    fn current_schema_rejects_an_unexpected_write_trigger() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        drop(open_store(&database));
+        let connection = Connection::open(&database).expect("fixture database must reopen");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER discard_update_loro_range_insert
+                 BEFORE INSERT ON update_loro_ranges
+                 BEGIN
+                     SELECT RAISE(IGNORE);
+                 END;",
+            )
+            .expect("unexpected trigger fixture must install");
+        drop(connection);
+
+        assert!(matches!(
+            DurableUpdateStore::open(&database, create_authority_provision()),
+            Err(StoreError::Corrupt(
+                "durable schema objects disagree with the current canonical schema"
+            )),
+        ));
+    }
+
+    #[test]
+    fn update_acceptance_requires_each_range_insert_to_affect_one_row() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let document_id = DocumentId::from_bytes([0xa1; IDENTIFIER_LENGTH]);
+        let capability_id = CapabilityId::from_bytes([0xa2; IDENTIFIER_LENGTH]);
+        let authenticator = Authenticator::from_bytes([0xa3; 32]);
+        let mut store = open_store(&database);
+        create_fixture_document(&mut store, document_id, capability_id, &authenticator, 0xa4);
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER discard_update_loro_range_insert
+                 BEFORE INSERT ON update_loro_ranges
+                 BEGIN
+                     SELECT RAISE(IGNORE);
+                 END;",
+            )
+            .expect("runtime trigger fixture must install");
+        let update = ranged_fixture_update(document_id, 0xa5, 31, 0, 1);
+        let encoded = encode_update_record(&update).expect("fixture update must encode");
+        assert!(matches!(
+            store.accept(capability_id, &authenticator, &update, &encoded),
+            Err(StoreError::Corrupt("Loro range insertion did not affect exactly one row")),
+        ));
+        assert!(
+            fetch_in(&store.connection, document_id, update.update_id())
+                .expect("rolled-back update lookup must resolve")
+                .is_none()
+        );
+        let document_bytes = document_id.into_bytes();
+        let peer_count = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM document_loro_peers WHERE document_id = ?1",
+                params![document_bytes.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("rolled-back peer union must remain readable");
+        assert_eq!(peer_count, 0);
+    }
+
+    #[test]
+    fn recovery_exhausts_foreign_key_check_before_provisioning() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let connection = Connection::open(&database).expect("fixture database must open");
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .expect("corruption fixture must bypass foreign-key enforcement");
+        connection.execute_batch(SCHEMA).expect("current schema must initialize");
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .expect("current user version must initialize");
+        let document_id = DocumentId::from_bytes([0xb1; IDENTIFIER_LENGTH]);
+        let update = ranged_fixture_update(document_id, 0xb2, 41, 2, 4);
+        let encoded = encode_update_record(&update).expect("fixture update must encode");
+        let document_bytes = document_id.into_bytes();
+        let update_bytes = update.update_id().into_bytes();
+        connection
+            .execute(
+                "INSERT INTO document_acceptance_sequences(document_id, next_sequence)
+                 VALUES (?1, ?2)",
+                params![
+                    document_bytes.as_slice(),
+                    AcceptanceSequence::FIRST
+                        .checked_next()
+                        .expect("fixture sequence must advance")
+                        .to_be_bytes()
+                        .as_slice(),
+                ],
+            )
+            .expect("orphan sequence fixture must insert with foreign keys disabled");
+        connection
+            .execute(
+                "INSERT INTO updates(
+                    document_id, update_id, acceptance_sequence, encoded_record
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    document_bytes.as_slice(),
+                    update_bytes.as_slice(),
+                    AcceptanceSequence::FIRST.to_be_bytes().as_slice(),
+                    encoded,
+                ],
+            )
+            .expect("orphan update fixture must insert");
+        let range =
+            update.public_loro_ranges().as_slice().first().expect("fixture must contain one range");
+        connection
+            .execute(
+                "INSERT INTO update_loro_ranges(
+                    document_id, update_id, peer_id, start_counter, end_counter
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    document_bytes.as_slice(),
+                    update_bytes.as_slice(),
+                    range.peer_id().to_be_bytes().as_slice(),
+                    range.start_counter().to_be_bytes().as_slice(),
+                    range.end_counter().to_be_bytes().as_slice(),
+                ],
+            )
+            .expect("orphan range fixture must insert");
+        connection
+            .execute(
+                "INSERT INTO document_loro_peers(document_id, peer_id) VALUES (?1, ?2)",
+                params![document_bytes.as_slice(), 41_u64.to_be_bytes().as_slice()],
+            )
+            .expect("orphan peer fixture must insert with foreign keys disabled");
+        drop(connection);
+
+        assert!(matches!(
+            DurableUpdateStore::open(&database, create_authority_provision()),
+            Err(StoreError::Corrupt("SQLite foreign key check failed")),
+        ));
+        let reopened = Connection::open(&database).expect("corrupt fixture must remain readable");
+        let authority_count = reopened
+            .query_row("SELECT COUNT(*) FROM create_authorities", [], |row| row.get::<_, i64>(0))
+            .expect("authority count must remain readable");
+        assert_eq!(authority_count, 0);
     }
 
     #[test]
