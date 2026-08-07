@@ -284,6 +284,7 @@ impl ServerHarness {
             .arg("--store-database")
             .arg(store_database)
             .env("RENEE_TEST_BARRIER_DIRECTORY", &barrier_directory)
+            .env("RENEE_TEST_FIXED_ENUMERATION_ORDER_KEY", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

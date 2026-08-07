@@ -133,7 +133,7 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
 
     // Capture the terminal anchor before accepting a lexically lower update
     // ID. Snapshot membership is acceptance-bounded even though each pass is
-    // publicly paginated in deterministic, non-semantic update-ID order.
+    // publicly paginated through a deterministic, non-semantic permutation.
     let first_page =
         connection.enumerate_updates(&first_root.root, first.document_id(), None).await?;
     if first_page.updates != vec![expected_metadata(&first)] {
@@ -163,12 +163,18 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
         .into());
     }
 
-    let expected_page = vec![expected_metadata(&later), expected_metadata(&first)];
+    let terminal_sequence = model
+        .high_water_sequence(first.document_id())
+        .ok_or_else(|| io::Error::other("model omitted the enumeration high-water sequence"))?;
+    let expected_page = model
+        .enumerate(first.document_id(), None, terminal_sequence)
+        .map(|(_sequence, metadata)| metadata)
+        .collect::<Vec<_>>();
     let observed_page =
         connection.enumerate_updates(&first_root.root, first.document_id(), None).await?;
     if observed_page.has_more || observed_page.updates != expected_page {
         return Err(io::Error::other(format!(
-            "subject enumeration did not use update-ID order: expected {expected_page:?}, observed {:?}",
+            "model and subject disagreed on pass-local enumeration order: expected {expected_page:?}, observed {:?}",
             observed_page.updates,
         ))
         .into());
@@ -245,6 +251,10 @@ async fn acknowledged_update_survives_store_restart() -> HarnessResult<()> {
     let accepted = update(9, 4, b"durable-opaque-update");
     let accepted_record = encode_update_record(&accepted)?;
     let accepted_root = root(9);
+    let mut model = UpdateModel::default();
+    if model.accept(accepted.clone()) != AcceptOutcome::Inserted {
+        return Err(io::Error::other("model rejected durable fixture update").into());
+    }
     if connection.create_document(&accepted_root).await? != CreateDocumentObservation::Inserted {
         return Err(io::Error::other("durable fixture document was not created").into());
     }
@@ -292,8 +302,9 @@ async fn acknowledged_update_survives_store_restart() -> HarnessResult<()> {
         return Err(io::Error::other("acknowledged payload was lost across restart").into());
     }
     let later = update(9, 1, b"accepted-after-restart");
-    if recovered.accept_update(&accepted_root.root, &encode_update_record(&later)?).await?
-        != AcceptObservation::Inserted
+    if model.accept(later.clone()) != AcceptOutcome::Inserted
+        || recovered.accept_update(&accepted_root.root, &encode_update_record(&later)?).await?
+            != AcceptObservation::Inserted
     {
         return Err(io::Error::other("post-restart update was not inserted").into());
     }
@@ -310,7 +321,14 @@ async fn acknowledged_update_survives_store_restart() -> HarnessResult<()> {
     }
     let restarted =
         recovered.enumerate_updates(&accepted_root.root, accepted.document_id(), None).await?;
-    if restarted.updates != vec![expected_metadata(&later), expected_metadata(&accepted)] {
+    let terminal_sequence = model
+        .high_water_sequence(accepted.document_id())
+        .ok_or_else(|| io::Error::other("model omitted restarted enumeration high-water"))?;
+    let expected_restarted = model
+        .enumerate(accepted.document_id(), None, terminal_sequence)
+        .map(|(_sequence, metadata)| metadata)
+        .collect::<Vec<_>>();
+    if restarted.updates != expected_restarted {
         return Err(io::Error::other("origin restart omitted durable history").into());
     }
 
@@ -329,26 +347,40 @@ async fn opaque_enumeration_pass_retries_exact_pages_and_excludes_later_accepts(
         return Err(io::Error::other("fixture document was not created").into());
     }
     let updates = [wide_update(10, 0x11), wide_update(10, 0x12), wide_update(10, 0x13)];
+    let mut model = UpdateModel::default();
     for update in &updates {
-        if connection.accept_update(&authority.root, &encode_update_record(update)?).await?
-            != AcceptObservation::Inserted
+        if model.accept(update.clone()) != AcceptOutcome::Inserted
+            || connection.accept_update(&authority.root, &encode_update_record(update)?).await?
+                != AcceptObservation::Inserted
         {
             return Err(io::Error::other("wide fixture update was not accepted").into());
         }
     }
+    let stable_terminal = model
+        .high_water_sequence(authority.document_id)
+        .ok_or_else(|| io::Error::other("model omitted stable enumeration high-water"))?;
+    let expected_stable = model
+        .enumerate(authority.document_id, None, stable_terminal)
+        .map(|(_sequence, metadata)| metadata)
+        .collect::<Vec<_>>();
     let first = connection.enumerate_updates(&authority.root, authority.document_id, None).await?;
-    if !first.has_more || first.updates != vec![expected_metadata(&updates[0])] {
+    if !first.has_more || first.updates != expected_stable[0..1] {
         return Err(io::Error::other("origin did not return one bounded first page").into());
     }
     let first_token =
         first.next_cursor.ok_or_else(|| io::Error::other("first page omitted its opaque token"))?;
     let later = wide_update(10, 0x14);
-    connection.accept_update(&authority.root, &encode_update_record(&later)?).await?;
+    if model.accept(later.clone()) != AcceptOutcome::Inserted
+        || connection.accept_update(&authority.root, &encode_update_record(&later)?).await?
+            != AcceptObservation::Inserted
+    {
+        return Err(io::Error::other("later fixture update was not accepted").into());
+    }
 
     let second = connection
         .enumerate_updates(&authority.root, authority.document_id, Some(first_token.clone()))
         .await?;
-    if !second.has_more || second.updates != vec![expected_metadata(&updates[1])] {
+    if !second.has_more || second.updates != expected_stable[1..2] {
         return Err(io::Error::other("second stable page was incorrect").into());
     }
     let second_retry = connection
@@ -363,7 +395,7 @@ async fn opaque_enumeration_pass_retries_exact_pages_and_excludes_later_accepts(
     let terminal = connection
         .enumerate_updates(&authority.root, authority.document_id, Some(second_token.clone()))
         .await?;
-    if terminal.has_more || terminal.updates != vec![expected_metadata(&updates[2])] {
+    if terminal.has_more || terminal.updates != expected_stable[2..3] {
         return Err(io::Error::other("terminal stable page included a later acceptance").into());
     }
     let terminal_retry = connection
@@ -378,7 +410,14 @@ async fn opaque_enumeration_pass_retries_exact_pages_and_excludes_later_accepts(
     let after_tail = connection
         .enumerate_updates_after_tail(&authority.root, authority.document_id, tail)
         .await?;
-    if after_tail.updates != vec![expected_metadata(&later)] {
+    let new_terminal = model
+        .high_water_sequence(authority.document_id)
+        .ok_or_else(|| io::Error::other("model omitted after-tail high-water"))?;
+    let expected_after_tail = model
+        .enumerate(authority.document_id, Some(stable_terminal), new_terminal)
+        .map(|(_sequence, metadata)| metadata)
+        .collect::<Vec<_>>();
+    if after_tail.updates != expected_after_tail {
         return Err(
             io::Error::other("after-tail pass repeated history or omitted later update").into()
         );

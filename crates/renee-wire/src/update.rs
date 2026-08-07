@@ -178,7 +178,7 @@ pub struct EnumerateResponse {
     pub has_more: bool,
     /// Opaque continuation or after-tail token returned with a nonempty page.
     pub next_cursor: Option<Vec<u8>>,
-    /// Public metadata in deterministic update-ID order, with no causal or acceptance-order claim.
+    /// Public metadata in deterministic pass-local order, with no causal or acceptance-order claim.
     pub updates: Vec<UpdateMetadata>,
 }
 

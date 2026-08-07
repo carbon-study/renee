@@ -4,6 +4,10 @@
 //! wall-clock, and runtime behavior.
 
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::big_endian_bytes,
+    reason = "the reference model mirrors canonical private storage and permutation encoding"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Included};
@@ -436,6 +440,90 @@ fn model_verifier(
     hash.finalize().into()
 }
 
+struct EnumerationPermutation {
+    length: u64,
+    lower: u64,
+    multiplier: u64,
+    offset: u64,
+}
+
+impl EnumerationPermutation {
+    fn new(
+        enumeration_order_key: &[u8; 32],
+        document_id: DocumentId,
+        lower_sequence_exclusive: AcceptanceSequence,
+        terminal_sequence: AcceptanceSequence,
+    ) -> Option<Self> {
+        let lower = lower_sequence_exclusive.get();
+        let length = terminal_sequence.get().checked_sub(lower)?;
+        if length == 0 {
+            return None;
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"renee-enumeration-permutation-v1\0");
+        hash.update(enumeration_order_key);
+        hash.update(document_id.into_bytes());
+        hash.update(lower_sequence_exclusive.to_be_bytes());
+        hash.update(terminal_sequence.to_be_bytes());
+        let digest = hash.finalize();
+        let offset = enumeration_hash_word(&digest, 0) % length;
+        let multiplier = coprime_enumeration_multiplier(enumeration_hash_word(&digest, 8), length);
+        Some(Self { length, lower, multiplier, offset })
+    }
+
+    fn sequence_at(&self, ordinal: u64) -> Option<AcceptanceSequence> {
+        if ordinal >= self.length {
+            return None;
+        }
+        let mapped = if self.length == 1 {
+            0
+        } else {
+            u64::try_from(
+                (u128::from(ordinal) * u128::from(self.multiplier) + u128::from(self.offset))
+                    % u128::from(self.length),
+            )
+            .ok()?
+        };
+        self.lower
+            .checked_add(mapped)?
+            .checked_add(1)
+            .map(|sequence| AcceptanceSequence::from_be_bytes(sequence.to_be_bytes()))
+    }
+}
+
+fn coprime_enumeration_multiplier(seed: u64, length: u64) -> u64 {
+    if length <= 2 {
+        return 1;
+    }
+    let mut candidate = seed % length;
+    if candidate == 0 {
+        candidate = 1;
+    }
+    for _attempt in 0..64 {
+        if greatest_common_divisor(candidate, length) == 1 {
+            return candidate;
+        }
+        candidate = candidate.checked_add(1).filter(|next| *next < length).unwrap_or(1);
+    }
+    length - 1
+}
+
+fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+fn enumeration_hash_word(digest: &[u8], offset: usize) -> u64 {
+    let mut word = [0_u8; 8];
+    let end = offset + word.len();
+    word.copy_from_slice(&digest[offset..end]);
+    u64::from_be_bytes(word)
+}
+
 /// Result of accepting one document-scoped immutable update.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AcceptOutcome {
@@ -462,11 +550,17 @@ struct AcceptedUpdate {
 pub struct UpdateModel {
     acceptance_order: BTreeMap<(DocumentId, AcceptanceSequence), UpdateId>,
     document_peers: BTreeMap<DocumentId, BTreeSet<u64>>,
+    enumeration_order_key: [u8; 32],
     next_sequences: BTreeMap<DocumentId, AcceptanceSequence>,
     updates: BTreeMap<(DocumentId, UpdateId), AcceptedUpdate>,
 }
 
 impl UpdateModel {
+    /// Creates an oracle with the private enumeration-order key used by the subject fixture.
+    pub fn with_enumeration_order_key(enumeration_order_key: [u8; 32]) -> Self {
+        Self { enumeration_order_key, ..Self::default() }
+    }
+
     /// Accepts an update idempotently under `(document_id, update_id)`.
     pub fn accept(&mut self, update: ImmutableUpdate) -> AcceptOutcome {
         let key = (update.document_id(), update.update_id());
@@ -515,8 +609,49 @@ impl UpdateModel {
             .map(|((_, sequence), _)| *sequence)
     }
 
-    /// Enumerates metadata inside one captured finite-read acceptance window.
+    /// Enumerates metadata in the deterministic non-semantic order for one captured window.
     pub fn enumerate(
+        &self,
+        document_id: DocumentId,
+        after: Option<AcceptanceSequence>,
+        terminal_sequence: AcceptanceSequence,
+    ) -> impl Iterator<Item = (AcceptanceSequence, UpdateMetadata)> + '_ {
+        let lower = after.unwrap_or(AcceptanceSequence::ORIGIN);
+        let permutation = EnumerationPermutation::new(
+            &self.enumeration_order_key,
+            document_id,
+            lower,
+            terminal_sequence,
+        );
+        let mut ordered = Vec::new();
+        if let Some(permutation) = permutation {
+            for ordinal in 0..permutation.length {
+                let Some(sequence) = permutation.sequence_at(ordinal) else {
+                    continue;
+                };
+                let Some(update_id) = self.acceptance_order.get(&(document_id, sequence)) else {
+                    continue;
+                };
+                let Some(accepted) = self.updates.get(&(document_id, *update_id)) else {
+                    continue;
+                };
+                ordered.push((
+                    sequence,
+                    UpdateMetadata {
+                        encrypted_payload_length: u32::try_from(
+                            accepted.update.encrypted_payload().len(),
+                        )
+                        .unwrap_or(u32::MAX),
+                        public_loro_ranges: accepted.update.public_loro_ranges().clone(),
+                        update_id: accepted.update.update_id(),
+                    },
+                ));
+            }
+        }
+        ordered.into_iter()
+    }
+
+    fn acceptance_window(
         &self,
         document_id: DocumentId,
         after: Option<AcceptanceSequence>,
@@ -549,7 +684,7 @@ impl UpdateModel {
         after: Option<AcceptanceSequence>,
         terminal_sequence: AcceptanceSequence,
     ) -> impl Iterator<Item = (AcceptanceSequence, UpdateMetadata)> + 'a {
-        self.enumerate(document_id, after, terminal_sequence).filter(
+        self.acceptance_window(document_id, after, terminal_sequence).filter(
             move |(_sequence, metadata)| {
                 metadata.public_loro_ranges.as_slice().iter().any(|range| {
                     range.end_counter() > oplog_version.end_counter_for(range.peer_id())

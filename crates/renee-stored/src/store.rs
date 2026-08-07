@@ -23,6 +23,7 @@ use ring::rand::{SecureRandom as _, SystemRandom};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior, params,
 };
+use sha2::{Digest as _, Sha256};
 
 pub use crate::subscription::{BrokerChannel, UpdateSubscription, UpdateSubscriptionEnd};
 use crate::subscription::{DocumentEmissionGate, RegisterError, UpdateSubscriptionRegistry};
@@ -54,6 +55,7 @@ const MAX_ENUMERATION_PASSES_PER_DOCUMENT: usize = 32;
 const MAX_ENUMERATION_SCAN_RECORDS: usize = 64;
 const ENUMERATION_CONTINUATION_LENGTH: usize = 32;
 const ENUMERATION_PASS_IDLE_TTL: Duration = Duration::from_secs(300);
+const ENUMERATION_ORDER_KEY_LENGTH: usize = 32;
 const STORE_GENERATION_LENGTH: usize = 16;
 
 const SCHEMA: &str = "
@@ -347,14 +349,14 @@ pub struct CreateAuthorityProvision {
     pub receipt_verifier: [u8; verifier::VERIFIER_LENGTH],
 }
 
-/// One bounded page in deterministic, non-semantic update-ID order.
+/// One bounded page in a deterministic, non-semantic pass-local permutation.
 #[derive(Clone)]
 pub struct StoredUpdatePage {
     /// Whether another row exists after this page.
     pub has_more: bool,
-    /// Last returned update ID, if any, retained only in server-side pass state.
-    pub last_update_id: Option<UpdateId>,
-    /// Public metadata in deterministic update-ID order.
+    /// Next private permutation ordinal retained only in server-side pass state.
+    pub next_ordinal: u64,
+    /// Public metadata in deterministic pass-local order.
     pub updates: Vec<UpdateMetadata>,
 }
 
@@ -495,7 +497,7 @@ enum EnumerationTokenMode {
 #[derive(Clone, Copy)]
 struct EnumerationPassPosition {
     mode: EnumerationTokenMode,
-    last_update_id: UpdateId,
+    next_ordinal: u64,
     token: [u8; ENUMERATION_CONTINUATION_LENGTH],
 }
 
@@ -508,6 +510,7 @@ struct EnumerationPassRetry {
 /// Authoritative capability and immutable-update `SQLite` connection.
 pub struct DurableUpdateStore {
     connection: Connection,
+    enumeration_order_key: [u8; ENUMERATION_ORDER_KEY_LENGTH],
     enumeration_passes: Vec<EnumerationPass>,
     generation: [u8; STORE_GENERATION_LENGTH],
     random: SystemRandom,
@@ -731,8 +734,15 @@ impl DurableUpdateStore {
         let random = SystemRandom::new();
         let mut generation = [0_u8; STORE_GENERATION_LENGTH];
         random.fill(&mut generation).map_err(|_error| StoreError::EntropyUnavailable)?;
+        let mut enumeration_order_key = [0_u8; ENUMERATION_ORDER_KEY_LENGTH];
+        random.fill(&mut enumeration_order_key).map_err(|_error| StoreError::EntropyUnavailable)?;
+        #[cfg(feature = "conformance")]
+        if std::env::var("RENEE_TEST_FIXED_ENUMERATION_ORDER_KEY").as_deref() == Ok("1") {
+            enumeration_order_key.fill(0);
+        }
         let mut store = Self {
             connection,
+            enumeration_order_key,
             enumeration_passes: Vec::new(),
             generation,
             random,
@@ -1794,17 +1804,18 @@ impl DurableUpdateStore {
                 };
                 let page = enumerate_in(
                     &transaction,
+                    &self.enumeration_order_key,
                     document_id,
                     AcceptanceSequence::ORIGIN,
                     terminal_sequence,
-                    None,
+                    0,
                     metadata_byte_limit,
                 )?;
-                let Some(last_update_id) = page.last_update_id else {
+                if page.updates.is_empty() {
                     return Err(StoreError::Corrupt(
                         "nonempty enumeration snapshot produced no first record",
                     ));
-                };
+                }
                 if !can_admit_enumeration_pass(
                     &self.enumeration_passes,
                     channel_id,
@@ -1822,13 +1833,18 @@ impl DurableUpdateStore {
                 } else {
                     EnumerationTokenMode::AfterTail
                 };
+                let page_next_ordinal = page.next_ordinal;
                 let response =
                     AuthorizedStoredUpdatePage { next_cursor: Some(token.to_vec()), page };
                 transaction.commit()?;
                 self.enumeration_passes.push(EnumerationPass {
                     capability_id,
                     channel_id,
-                    current: EnumerationPassPosition { mode, last_update_id, token },
+                    current: EnumerationPassPosition {
+                        mode,
+                        next_ordinal: page_next_ordinal,
+                        token,
+                    },
                     document_id,
                     expires_at: now + ENUMERATION_PASS_IDLE_TTL,
                     generation: self.generation,
@@ -1876,12 +1892,12 @@ impl DurableUpdateStore {
                 if current.token != token || current.mode != requested_mode {
                     return Ok(StoreEnumerateOutcome::InvalidContinuation);
                 }
-                let (lower_sequence_exclusive, terminal_sequence, last_update_id) =
+                let (lower_sequence_exclusive, terminal_sequence, next_ordinal) =
                     match requested_mode {
                         EnumerationTokenMode::Continue => (
                             pass.lower_sequence_exclusive,
                             pass.terminal_sequence,
-                            Some(current.last_update_id),
+                            current.next_ordinal,
                         ),
                         EnumerationTokenMode::AfterTail => {
                             let Some(high_water) =
@@ -1901,15 +1917,16 @@ impl DurableUpdateStore {
                                     },
                                 ));
                             }
-                            (pass.terminal_sequence, high_water, None)
+                            (pass.terminal_sequence, high_water, 0)
                         }
                     };
                 let page = match enumerate_in(
                     &transaction,
+                    &self.enumeration_order_key,
                     document_id,
                     lower_sequence_exclusive,
                     terminal_sequence,
-                    last_update_id,
+                    next_ordinal,
                     metadata_byte_limit,
                 ) {
                     Ok(page) => page,
@@ -1919,11 +1936,11 @@ impl DurableUpdateStore {
                     }
                     Err(error) => return Err(error),
                 };
-                let Some(next_update_id) = page.last_update_id else {
+                if page.updates.is_empty() {
                     return Err(StoreError::Corrupt(
                         "advancing enumeration pass produced no record",
                     ));
-                };
+                }
                 let Some(next_token) =
                     mint_enumeration_token(&self.random, &self.enumeration_passes)?
                 else {
@@ -1934,13 +1951,14 @@ impl DurableUpdateStore {
                 } else {
                     EnumerationTokenMode::AfterTail
                 };
+                let page_next_ordinal = page.next_ordinal;
                 let response =
                     AuthorizedStoredUpdatePage { next_cursor: Some(next_token.to_vec()), page };
                 transaction.commit()?;
                 let mutable_pass = &mut self.enumeration_passes[pass_index];
                 mutable_pass.current = EnumerationPassPosition {
                     mode: next_mode,
-                    last_update_id: next_update_id,
+                    next_ordinal: page_next_ordinal,
                     token: next_token,
                 };
                 mutable_pass.expires_at = Instant::now() + ENUMERATION_PASS_IDLE_TTL;
@@ -2192,7 +2210,7 @@ impl DurableUpdateStore {
             self.connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         validate_create_state(&transaction)?;
         validate_capability_state(&transaction)?;
-        let mut maxima = BTreeMap::<DocumentId, AcceptanceSequence>::new();
+        let mut next_sequences = BTreeMap::<DocumentId, AcceptanceSequence>::new();
         let mut expected_peer_counts = BTreeMap::<DocumentId, usize>::new();
         let mut expected_peers = BTreeSet::<(DocumentId, u64)>::new();
         let mut expected_range_count = 0_usize;
@@ -2218,6 +2236,16 @@ impl DurableUpdateStore {
                 if sequence == AcceptanceSequence::ORIGIN {
                     return Err(StoreError::Corrupt("stored acceptance sequence is zero"));
                 }
+                let expected_sequence =
+                    next_sequences.entry(document_id).or_insert(AcceptanceSequence::FIRST);
+                if sequence != *expected_sequence {
+                    return Err(StoreError::Corrupt(
+                        "stored acceptance positions are not contiguous",
+                    ));
+                }
+                *expected_sequence = sequence
+                    .checked_next()
+                    .ok_or(StoreError::Corrupt("stored acceptance sequence cannot advance"))?;
                 let record = row.get::<_, Vec<u8>>(3)?;
                 let update = decode_update_record(&record)
                     .map_err(|_error| StoreError::Corrupt("stored update record is invalid"))?;
@@ -2265,7 +2293,6 @@ impl DurableUpdateStore {
                         "stored Loro range index disagrees with update records",
                     ));
                 }
-                maxima.insert(document_id, sequence);
             }
         }
 
@@ -2306,7 +2333,7 @@ impl DurableUpdateStore {
             }
         }
 
-        for (document_id, maximum) in maxima {
+        for (document_id, expected_next) in next_sequences {
             let document_bytes = document_id.into_bytes();
             let next = transaction.query_row(
                 "SELECT next_sequence FROM document_acceptance_sequences
@@ -2315,9 +2342,9 @@ impl DurableUpdateStore {
                 |row| row.get::<_, Vec<u8>>(0),
             )?;
             let next = decode_sequence(&next)?;
-            if next <= maximum {
+            if next != expected_next {
                 return Err(StoreError::Corrupt(
-                    "document acceptance counter does not follow stored rows",
+                    "document acceptance counter does not exactly follow stored rows",
                 ));
             }
         }
@@ -2348,52 +2375,53 @@ fn high_water_sequence_in(
 
 fn enumerate_in(
     connection: &Connection,
+    enumeration_order_key: &[u8; ENUMERATION_ORDER_KEY_LENGTH],
     document_id: DocumentId,
     lower_sequence_exclusive: AcceptanceSequence,
     terminal_sequence: AcceptanceSequence,
-    after_update_id: Option<UpdateId>,
+    next_ordinal: u64,
     metadata_byte_limit: usize,
 ) -> Result<StoredUpdatePage, StoreError> {
     let document_bytes = document_id.into_bytes();
-    let after_update_bytes = validate_enumeration_window(
-        connection,
+    let permutation = EnumerationPermutation::new(
+        enumeration_order_key,
         document_id,
         lower_sequence_exclusive,
         terminal_sequence,
-        after_update_id,
-    )?;
-    let row_limit = i64::try_from(MAX_ENUMERATION_SCAN_RECORDS + 1)
-        .map_err(|_error| StoreError::Corrupt("enumeration scan bound cannot fit SQLite"))?;
+    )
+    .ok_or(StoreError::InvalidCursor)?;
+    if next_ordinal >= permutation.length {
+        return Err(StoreError::InvalidCursor);
+    }
     let mut statement = connection.prepare(
         "SELECT update_id, encoded_record
          FROM updates
          WHERE document_id = ?1
-           AND acceptance_sequence > ?2
-           AND acceptance_sequence <= ?3
-           AND (?4 IS NULL OR update_id > ?4)
-         ORDER BY update_id
-         LIMIT ?5",
+           AND acceptance_sequence = ?2",
     )?;
-    let mut rows = statement.query(params![
-        document_bytes.as_slice(),
-        lower_sequence_exclusive.to_be_bytes().as_slice(),
-        terminal_sequence.to_be_bytes().as_slice(),
-        after_update_bytes.as_ref().map(<[u8; IDENTIFIER_LENGTH]>::as_slice),
-        row_limit,
-    ])?;
     let mut used = 0_usize;
     let mut updates = Vec::new();
-    let mut page_last_update_id = None;
-    let mut scanned = 0_usize;
-    let mut has_more = false;
-    while let Some(row) = rows.next()? {
-        if scanned == MAX_ENUMERATION_SCAN_RECORDS {
-            has_more = true;
-            break;
-        }
-        let indexed_update_id =
-            UpdateId::from_bytes(decode_identifier(&row.get::<_, Vec<u8>>(0)?)?);
-        let record = row.get::<_, Vec<u8>>(1)?;
+    let scan_end = next_ordinal
+        .saturating_add(u64::try_from(MAX_ENUMERATION_SCAN_RECORDS).map_err(|_error| {
+            StoreError::Corrupt("enumeration scan bound cannot fit the ordinal domain")
+        })?)
+        .min(permutation.length);
+    let mut page_next_ordinal = next_ordinal;
+    while page_next_ordinal < scan_end {
+        let sequence = permutation
+            .sequence_at(page_next_ordinal)
+            .ok_or(StoreError::Corrupt("enumeration permutation left its finite window"))?;
+        let row = statement
+            .query_row(
+                params![document_bytes.as_slice(), sequence.to_be_bytes().as_slice()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::Corrupt(
+                "enumeration snapshot contains a missing acceptance position",
+            ))?;
+        let indexed_update_id = UpdateId::from_bytes(decode_identifier(&row.0)?);
+        let record = row.1;
         let update = decode_update_record(&record)
             .map_err(|_error| StoreError::Corrupt("stored update record is invalid"))?;
         if update.document_id() != document_id {
@@ -2406,81 +2434,110 @@ fn enumerate_in(
         let encoded_length = metadata_encoded_length(&metadata)
             .map_err(|_error| StoreError::Corrupt("stored metadata cannot be encoded"))?;
         let Some(next_used) = used.checked_add(encoded_length) else {
-            has_more = true;
             break;
         };
         if next_used > metadata_byte_limit {
-            has_more = true;
             break;
         }
         used = next_used;
-        page_last_update_id = Some(indexed_update_id);
         updates.push(metadata);
-        scanned = scanned
+        page_next_ordinal = page_next_ordinal
             .checked_add(1)
-            .ok_or(StoreError::Corrupt("enumeration scan count overflowed"))?;
+            .ok_or(StoreError::Corrupt("enumeration ordinal overflowed"))?;
     }
-    Ok(StoredUpdatePage { has_more, last_update_id: page_last_update_id, updates })
+    Ok(StoredUpdatePage {
+        has_more: page_next_ordinal < permutation.length,
+        next_ordinal: page_next_ordinal,
+        updates,
+    })
 }
 
-fn validate_enumeration_window(
-    connection: &Connection,
-    document_id: DocumentId,
-    lower_sequence_exclusive: AcceptanceSequence,
-    terminal_sequence: AcceptanceSequence,
-    after_update_id: Option<UpdateId>,
-) -> Result<Option<[u8; IDENTIFIER_LENGTH]>, StoreError> {
-    let document_bytes = document_id.into_bytes();
-    if terminal_sequence == AcceptanceSequence::ORIGIN
-        || lower_sequence_exclusive > terminal_sequence
-    {
-        return Err(StoreError::InvalidCursor);
-    }
-    for sequence in [lower_sequence_exclusive, terminal_sequence] {
-        if sequence == AcceptanceSequence::ORIGIN {
-            continue;
+struct EnumerationPermutation {
+    length: u64,
+    lower: u64,
+    multiplier: u64,
+    offset: u64,
+}
+
+impl EnumerationPermutation {
+    fn new(
+        enumeration_order_key: &[u8; ENUMERATION_ORDER_KEY_LENGTH],
+        document_id: DocumentId,
+        lower_sequence_exclusive: AcceptanceSequence,
+        terminal_sequence: AcceptanceSequence,
+    ) -> Option<Self> {
+        let lower = lower_sequence_exclusive.get();
+        let length = terminal_sequence.get().checked_sub(lower)?;
+        if length == 0 {
+            return None;
         }
-        let exists = connection
-            .query_row(
-                "SELECT 1 FROM updates
-                 WHERE document_id = ?1 AND acceptance_sequence = ?2",
-                params![document_bytes.as_slice(), sequence.to_be_bytes().as_slice()],
-                |_row| Ok(()),
+        let mut hash = Sha256::new();
+        hash.update(b"renee-enumeration-permutation-v1\0");
+        hash.update(enumeration_order_key);
+        hash.update(document_id.into_bytes());
+        hash.update(lower_sequence_exclusive.to_be_bytes());
+        hash.update(terminal_sequence.to_be_bytes());
+        let digest = hash.finalize();
+        let offset = enumeration_hash_word(&digest, 0) % length;
+        let multiplier = coprime_enumeration_multiplier(enumeration_hash_word(&digest, 8), length);
+        Some(Self { length, lower, multiplier, offset })
+    }
+
+    fn sequence_at(&self, ordinal: u64) -> Option<AcceptanceSequence> {
+        if ordinal >= self.length {
+            return None;
+        }
+        let mapped = if self.length == 1 {
+            0
+        } else {
+            u64::try_from(
+                (u128::from(ordinal) * u128::from(self.multiplier) + u128::from(self.offset))
+                    % u128::from(self.length),
             )
-            .optional()?
-            .is_some();
-        if !exists {
-            return Err(StoreError::InvalidCursor);
-        }
+            .ok()?
+        };
+        self.lower
+            .checked_add(mapped)?
+            .checked_add(1)
+            .map(|sequence| AcceptanceSequence::from_be_bytes(sequence.to_be_bytes()))
     }
-    let after_update_bytes = after_update_id.map(UpdateId::into_bytes);
-    if let Some(after_update_bytes) = after_update_bytes {
-        let position_exists = connection
-            .query_row(
-                "SELECT 1 FROM updates
-                 WHERE document_id = ?1
-                   AND acceptance_sequence > ?2
-                   AND acceptance_sequence <= ?3
-                   AND update_id = ?4",
-                params![
-                    document_bytes.as_slice(),
-                    lower_sequence_exclusive.to_be_bytes().as_slice(),
-                    terminal_sequence.to_be_bytes().as_slice(),
-                    after_update_bytes.as_slice(),
-                ],
-                |_row| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !position_exists {
-            return Err(StoreError::InvalidCursor);
-        }
+}
+
+fn coprime_enumeration_multiplier(seed: u64, length: u64) -> u64 {
+    if length <= 2 {
+        return 1;
     }
-    Ok(after_update_bytes)
+    let mut candidate = seed % length;
+    if candidate == 0 {
+        candidate = 1;
+    }
+    for _attempt in 0..64 {
+        if greatest_common_divisor(candidate, length) == 1 {
+            return candidate;
+        }
+        candidate = candidate.checked_add(1).filter(|next| *next < length).unwrap_or(1);
+    }
+    length - 1
+}
+
+fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+fn enumeration_hash_word(digest: &[u8], offset: usize) -> u64 {
+    let mut word = [0_u8; 8];
+    let end = offset + word.len();
+    word.copy_from_slice(&digest[offset..end]);
+    u64::from_be_bytes(word)
 }
 
 fn empty_stored_update_page() -> StoredUpdatePage {
-    StoredUpdatePage { has_more: false, last_update_id: None, updates: Vec::new() }
+    StoredUpdatePage { has_more: false, next_ordinal: 0, updates: Vec::new() }
 }
 
 fn can_admit_enumeration_pass(
@@ -3715,9 +3772,11 @@ mod tests {
             fixture_update_for(document_id, 0x26),
             fixture_update_for(document_id, 0x27),
         ];
-        // Acceptance order deliberately differs from the public, non-semantic
-        // update-ID order used inside this stable snapshot.
-        for update in [&updates[2], &updates[0], &updates[1]] {
+        // Acceptance order deliberately differs from update-ID order. The
+        // public pass uses a deterministic window-local permutation of these
+        // private positions rather than exposing either order.
+        let accepted_order = [&updates[2], &updates[0], &updates[1]];
+        for update in accepted_order {
             let encoded = encode_update_record(update).expect("fixture update must encode");
             assert_eq!(
                 store
@@ -3726,6 +3785,24 @@ mod tests {
                 StoreAcceptOutcome::Inserted,
             );
         }
+        let terminal_sequence = high_water_sequence_in(&store.connection, document_id)
+            .expect("high-water lookup must resolve")
+            .expect("fixture must have a high water");
+        let permutation = EnumerationPermutation::new(
+            &store.enumeration_order_key,
+            document_id,
+            AcceptanceSequence::ORIGIN,
+            terminal_sequence,
+        )
+        .expect("nonempty fixture must produce a permutation");
+        let expected_order = (0..permutation.length)
+            .map(|ordinal| {
+                let sequence = permutation.sequence_at(ordinal).expect("ordinal must be valid");
+                let index = usize::try_from(sequence.get() - 1)
+                    .expect("fixture sequence must index accepted order");
+                accepted_order[index].update_id()
+            })
+            .collect::<Vec<_>>();
         let one_metadata = metadata_encoded_length(&metadata(&updates[0]).expect("metadata"))
             .expect("metadata length must fit");
         let StoreEnumerateOutcome::Authorized(first) = store
@@ -3742,7 +3819,7 @@ mod tests {
             panic!("read-authorized origin must succeed");
         };
         assert!(first.page.has_more);
-        assert_eq!(first.page.updates[0].update_id, updates[0].update_id());
+        assert_eq!(first.page.updates[0].update_id, expected_order[0]);
         let first_token = first.next_cursor.expect("nonempty page must return a token");
         assert_eq!(first_token.len(), ENUMERATION_CONTINUATION_LENGTH);
         assert_eq!(store.enumeration_passes.len(), 1);
@@ -3841,7 +3918,7 @@ mod tests {
         else {
             panic!("continuation must remain authorized");
         };
-        assert_eq!(second.page.updates[0].update_id, updates[1].update_id());
+        assert_eq!(second.page.updates[0].update_id, expected_order[1]);
         let second_token = second.next_cursor.clone().expect("second page must return a token");
         let StoreEnumerateOutcome::Authorized(second_retry) = store
             .enumerate_authorized(
@@ -3857,7 +3934,7 @@ mod tests {
             panic!("exact retry must remain authorized");
         };
         assert_eq!(second_retry.next_cursor, second.next_cursor);
-        assert_eq!(second_retry.page.updates[0].update_id, updates[1].update_id());
+        assert_eq!(second_retry.page.updates[0].update_id, expected_order[1]);
         assert_eq!(store.enumeration_passes.len(), 1);
 
         let StoreEnumerateOutcome::Authorized(terminal) = store
@@ -3874,7 +3951,7 @@ mod tests {
             panic!("terminal continuation must remain authorized");
         };
         assert!(!terminal.page.has_more);
-        assert_eq!(terminal.page.updates[0].update_id, updates[2].update_id());
+        assert_eq!(terminal.page.updates[0].update_id, expected_order[2]);
         let tail_token = terminal.next_cursor.clone().expect("terminal page must return a tail");
         let StoreEnumerateOutcome::Authorized(terminal_retry) = store
             .enumerate_authorized(
@@ -3890,7 +3967,7 @@ mod tests {
             panic!("terminal retry must remain authorized");
         };
         assert_eq!(terminal_retry.next_cursor, terminal.next_cursor);
-        assert_eq!(terminal_retry.page.updates[0].update_id, updates[2].update_id());
+        assert_eq!(terminal_retry.page.updates[0].update_id, expected_order[2]);
 
         let StoreEnumerateOutcome::Authorized(after_tail) = store
             .enumerate_authorized(
@@ -3908,6 +3985,163 @@ mod tests {
         assert_eq!(after_tail.page.updates[0].update_id, accepted_after_snapshot.update_id(),);
         assert!(!after_tail.page.has_more);
         assert_eq!(store.enumeration_passes.len(), 1);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the bounded-page and SQLite-plan assertions exercise one indexed scan fixture"
+    )]
+    fn enumeration_pages_use_bounded_indexed_permutation_lookups() {
+        let directory = TestDirectory::create();
+        let database = directory.path.join("renee.sqlite3");
+        let document_id = DocumentId::from_bytes([0x61; IDENTIFIER_LENGTH]);
+        let capability_id = CapabilityId::from_bytes([0x62; IDENTIFIER_LENGTH]);
+        let authenticator = Authenticator::from_bytes([0x63; 32]);
+        let mut store = open_store(&database);
+        create_fixture_document(&mut store, document_id, capability_id, &authenticator, 0x64);
+        for ordinal in 0_u64..130 {
+            let mut update_id = [0_u8; IDENTIFIER_LENGTH];
+            update_id[8..].copy_from_slice(&ordinal.to_be_bytes());
+            let update = ImmutableUpdate::new(
+                document_id,
+                UpdateId::from_bytes(update_id),
+                PublicLoroRanges::new(vec![
+                    LoroRange::new(7, 0, 1).expect("fixture range must be valid"),
+                ])
+                .expect("fixture ranges must be canonical"),
+                vec![u8::try_from(ordinal).expect("fixture ordinal must fit")],
+            );
+            let encoded = encode_update_record(&update).expect("fixture update must encode");
+            assert_eq!(
+                store
+                    .accept(capability_id, &authenticator, &update, &encoded)
+                    .expect("fixture update must commit"),
+                StoreAcceptOutcome::Inserted,
+            );
+        }
+        let terminal_sequence = high_water_sequence_in(&store.connection, document_id)
+            .expect("high-water lookup must resolve")
+            .expect("fixture must have a high water");
+
+        let first = enumerate_in(
+            &store.connection,
+            &store.enumeration_order_key,
+            document_id,
+            AcceptanceSequence::ORIGIN,
+            terminal_sequence,
+            0,
+            usize::MAX,
+        )
+        .expect("first bounded scan must resolve");
+        assert!(first.has_more);
+        assert_eq!(first.next_ordinal, 64);
+        assert_eq!(first.updates.len(), MAX_ENUMERATION_SCAN_RECORDS);
+        let second = enumerate_in(
+            &store.connection,
+            &store.enumeration_order_key,
+            document_id,
+            AcceptanceSequence::ORIGIN,
+            terminal_sequence,
+            first.next_ordinal,
+            usize::MAX,
+        )
+        .expect("second bounded scan must resolve");
+        assert!(second.has_more);
+        assert_eq!(second.next_ordinal, 128);
+        assert_eq!(second.updates.len(), MAX_ENUMERATION_SCAN_RECORDS);
+        let terminal = enumerate_in(
+            &store.connection,
+            &store.enumeration_order_key,
+            document_id,
+            AcceptanceSequence::ORIGIN,
+            terminal_sequence,
+            second.next_ordinal,
+            usize::MAX,
+        )
+        .expect("terminal bounded scan must resolve");
+        assert!(!terminal.has_more);
+        assert_eq!(terminal.next_ordinal, 130);
+        assert_eq!(terminal.updates.len(), 2);
+
+        let first_sequence = EnumerationPermutation::new(
+            &store.enumeration_order_key,
+            document_id,
+            AcceptanceSequence::ORIGIN,
+            terminal_sequence,
+        )
+        .and_then(|permutation| permutation.sequence_at(0))
+        .expect("fixture permutation must have a first sequence");
+        let mut plan = store
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT update_id, encoded_record
+                 FROM updates
+                 WHERE document_id = ?1
+                   AND acceptance_sequence = ?2",
+            )
+            .expect("query plan must prepare");
+        let details = plan
+            .query_map(
+                params![
+                    document_id.into_bytes().as_slice(),
+                    first_sequence.to_be_bytes().as_slice(),
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .expect("query plan must resolve")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("query plan rows must decode");
+        assert!(
+            details.iter().any(|detail| detail.contains("SEARCH updates USING INDEX")),
+            "enumeration must seek through the acceptance-position index: {details:?}",
+        );
+        assert!(
+            details.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+            "enumeration must not construct a temporary ordering: {details:?}",
+        );
+    }
+
+    #[test]
+    fn enumeration_permutation_is_bijective_within_each_window() {
+        let document_id = DocumentId::from_bytes([0x71; IDENTIFIER_LENGTH]);
+        let enumeration_order_key = [0x72; ENUMERATION_ORDER_KEY_LENGTH];
+        for length in 1_u64..=512 {
+            let terminal = AcceptanceSequence::from_be_bytes(length.to_be_bytes());
+            let permutation = EnumerationPermutation::new(
+                &enumeration_order_key,
+                document_id,
+                AcceptanceSequence::ORIGIN,
+                terminal,
+            )
+            .expect("nonempty window must produce a permutation");
+            let observed = (0..length)
+                .map(|ordinal| {
+                    permutation
+                        .sequence_at(ordinal)
+                        .expect("in-range ordinal must map to a sequence")
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(observed.len(), usize::try_from(length).expect("fixture length must fit"));
+            assert_eq!(observed.first(), Some(&AcceptanceSequence::FIRST));
+            assert_eq!(observed.last(), Some(&terminal));
+        }
+        let terminal = AcceptanceSequence::from_be_bytes(509_u64.to_be_bytes());
+        let alternate_key = [0x73; ENUMERATION_ORDER_KEY_LENGTH];
+        let order_for = |key: &[u8; ENUMERATION_ORDER_KEY_LENGTH]| {
+            let permutation =
+                EnumerationPermutation::new(key, document_id, AcceptanceSequence::ORIGIN, terminal)
+                    .expect("nonempty window must produce a permutation");
+            (0..permutation.length)
+                .map(|ordinal| permutation.sequence_at(ordinal).expect("ordinal must be valid"))
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(
+            order_for(&enumeration_order_key),
+            order_for(&alternate_key),
+            "the private process key must domain-separate public pass order",
+        );
     }
 
     #[test]
