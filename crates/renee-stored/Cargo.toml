@@ -21,7 +21,6 @@ ring.workspace = true
 renee-types = { path = "../renee-types" }
 renee-wire = { path = "../renee-wire" }
 rusqlite.workspace = true
-sha2.workspace = true
 subtle.workspace = true
 tokio.workspace = true
 

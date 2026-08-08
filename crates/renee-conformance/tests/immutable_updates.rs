@@ -59,6 +59,14 @@ fn expected_metadata(update: &ImmutableUpdate) -> UpdateMetadata {
     }
 }
 
+fn same_metadata_set(left: &[UpdateMetadata], right: &[UpdateMetadata]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort_by_key(|metadata| metadata.update_id);
+    right.sort_by_key(|metadata| metadata.update_id);
+    left == right
+}
+
 fn root(document: u8) -> CreateDocumentRequest {
     CreateDocumentRequest {
         create_authority: CreateAuthority {
@@ -132,8 +140,8 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
     }
 
     // Capture the terminal anchor before accepting a lexically lower update
-    // ID. Snapshot membership is acceptance-bounded even though each pass is
-    // publicly paginated through a deterministic, non-semantic permutation.
+    // ID. Snapshot membership is acceptance-bounded; its delivery order has
+    // no semantic meaning.
     let first_page =
         connection.enumerate_updates(&first_root.root, first.document_id(), None).await?;
     if first_page.updates != vec![expected_metadata(&first)] {
@@ -172,9 +180,9 @@ async fn model_and_subject_agree_on_minimal_immutable_update_api() -> HarnessRes
         .collect::<Vec<_>>();
     let observed_page =
         connection.enumerate_updates(&first_root.root, first.document_id(), None).await?;
-    if observed_page.has_more || observed_page.updates != expected_page {
+    if observed_page.has_more || !same_metadata_set(&observed_page.updates, &expected_page) {
         return Err(io::Error::other(format!(
-            "model and subject disagreed on pass-local enumeration order: expected {expected_page:?}, observed {:?}",
+            "model and subject disagreed on enumeration membership: expected {expected_page:?}, observed {:?}",
             observed_page.updates,
         ))
         .into());
@@ -328,7 +336,7 @@ async fn acknowledged_update_survives_store_restart() -> HarnessResult<()> {
         .enumerate(accepted.document_id(), None, terminal_sequence)
         .map(|(_sequence, metadata)| metadata)
         .collect::<Vec<_>>();
-    if restarted.updates != expected_restarted {
+    if !same_metadata_set(&restarted.updates, &expected_restarted) {
         return Err(io::Error::other("origin restart omitted durable history").into());
     }
 
@@ -364,9 +372,10 @@ async fn opaque_enumeration_pass_retries_exact_pages_and_excludes_later_accepts(
         .map(|(_sequence, metadata)| metadata)
         .collect::<Vec<_>>();
     let first = connection.enumerate_updates(&authority.root, authority.document_id, None).await?;
-    if !first.has_more || first.updates != expected_stable[0..1] {
+    if !first.has_more || first.updates.len() != 1 {
         return Err(io::Error::other("origin did not return one bounded first page").into());
     }
+    let mut stable_observed = first.updates.clone();
     let first_token =
         first.next_cursor.ok_or_else(|| io::Error::other("first page omitted its opaque token"))?;
     let later = wide_update(10, 0x14);
@@ -380,7 +389,7 @@ async fn opaque_enumeration_pass_retries_exact_pages_and_excludes_later_accepts(
     let second = connection
         .enumerate_updates(&authority.root, authority.document_id, Some(first_token.clone()))
         .await?;
-    if !second.has_more || second.updates != expected_stable[1..2] {
+    if !second.has_more || second.updates.len() != 1 {
         return Err(io::Error::other("second stable page was incorrect").into());
     }
     let second_retry = connection
@@ -389,13 +398,14 @@ async fn opaque_enumeration_pass_retries_exact_pages_and_excludes_later_accepts(
     if second_retry != second {
         return Err(io::Error::other("intermediate exact retry changed bytes or successor").into());
     }
+    stable_observed.extend(second.updates.iter().cloned());
     let second_token = second
         .next_cursor
         .ok_or_else(|| io::Error::other("second page omitted its opaque token"))?;
     let terminal = connection
         .enumerate_updates(&authority.root, authority.document_id, Some(second_token.clone()))
         .await?;
-    if terminal.has_more || terminal.updates != expected_stable[2..3] {
+    if terminal.has_more || terminal.updates.len() != 1 {
         return Err(io::Error::other("terminal stable page included a later acceptance").into());
     }
     let terminal_retry = connection
@@ -403,6 +413,13 @@ async fn opaque_enumeration_pass_retries_exact_pages_and_excludes_later_accepts(
         .await?;
     if terminal_retry != terminal {
         return Err(io::Error::other("terminal exact retry changed bytes or successor").into());
+    }
+    stable_observed.extend(terminal.updates.iter().cloned());
+    if !same_metadata_set(&stable_observed, &expected_stable) {
+        return Err(io::Error::other(
+            "stable enumeration pages omitted, duplicated, or added a window member",
+        )
+        .into());
     }
     let tail = terminal
         .next_cursor
@@ -417,7 +434,7 @@ async fn opaque_enumeration_pass_retries_exact_pages_and_excludes_later_accepts(
         .enumerate(authority.document_id, Some(stable_terminal), new_terminal)
         .map(|(_sequence, metadata)| metadata)
         .collect::<Vec<_>>();
-    if after_tail.updates != expected_after_tail {
+    if !same_metadata_set(&after_tail.updates, &expected_after_tail) {
         return Err(
             io::Error::other("after-tail pass repeated history or omitted later update").into()
         );

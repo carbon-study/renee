@@ -23,7 +23,6 @@ use ring::rand::{SecureRandom as _, SystemRandom};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior, params,
 };
-use sha2::{Digest as _, Sha256};
 
 pub use crate::subscription::{BrokerChannel, UpdateSubscription, UpdateSubscriptionEnd};
 use crate::subscription::{DocumentEmissionGate, RegisterError, UpdateSubscriptionRegistry};
@@ -55,7 +54,6 @@ const MAX_ENUMERATION_PASSES_PER_DOCUMENT: usize = 32;
 const MAX_ENUMERATION_SCAN_RECORDS: usize = 64;
 const ENUMERATION_CONTINUATION_LENGTH: usize = 32;
 const ENUMERATION_PASS_IDLE_TTL: Duration = Duration::from_secs(300);
-const ENUMERATION_ORDER_KEY_LENGTH: usize = 32;
 const STORE_GENERATION_LENGTH: usize = 16;
 
 const SCHEMA: &str = "
@@ -349,14 +347,14 @@ pub struct CreateAuthorityProvision {
     pub receipt_verifier: [u8; verifier::VERIFIER_LENGTH],
 }
 
-/// One bounded page in a deterministic, non-semantic pass-local permutation.
+/// One bounded page from a frozen acceptance window.
 #[derive(Clone)]
 pub struct StoredUpdatePage {
     /// Whether another row exists after this page.
     pub has_more: bool,
-    /// Next private permutation ordinal retained only in server-side pass state.
+    /// Next window ordinal retained only in server-side pass state.
     pub next_ordinal: u64,
-    /// Public metadata in deterministic pass-local order.
+    /// Public metadata whose delivery order has no protocol meaning.
     pub updates: Vec<UpdateMetadata>,
 }
 
@@ -510,7 +508,6 @@ struct EnumerationPassRetry {
 /// Authoritative capability and immutable-update `SQLite` connection.
 pub struct DurableUpdateStore {
     connection: Connection,
-    enumeration_order_key: [u8; ENUMERATION_ORDER_KEY_LENGTH],
     enumeration_passes: Vec<EnumerationPass>,
     generation: [u8; STORE_GENERATION_LENGTH],
     random: SystemRandom,
@@ -734,15 +731,8 @@ impl DurableUpdateStore {
         let random = SystemRandom::new();
         let mut generation = [0_u8; STORE_GENERATION_LENGTH];
         random.fill(&mut generation).map_err(|_error| StoreError::EntropyUnavailable)?;
-        let mut enumeration_order_key = [0_u8; ENUMERATION_ORDER_KEY_LENGTH];
-        random.fill(&mut enumeration_order_key).map_err(|_error| StoreError::EntropyUnavailable)?;
-        #[cfg(feature = "conformance")]
-        if std::env::var("RENEE_TEST_FIXED_ENUMERATION_ORDER_KEY").as_deref() == Ok("1") {
-            enumeration_order_key.fill(0);
-        }
         let mut store = Self {
             connection,
-            enumeration_order_key,
             enumeration_passes: Vec::new(),
             generation,
             random,
@@ -1804,7 +1794,6 @@ impl DurableUpdateStore {
                 };
                 let page = enumerate_in(
                     &transaction,
-                    &self.enumeration_order_key,
                     document_id,
                     AcceptanceSequence::ORIGIN,
                     terminal_sequence,
@@ -1922,7 +1911,6 @@ impl DurableUpdateStore {
                     };
                 let page = match enumerate_in(
                     &transaction,
-                    &self.enumeration_order_key,
                     document_id,
                     lower_sequence_exclusive,
                     terminal_sequence,
@@ -2375,7 +2363,6 @@ fn high_water_sequence_in(
 
 fn enumerate_in(
     connection: &Connection,
-    enumeration_order_key: &[u8; ENUMERATION_ORDER_KEY_LENGTH],
     document_id: DocumentId,
     lower_sequence_exclusive: AcceptanceSequence,
     terminal_sequence: AcceptanceSequence,
@@ -2383,14 +2370,13 @@ fn enumerate_in(
     metadata_byte_limit: usize,
 ) -> Result<StoredUpdatePage, StoreError> {
     let document_bytes = document_id.into_bytes();
-    let permutation = EnumerationPermutation::new(
-        enumeration_order_key,
-        document_id,
-        lower_sequence_exclusive,
-        terminal_sequence,
-    )
-    .ok_or(StoreError::InvalidCursor)?;
-    if next_ordinal >= permutation.length {
+    let lower_sequence = lower_sequence_exclusive.get();
+    let window_length = terminal_sequence
+        .get()
+        .checked_sub(lower_sequence)
+        .filter(|length| *length > 0)
+        .ok_or(StoreError::InvalidCursor)?;
+    if next_ordinal >= window_length {
         return Err(StoreError::InvalidCursor);
     }
     let mut statement = connection.prepare(
@@ -2405,15 +2391,17 @@ fn enumerate_in(
         .saturating_add(u64::try_from(MAX_ENUMERATION_SCAN_RECORDS).map_err(|_error| {
             StoreError::Corrupt("enumeration scan bound cannot fit the ordinal domain")
         })?)
-        .min(permutation.length);
+        .min(window_length);
     let mut page_next_ordinal = next_ordinal;
     while page_next_ordinal < scan_end {
-        let sequence = permutation
-            .sequence_at(page_next_ordinal)
-            .ok_or(StoreError::Corrupt("enumeration permutation left its finite window"))?;
+        let acceptance_sequence = lower_sequence
+            .checked_add(page_next_ordinal)
+            .and_then(|sequence| sequence.checked_add(1))
+            .map(|sequence| AcceptanceSequence::from_be_bytes(sequence.to_be_bytes()))
+            .ok_or(StoreError::Corrupt("enumeration sequence overflowed its finite window"))?;
         let row = statement
             .query_row(
-                params![document_bytes.as_slice(), sequence.to_be_bytes().as_slice()],
+                params![document_bytes.as_slice(), acceptance_sequence.to_be_bytes().as_slice()],
                 |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
             )
             .optional()?
@@ -2446,94 +2434,10 @@ fn enumerate_in(
             .ok_or(StoreError::Corrupt("enumeration ordinal overflowed"))?;
     }
     Ok(StoredUpdatePage {
-        has_more: page_next_ordinal < permutation.length,
+        has_more: page_next_ordinal < window_length,
         next_ordinal: page_next_ordinal,
         updates,
     })
-}
-
-struct EnumerationPermutation {
-    length: u64,
-    lower: u64,
-    multiplier: u64,
-    offset: u64,
-}
-
-impl EnumerationPermutation {
-    fn new(
-        enumeration_order_key: &[u8; ENUMERATION_ORDER_KEY_LENGTH],
-        document_id: DocumentId,
-        lower_sequence_exclusive: AcceptanceSequence,
-        terminal_sequence: AcceptanceSequence,
-    ) -> Option<Self> {
-        let lower = lower_sequence_exclusive.get();
-        let length = terminal_sequence.get().checked_sub(lower)?;
-        if length == 0 {
-            return None;
-        }
-        let mut hash = Sha256::new();
-        hash.update(b"renee-enumeration-permutation-v1\0");
-        hash.update(enumeration_order_key);
-        hash.update(document_id.into_bytes());
-        hash.update(lower_sequence_exclusive.to_be_bytes());
-        hash.update(terminal_sequence.to_be_bytes());
-        let digest = hash.finalize();
-        let offset = enumeration_hash_word(&digest, 0) % length;
-        let multiplier = coprime_enumeration_multiplier(enumeration_hash_word(&digest, 8), length);
-        Some(Self { length, lower, multiplier, offset })
-    }
-
-    fn sequence_at(&self, ordinal: u64) -> Option<AcceptanceSequence> {
-        if ordinal >= self.length {
-            return None;
-        }
-        let mapped = if self.length == 1 {
-            0
-        } else {
-            u64::try_from(
-                (u128::from(ordinal) * u128::from(self.multiplier) + u128::from(self.offset))
-                    % u128::from(self.length),
-            )
-            .ok()?
-        };
-        self.lower
-            .checked_add(mapped)?
-            .checked_add(1)
-            .map(|sequence| AcceptanceSequence::from_be_bytes(sequence.to_be_bytes()))
-    }
-}
-
-fn coprime_enumeration_multiplier(seed: u64, length: u64) -> u64 {
-    if length <= 2 {
-        return 1;
-    }
-    let mut candidate = seed % length;
-    if candidate == 0 {
-        candidate = 1;
-    }
-    for _attempt in 0..64 {
-        if greatest_common_divisor(candidate, length) == 1 {
-            return candidate;
-        }
-        candidate = candidate.checked_add(1).filter(|next| *next < length).unwrap_or(1);
-    }
-    length - 1
-}
-
-fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
-    while right != 0 {
-        let remainder = left % right;
-        left = right;
-        right = remainder;
-    }
-    left
-}
-
-fn enumeration_hash_word(digest: &[u8], offset: usize) -> u64 {
-    let mut word = [0_u8; 8];
-    let end = offset + word.len();
-    word.copy_from_slice(&digest[offset..end]);
-    u64::from_be_bytes(word)
 }
 
 fn empty_stored_update_page() -> StoredUpdatePage {
@@ -3773,8 +3677,8 @@ mod tests {
             fixture_update_for(document_id, 0x27),
         ];
         // Acceptance order deliberately differs from update-ID order. The
-        // public pass uses a deterministic window-local permutation of these
-        // private positions rather than exposing either order.
+        // store traverses the frozen acceptance window directly, while the
+        // public metadata gives this delivery order no semantic meaning.
         let accepted_order = [&updates[2], &updates[0], &updates[1]];
         for update in accepted_order {
             let encoded = encode_update_record(update).expect("fixture update must encode");
@@ -3785,24 +3689,7 @@ mod tests {
                 StoreAcceptOutcome::Inserted,
             );
         }
-        let terminal_sequence = high_water_sequence_in(&store.connection, document_id)
-            .expect("high-water lookup must resolve")
-            .expect("fixture must have a high water");
-        let permutation = EnumerationPermutation::new(
-            &store.enumeration_order_key,
-            document_id,
-            AcceptanceSequence::ORIGIN,
-            terminal_sequence,
-        )
-        .expect("nonempty fixture must produce a permutation");
-        let expected_order = (0..permutation.length)
-            .map(|ordinal| {
-                let sequence = permutation.sequence_at(ordinal).expect("ordinal must be valid");
-                let index = usize::try_from(sequence.get() - 1)
-                    .expect("fixture sequence must index accepted order");
-                accepted_order[index].update_id()
-            })
-            .collect::<Vec<_>>();
+        let expected_order = accepted_order.map(ImmutableUpdate::update_id);
         let one_metadata = metadata_encoded_length(&metadata(&updates[0]).expect("metadata"))
             .expect("metadata length must fit");
         let StoreEnumerateOutcome::Authorized(first) = store
@@ -3988,11 +3875,7 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the bounded-page and SQLite-plan assertions exercise one indexed scan fixture"
-    )]
-    fn enumeration_pages_use_bounded_indexed_permutation_lookups() {
+    fn enumeration_pages_use_at_most_64_indexed_point_lookups() {
         let directory = TestDirectory::create();
         let database = directory.path.join("renee.sqlite3");
         let document_id = DocumentId::from_bytes([0x61; IDENTIFIER_LENGTH]);
@@ -4026,7 +3909,6 @@ mod tests {
 
         let first = enumerate_in(
             &store.connection,
-            &store.enumeration_order_key,
             document_id,
             AcceptanceSequence::ORIGIN,
             terminal_sequence,
@@ -4039,7 +3921,6 @@ mod tests {
         assert_eq!(first.updates.len(), MAX_ENUMERATION_SCAN_RECORDS);
         let second = enumerate_in(
             &store.connection,
-            &store.enumeration_order_key,
             document_id,
             AcceptanceSequence::ORIGIN,
             terminal_sequence,
@@ -4052,7 +3933,6 @@ mod tests {
         assert_eq!(second.updates.len(), MAX_ENUMERATION_SCAN_RECORDS);
         let terminal = enumerate_in(
             &store.connection,
-            &store.enumeration_order_key,
             document_id,
             AcceptanceSequence::ORIGIN,
             terminal_sequence,
@@ -4064,14 +3944,6 @@ mod tests {
         assert_eq!(terminal.next_ordinal, 130);
         assert_eq!(terminal.updates.len(), 2);
 
-        let first_sequence = EnumerationPermutation::new(
-            &store.enumeration_order_key,
-            document_id,
-            AcceptanceSequence::ORIGIN,
-            terminal_sequence,
-        )
-        .and_then(|permutation| permutation.sequence_at(0))
-        .expect("fixture permutation must have a first sequence");
         let mut plan = store
             .connection
             .prepare(
@@ -4086,7 +3958,7 @@ mod tests {
             .query_map(
                 params![
                     document_id.into_bytes().as_slice(),
-                    first_sequence.to_be_bytes().as_slice(),
+                    AcceptanceSequence::FIRST.to_be_bytes().as_slice(),
                 ],
                 |row| row.get::<_, String>(3),
             )
@@ -4100,47 +3972,6 @@ mod tests {
         assert!(
             details.iter().all(|detail| !detail.contains("TEMP B-TREE")),
             "enumeration must not construct a temporary ordering: {details:?}",
-        );
-    }
-
-    #[test]
-    fn enumeration_permutation_is_bijective_within_each_window() {
-        let document_id = DocumentId::from_bytes([0x71; IDENTIFIER_LENGTH]);
-        let enumeration_order_key = [0x72; ENUMERATION_ORDER_KEY_LENGTH];
-        for length in 1_u64..=512 {
-            let terminal = AcceptanceSequence::from_be_bytes(length.to_be_bytes());
-            let permutation = EnumerationPermutation::new(
-                &enumeration_order_key,
-                document_id,
-                AcceptanceSequence::ORIGIN,
-                terminal,
-            )
-            .expect("nonempty window must produce a permutation");
-            let observed = (0..length)
-                .map(|ordinal| {
-                    permutation
-                        .sequence_at(ordinal)
-                        .expect("in-range ordinal must map to a sequence")
-                })
-                .collect::<BTreeSet<_>>();
-            assert_eq!(observed.len(), usize::try_from(length).expect("fixture length must fit"));
-            assert_eq!(observed.first(), Some(&AcceptanceSequence::FIRST));
-            assert_eq!(observed.last(), Some(&terminal));
-        }
-        let terminal = AcceptanceSequence::from_be_bytes(509_u64.to_be_bytes());
-        let alternate_key = [0x73; ENUMERATION_ORDER_KEY_LENGTH];
-        let order_for = |key: &[u8; ENUMERATION_ORDER_KEY_LENGTH]| {
-            let permutation =
-                EnumerationPermutation::new(key, document_id, AcceptanceSequence::ORIGIN, terminal)
-                    .expect("nonempty window must produce a permutation");
-            (0..permutation.length)
-                .map(|ordinal| permutation.sequence_at(ordinal).expect("ordinal must be valid"))
-                .collect::<Vec<_>>()
-        };
-        assert_ne!(
-            order_for(&enumeration_order_key),
-            order_for(&alternate_key),
-            "the private process key must domain-separate public pass order",
         );
     }
 
